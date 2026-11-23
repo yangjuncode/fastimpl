@@ -19,11 +19,21 @@ import (
 	"github.com/yangjuncode/fastimpl/worktree"
 )
 
-// fakeForge 记录 Claim/Close 调用。
+// fakeForge 记录 Claim/Close/Note 调用；closedOn/other 控制 IssueState。
 type fakeForge struct {
-	mu      sync.Mutex
-	claimed []graph.Key
-	closed  []graph.Key
+	mu       sync.Mutex
+	claimed  []graph.Key
+	closed   []graph.Key
+	notes    []string
+	closedOn map[int]bool // IssueState 返回 open=false
+	other    map[int]bool // IssueState 返回 assignedToOther=true
+}
+
+// IssueState 默认全部 open 且未领取；closedOn/other 覆盖。
+func (f *fakeForge) IssueState(ctx context.Context, projectID, iid int) (bool, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.closedOn[iid], f.other[iid], nil
 }
 
 func (f *fakeForge) Claim(ctx context.Context, projectID, iid int) error {
@@ -41,6 +51,9 @@ func (f *fakeForge) Close(ctx context.Context, projectID, iid int) error {
 }
 
 func (f *fakeForge) Note(ctx context.Context, projectID, iid int, message string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notes = append(f.notes, fmt.Sprintf("%d!%d: %s", projectID, iid, message))
 	return nil
 }
 
@@ -145,28 +158,30 @@ func TestSchedulerRun(t *testing.T) {
 	repoDir := initRepo(t)
 	repo := worktree.NewRepo(repoDir, filepath.Join(repoDir, ".wt"))
 	ctx := context.Background()
-	_, intDir, baseName, err := repo.EnsureIntegration(ctx, 8, "")
+	intBranch, intDir, baseName, err := repo.EnsureIntegration(ctx, 8, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 图：#9 无前置、#10 依赖 #9。
+	// 图：#9 无前置、#10 依赖 #9；#11 在 forge 上已被外部关闭，
+	// 开跑前重读应直接跳过、不 claim 不建 worker。
 	g := graph.New(graph.Key{ProjectID: 1, IID: 8})
 	g.Add(graph.Node{Key: graph.Key{ProjectID: 1, IID: 9}, Title: "task A", Kind: graph.KindChild})
 	g.Add(graph.Node{Key: graph.Key{ProjectID: 1, IID: 10}, Title: "task B", Kind: graph.KindChild, Deps: []graph.Key{{ProjectID: 1, IID: 9}}})
+	g.Add(graph.Node{Key: graph.Key{ProjectID: 1, IID: 11}, Title: "closed task", Kind: graph.KindChild})
 
-	forge := &fakeForge{}
+	forge := &fakeForge{closedOn: map[int]bool{11: true}}
 	sessions := &fakeSessions{}
 	// worker 在各自 worktree 里制造一次提交（Merge 需要真实差异）。
 	hookSessions := &commitSessions{fakeSessions: sessions, t: t}
 	cfg := config.Config{Parallelism: 4, SpecIID: 8}
-	s := New(cfg, repo, forge, g, hookSessions, "{issue-no}|{token}|{spec-no}", intDir, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, forge, g, hookSessions, "{issue-no}|{token}|{spec-no}", intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if !g.Done() {
 		t.Fatal("graph not done")
 	}
-	// 顺序：#9 必须先于 #10 被 claim。
+	// 顺序：#9 必须先于 #10 被 claim；#11 不 claim。
 	forge.mu.Lock()
 	claimed := append([]graph.Key{}, forge.claimed...)
 	closed := append([]graph.Key{}, forge.closed...)
@@ -176,6 +191,12 @@ func TestSchedulerRun(t *testing.T) {
 	}
 	if len(closed) != 2 {
 		t.Fatalf("closed %v, want 2 issues", closed)
+	}
+	sessions.mu.Lock()
+	started := len(sessions.started)
+	sessions.mu.Unlock()
+	if started != 2 {
+		t.Fatalf("workers started = %d, want 2 (#11 must not start)", started)
 	}
 	// 集成 worktree 应包含两个任务的合并提交与文件。
 	for _, f := range []string{"task9.txt", "task10.txt"} {
@@ -367,7 +388,7 @@ func TestSchedulerBaseSyncConflict(t *testing.T) {
 	repoDir := initRepo(t)
 	repo := worktree.NewRepo(repoDir, filepath.Join(repoDir, ".wt"))
 	ctx := context.Background()
-	_, intDir, baseName, err := repo.EnsureIntegration(ctx, 8, "")
+	intBranch, intDir, baseName, err := repo.EnsureIntegration(ctx, 8, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +412,7 @@ func TestSchedulerBaseSyncConflict(t *testing.T) {
 
 	sessions := &baseSyncSessions{fakeSessions: &fakeSessions{}}
 	cfg := config.Config{Parallelism: 1, SpecIID: 8, Retries: 2}
-	s := New(cfg, repo, &fakeForge{}, g, sessions, "{issue-no}|{token}|{spec-no}", intDir, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, &fakeForge{}, g, sessions, "{issue-no}|{token}|{spec-no}", intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -429,7 +450,7 @@ func TestSchedulerConflictResolvedByAgent(t *testing.T) {
 	repoDir := initRepo(t)
 	repo := worktree.NewRepo(repoDir, filepath.Join(repoDir, ".wt"))
 	ctx := context.Background()
-	intBranch, intDir, baseName, err := repo.EnsureIntegration(ctx, 8, "")
+	intBranch, intDir, baseName, err := repo.EnsureIntegration(ctx, 8, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +460,7 @@ func TestSchedulerConflictResolvedByAgent(t *testing.T) {
 
 	sessions := &conflictSessions{fakeSessions: &fakeSessions{}, intBranch: intBranch}
 	cfg := config.Config{Parallelism: 2, SpecIID: 8, Retries: 4}
-	s := New(cfg, repo, &fakeForge{}, g, sessions, "{issue-no}|{token}|{spec-no}", intDir, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, &fakeForge{}, g, sessions, "{issue-no}|{token}|{spec-no}", intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}

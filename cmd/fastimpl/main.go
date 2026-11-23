@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/yangjuncode/fastimpl/app"
 )
@@ -32,7 +34,11 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return app.Run(context.Background(), opts, stdout, stderr)
+	// Ctrl+C/SIGTERM 取消运行：调度器 defer 的清理（如回收集成终端）
+	// 才有机会执行，而不是进程直接被杀。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return app.Run(ctx, opts, stdout, stderr)
 }
 
 // parseArguments 解析命令行；位置参数是 spec issue 的 IID。

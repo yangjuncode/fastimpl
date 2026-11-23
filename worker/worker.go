@@ -21,6 +21,9 @@ const (
 	InitialStatusBudget = 5 * time.Minute
 	// TurnBudget 是等待一轮 turn 结束的时限。
 	TurnBudget = 90 * time.Minute
+	// IntegrationTurnBudget 是集成专属 agent 解一轮 base 冲突的时限，
+	// 比 TurnBudget 短：merge 冲突解决不应像完整实现那样久等。
+	IntegrationTurnBudget = 45 * time.Minute
 	// PollInterval 是轮询终端记录的间隔。
 	PollInterval = 3 * time.Second
 	// CaptureLines 是读取屏幕的行数：0 表示只要当前屏幕，不读 scrollback。
@@ -145,7 +148,7 @@ func (r *Runner) Snapshot(ctx context.Context, addr string) (Record, error) {
 }
 
 // ReadScreen 读取终端屏幕文本（lines=0 只要当前屏幕，不读 scrollback），
-// 供提取 FASTIMPL-READY/COMMIT 报告帧；complete=false 表示屏幕不完整。
+// 供提取 FASTIMPL-READY 报告帧；complete=false 表示屏幕不完整。
 func (r *Runner) ReadScreen(ctx context.Context, addr string, lines int) (text string, complete bool, err error) {
 	result, err := r.client.Read(addr, lines)
 	if err != nil {

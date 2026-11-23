@@ -24,9 +24,15 @@ import (
 // Tick 是调度循环查看图变化的间隔。
 const Tick = 500 * time.Millisecond
 
-// Forge 是调度器需要的 issue/MR 写操作；gitlab.Client 与 github.Client
+// RefreshInterval 是周期重读 forge 上全部节点开关状态的间隔：
+// 外部关闭的依赖会立即释放后继，无需等任何任务完成。
+const RefreshInterval = 10 * time.Minute
+
+// Forge 是调度器需要的 issue/MR 操作；gitlab.Client 与 github.Client
 // 都满足本接口（GitLab 的 projectID 即 GitHub 的 repo database id）。
 type Forge interface {
+	// IssueState 返回 issue 的开关与领取状态（claim 前重读与周期刷新共用）。
+	IssueState(ctx context.Context, projectID, iid int) (open, assignedToOther bool, err error)
 	// Claim 把 issue 指派给当前用户。
 	Claim(ctx context.Context, projectID, iid int) error
 	// Close 关闭一个 issue。
@@ -84,9 +90,9 @@ type Scheduler struct {
 }
 
 // New 组装调度器；所有依赖由 app 层注入，便于测试替换。
-// intDir 是集成分支 worktree 目录（app 已 EnsureIntegration），
-// baseName 是 MR 目标基点名。
-func New(cfg config.Config, repo *worktree.Repo, forge Forge, g *graph.Graph, sessions Sessions, template, intDir, baseName string, agentArgv []string, log *slog.Logger) *Scheduler {
+// intDir/intBranch/baseName 均来自 EnsureIntegration 的实际返回，
+// 复用带描述后缀或配置覆盖的分支名时也能正确合并与推送。
+func New(cfg config.Config, repo *worktree.Repo, forge Forge, g *graph.Graph, sessions Sessions, template, intDir, intBranch, baseName string, agentArgv []string, log *slog.Logger) *Scheduler {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -100,7 +106,7 @@ func New(cfg config.Config, repo *worktree.Repo, forge Forge, g *graph.Graph, se
 		intDir:    intDir,
 		log:       log,
 		specIID:   g.Spec().IID,
-		branch:    worktree.IntegrationBranch(g.Spec().IID),
+		branch:    intBranch,
 		baseName:  baseName,
 		agentArgv: agentArgv,
 	}
@@ -110,6 +116,7 @@ func New(cfg config.Config, repo *worktree.Repo, forge Forge, g *graph.Graph, se
 type taskResult struct {
 	key        graph.Key
 	integrated bool
+	closed     bool // 开跑前发现 issue 已被外部关闭：不当失败，只标记
 	commit     string
 	attention  string
 }
@@ -120,6 +127,8 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	defer s.stopIntegrationAgent()
 	running := make(map[graph.Key]bool)
 	results := make(chan taskResult, s.cfg.Parallelism)
+	refresh := time.NewTicker(RefreshInterval)
+	defer refresh.Stop()
 	for {
 		ready := s.g.Ready()
 		for _, n := range ready {
@@ -145,16 +154,39 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		select {
 		case res := <-results:
 			delete(running, res.key)
-			if res.integrated {
+			switch {
+			case res.integrated:
 				s.g.SetState(res.key, graph.Integrated)
 				s.log.Info("task integrated", "key", res.key, "commit", res.commit)
-			} else {
+			case res.closed:
+				s.g.SetClosed(res.key, true)
+				s.log.Info("issue already closed; skipped", "key", res.key)
+			default:
 				s.g.SetState(res.key, graph.NeedsAttention)
 				s.log.Warn("task needs attention", "key", res.key, "reason", res.attention)
 			}
+		case <-refresh.C:
+			s.refreshStates(ctx)
 		case <-time.After(Tick):
 		case <-ctx.Done():
 			return ctx.Err()
+		}
+	}
+}
+
+// refreshStates 周期重读所有节点在 forge 上的开关状态：
+// 外部关闭的依赖释放后继，重新打开的恢复 gating。
+// 单个节点读取失败只告警不中断本次刷新。
+func (s *Scheduler) refreshStates(ctx context.Context) {
+	for _, n := range s.g.Snapshot() {
+		open, _, err := s.forge.IssueState(ctx, n.Key.ProjectID, n.Key.IID)
+		if err != nil {
+			s.log.Warn("refresh issue state failed", "key", n.Key, "err", err)
+			continue
+		}
+		if n.Closed == open {
+			s.g.SetClosed(n.Key, !open)
+			s.log.Info("issue state refreshed", "key", n.Key, "closed", !open)
 		}
 	}
 }
@@ -289,7 +321,7 @@ func (s *Scheduler) resolveBaseConflict(ctx context.Context, files []string) err
 		return fmt.Errorf("send base-conflict prompt: %w", err)
 	}
 	for attempts := 0; ; attempts++ {
-		if _, err := s.sessions.WaitTurn(ctx, s.intAddr, baseline, worker.TurnBudget); err != nil {
+		if _, err := s.sessions.WaitTurn(ctx, s.intAddr, baseline, worker.IntegrationTurnBudget); err != nil {
 			return fmt.Errorf("wait integration worker turn: %w", err)
 		}
 		if _, err := s.captureReport(ctx, s.intAddr, token); err == nil {
@@ -331,17 +363,40 @@ func (s *Scheduler) stopIntegrationAgent() {
 // 合并冲突时让 agent 在任务 worktree 里解决后重试快速合并。
 func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- taskResult) {
 	res := taskResult{key: key}
-	fail := func(err error) {
+	iid := key.IID
+	// report 把失败原因写到 issue 评论里再上报，方便人工接手。
+	report := func(err error, note string) {
+		if nerr := s.forge.Note(ctx, key.ProjectID, iid, note); nerr != nil {
+			s.log.Warn("issue note failed", "key", key, "err", nerr)
+		}
 		res.attention = err.Error()
 		results <- res
 	}
-	iid := key.IID
+	fail := func(err error) {
+		report(err, "fastimpl: "+err.Error())
+	}
 
+	// 开跑前重读现场状态：建图快照可能已过期。
+	open, assignedToOther, err := s.forge.IssueState(ctx, key.ProjectID, iid)
+	if err != nil {
+		fail(fmt.Errorf("read issue state: %w", err))
+		return
+	}
+	if !open {
+		// 外部已关闭：依赖视为满足，不启动 worker。
+		res.closed = true
+		results <- res
+		return
+	}
+	if assignedToOther {
+		fail(errors.New("issue 已被他人领取，不抢占"))
+		return
+	}
 	if err := s.forge.Claim(ctx, key.ProjectID, iid); err != nil {
 		fail(fmt.Errorf("claim issue: %w", err))
 		return
 	}
-	dir, branch, err := s.repo.Create(ctx, s.specIID, iid)
+	dir, branch, err := s.repo.Create(ctx, s.branch, iid)
 	if err != nil {
 		fail(fmt.Errorf("create worktree: %w", err))
 		return
@@ -361,11 +416,11 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		return
 	}
 	s.log.Info("worker running", "key", key, "terminal", termName, "addr", addr)
-	// worker 启动后的失败：保留终端让用户 hc attach 排查，不主动 Kill。
-	report := fail
+	// worker 启动后的失败：保留终端让用户 hc attach 排查，不主动 Kill，
+	// 且把排查入口写进 issue 评论。
 	fail = func(err error) {
 		s.log.Warn("task needs attention", "key", key, "err", err, "inspect", "hc attach "+termName)
-		report(err)
+		report(err, "fastimpl: "+err.Error()+"\n排查终端: hc attach "+termName)
 	}
 
 	if _, err := s.sessions.AwaitBoot(ctx, addr); err != nil {

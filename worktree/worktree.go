@@ -146,8 +146,9 @@ func (r *Repo) baseRef(ctx context.Context, base string) string {
 // EnsureIntegration 确保 spec 的集成分支与它的 worktree 存在，
 // 返回分支名、worktree 目录与 MR 目标基点名。
 // 既有 issue-<spec>(-*)? 分支/worktree 直接复用；没有则按
-// main > master > origin/HEAD 顺序建 issue-<spec>-integration。
-func (r *Repo) EnsureIntegration(ctx context.Context, spec int, base string) (branch, dir, baseName string, err error) {
+// main > master > origin/HEAD 顺序建分支，名称为 want（空时默认
+// issue-<spec>-integration，config integration 可覆盖）。
+func (r *Repo) EnsureIntegration(ctx context.Context, spec int, base, want string) (branch, dir, baseName string, err error) {
 	baseName = r.baseName(ctx, base)
 	if err := os.MkdirAll(r.TreeDir, 0o755); err != nil {
 		return "", "", "", fmt.Errorf("create tree dir %s: %w", r.TreeDir, err)
@@ -158,7 +159,10 @@ func (r *Repo) EnsureIntegration(ctx context.Context, spec int, base string) (br
 	}
 	branch = r.findIssueBranch(ctx, spec)
 	if branch == "" {
-		branch = IntegrationBranch(spec)
+		branch = want
+		if branch == "" {
+			branch = IntegrationBranch(spec)
+		}
 		if _, err := r.run(ctx, r.Root, "branch", branch, r.baseRef(ctx, baseName)); err != nil {
 			return "", "", "", fmt.Errorf("create integration branch %s: %w", branch, err)
 		}
@@ -170,10 +174,11 @@ func (r *Repo) EnsureIntegration(ctx context.Context, spec int, base string) (br
 	return branch, dir, baseName, nil
 }
 
-// Create 为子任务从集成分支建 issue-<iid>(-*)? 分支与 worktree。
-// 已有匹配的 worktree 目录直接复用；有匹配分支复用该分支；
-// 都没有则从集成分支新建 issue-<iid>。返回目录与实际分支名。
-func (r *Repo) Create(ctx context.Context, spec, iid int) (dir, branch string, err error) {
+// Create 为子任务从 intBranch（实际集成分支名，含描述后缀/覆盖名）
+// 建 issue-<iid>(-*)? 分支与 worktree。已有匹配的 worktree 目录直接
+// 复用；有匹配分支复用该分支；都没有则从 intBranch 新建 issue-<iid>。
+// 返回目录与实际分支名。
+func (r *Repo) Create(ctx context.Context, intBranch string, iid int) (dir, branch string, err error) {
 	if existing := r.findIssueDir(iid); existing != "" {
 		return existing, filepath.Base(existing), nil
 	}
@@ -191,7 +196,7 @@ func (r *Repo) Create(ctx context.Context, spec, iid int) (dir, branch string, e
 		}
 		return dir, branch, nil
 	}
-	if _, err := r.run(ctx, r.Root, "worktree", "add", dir, "-b", branch, IntegrationBranch(spec)); err != nil {
+	if _, err := r.run(ctx, r.Root, "worktree", "add", dir, "-b", branch, intBranch); err != nil {
 		return "", "", fmt.Errorf("add worktree %s on %s: %w", dir, branch, err)
 	}
 	return dir, branch, nil

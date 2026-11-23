@@ -46,22 +46,12 @@ type Options struct {
 	SpecIID int
 }
 
-// Run 执行一次运行。
-//
-// 已实现：work-dir 解析 → config.Load（分层覆盖）→ repo-dir 解析
-// （-repo-dir > 配置 > worktree.FindRoot）→ origin 解析 → forge 解析
-// （配置 > 主机名启发式 > glab/gh 探测 > 默认 gitlab）→ forge client →
-// graph.Build（子任务 + blocked-by 传递闭包）→ -json 写文件 →
-// -print 打印文本依赖图并返回。
-//
-// TODO（对照 /tmp/ytmp/fastimpl demo）：
-//  1. prompt.Load(workDir, opts.TemplatePath)：读模板文件。
-//  2. tree-dir：worktree.ResolveTreeDir；EnsureIntegration 集成分支 worktree。
-//  3. worker.Dial（hcgo）→ scheduler.New → Scheduler.Run：
-//     就绪任务先 Claim（校验未被他人领取）→ 建 issue-<iid> worktree →
-//     hc 终端里跑 devin + 渲染后的 prompt → 轮询 OSC 7501 至 settled →
-//     读屏取报告 → eval.Judge 判定 → 通过则串行集成、推送、Close issue。
-//  4. 全部任务 integrated 后把集成分支对 main 交付合并请求。
+// Run 执行一次运行：
+// work-dir 解析 → config.Load（分层覆盖）→ repo-dir 解析 → origin
+// 解析 → forge 解析 → graph.Build（子任务 + blocked-by 传递闭包）→
+// -json/-print 导出 → prompt.Load → tree-dir 解析 → EnsureIntegration
+// 集成分支 worktree → SyncBase + push + EnsureMR → worker.Dial（hcgo）
+// → scheduler.Run（就绪即派、完成即放）。
 func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	workDir, err := resolveWorkDir(opts.WorkDir)
 	if err != nil {
@@ -109,7 +99,7 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	// 终端命名前缀用 origin 项目路径的最后一段（gzdev/bf9100 → bf9100），
 	// 多项目并行时避免 issue-<iid> 终端名互相碰撞。
 	repo.Name = path.Base(projectPath)
-	branch, intDir, baseName, err := repo.EnsureIntegration(ctx, opts.SpecIID, "")
+	branch, intDir, baseName, err := repo.EnsureIntegration(ctx, opts.SpecIID, "", cfg.Integration)
 	if err != nil {
 		return err
 	}
@@ -138,7 +128,7 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	defer runner.Close()
 	log := slog.New(slog.NewTextHandler(stderr, nil))
 	log.Info("integration ready", "branch", branch, "mr", mrURL)
-	sched := scheduler.New(cfg, repo, fc, g, runner, tmpl, intDir, baseName, agentArgv, log)
+	sched := scheduler.New(cfg, repo, fc, g, runner, tmpl, intDir, branch, baseName, agentArgv, log)
 	return sched.Run(ctx)
 }
 

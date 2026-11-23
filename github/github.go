@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/yangjuncode/fastimpl/config"
 	"net/url"
 	"os/exec"
 	"strconv"
@@ -39,6 +41,8 @@ type ExecRunner struct{}
 func (ExecRunner) Run(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "gh", argv...)
 	cmd.Dir = dir
+	// 子进程不继承 FASTIMPL_LLM_*，避免凭据经 gh 泄漏。
+	cmd.Env = config.ScrubbedEnv()
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -75,6 +79,16 @@ type Issue struct {
 
 // IsOpen 报告 issue 当前是否未关闭。
 func (i Issue) IsOpen() bool { return i.State == "open" }
+
+// AssignedToOther 报告 issue 是否已被当前用户之外的人领取。
+func (i Issue) AssignedToOther(login string) bool {
+	for _, a := range i.Assignees {
+		if a.Login != login {
+			return true
+		}
+	}
+	return false
+}
 
 // TypeName 返回 issue type 名（GitHub issue types，可缺省）。
 func (i Issue) TypeName() string {
@@ -349,6 +363,15 @@ func (c *Client) bindAll(ctx context.Context, issues []Issue) ([]RepoIssue, erro
 		out = append(out, bound)
 	}
 	return out, nil
+}
+
+// IssueState 返回 issue 的开关与领取状态（claim 前重读与周期刷新共用）。
+func (c *Client) IssueState(ctx context.Context, repoID, num int) (open, assignedToOther bool, err error) {
+	iss, err := c.Issue(ctx, repoID, num)
+	if err != nil {
+		return false, false, err
+	}
+	return iss.IsOpen(), iss.AssignedToOther(c.login), nil
 }
 
 // Claim 把 issue 指派给当前用户。

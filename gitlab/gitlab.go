@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+
+	"github.com/yangjuncode/fastimpl/config"
 )
 
 // Runner 执行 glab 命令；测试用假实现替换它。
@@ -29,7 +31,8 @@ type ExecRunner struct{}
 func (ExecRunner) Run(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "glab", argv...)
 	cmd.Dir = dir
-	// TODO: sanitizedEnv —— 过滤不应传给子进程的环境变量。
+	// 子进程不继承 FASTIMPL_LLM_*，避免凭据经 glab 泄漏。
+	cmd.Env = config.ScrubbedEnv()
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -195,6 +198,15 @@ func (c *Client) projectScope(projectID int) string {
 // escape 把项目路径编码成单个 REST 路径段。
 func escape(path string) string {
 	return url.PathEscape(path)
+}
+
+// IssueState 返回 issue 的开关与领取状态（claim 前重读与周期刷新共用）。
+func (c *Client) IssueState(ctx context.Context, projectID, iid int) (open, assignedToOther bool, err error) {
+	iss, err := c.Issue(ctx, projectID, iid)
+	if err != nil {
+		return false, false, err
+	}
+	return iss.IsOpen(), iss.AssignedToOther(c.username), nil
 }
 
 // Issue 读取指定项目中的一个 issue，并校验返回的项目与编号。
