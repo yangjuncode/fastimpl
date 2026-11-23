@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 
 	"github.com/yangjuncode/fastimpl/config"
+	"github.com/yangjuncode/fastimpl/files"
 	"github.com/yangjuncode/fastimpl/github"
 	"github.com/yangjuncode/fastimpl/gitlab"
 	"github.com/yangjuncode/fastimpl/graph"
@@ -24,6 +25,9 @@ import (
 
 // Options 是命令行（或 GUI）解析后的一次运行选项。
 type Options struct {
+	// Init 为真时把 fastimpl.toml 与 fastimpl.tmp.md 生成到
+	// work-dir 后退出：exe 目录已有同名文件则复制，没有用内置默认。
+	Init bool
 	// Print 为真时只读取并打印依赖图，不做任何写入。
 	Print bool
 	// JSONPath 非空时把完整依赖图（含 open/closed 状态）写到该 JSON 文件。
@@ -56,6 +60,9 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	workDir, err := resolveWorkDir(opts.WorkDir)
 	if err != nil {
 		return err
+	}
+	if opts.Init {
+		return initFiles(workDir, stdout)
 	}
 	cfg, err := config.Load(workDir, opts.ConfigPath)
 	if err != nil {
@@ -130,6 +137,36 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	log.Info("integration ready", "branch", branch, "mr", mrURL)
 	sched := scheduler.New(cfg, repo, fc, g, runner, tmpl, intDir, branch, baseName, agentArgv, log)
 	return sched.Run(ctx)
+}
+
+// initFiles 把配置与模板文件生成到 work-dir：优先复制 exe 目录
+// 的同名文件（用户可能已在全局层定制过），exe 目录没有则写内置
+// 默认内容。已存在的文件不覆盖，跳过并提示。
+func initFiles(workDir string, out io.Writer) error {
+	exeDir, err := files.ExeDir()
+	if err != nil {
+		return err
+	}
+	pairs := []struct{ name, fallback string }{
+		{config.DefaultFile, config.DefaultConfig},
+		{prompt.DefaultFile, prompt.DefaultTemplate},
+	}
+	for _, p := range pairs {
+		dst := filepath.Join(workDir, p.name)
+		if _, err := os.Stat(dst); err == nil {
+			fmt.Fprintf(out, "%s already exists; skipped\n", dst)
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(exeDir, p.name))
+		if err != nil {
+			data = []byte(p.fallback)
+		}
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", dst, err)
+		}
+		fmt.Fprintf(out, "wrote %s\n", dst)
+	}
+	return nil
 }
 
 // resolveWorkDir 解析工作目录：空取当前目录，结果转绝对路径。

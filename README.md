@@ -192,23 +192,27 @@ go build -o fastimpl ./cmd/fastimpl
 
 ```bash
 cd /path/to/repo            # work-dir 默认就是当前目录
+fastimpl -init              # 把配置与模板文件生成到当前目录，按需修改
 fastimpl -print 42          # 先看 spec issue #42 的依赖图，不写任何东西
 fastimpl 42                 # 正式运行
 ```
 
-第一次运行会在可执行文件同目录播种 `fastimpl.toml`（默认配置）与
-`fastimpl.tmp.md`（默认提示词模板），按需就地修改。
+`-init` 把 `fastimpl.toml` 与 `fastimpl.tmp.md` 生成到 work-dir：exe 同
+目录已有同名文件就**复制**它（全局层已定制的内容会带过来），没有则写
+内置默认内容；已存在的文件不覆盖、只提示跳过。也可以不跑 `-init`——
+首次正常运行时默认文件会自动播种到 exe 同目录。
 
 ### 命令行参数
 
 ```
-usage: fastimpl [-print] [-json file] [-j N] [-config path]
+usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
         [-template path] [-repo-dir dir] [-tree-dir dir]
         [-work-dir dir] <spec-issue-iid>
 ```
 
 | 参数 | 说明 |
 |---|---|
+| `-init` | 把 fastimpl.toml / fastimpl.tmp.md 生成到 work-dir 后退出（不接 spec IID，已有文件不覆盖） |
 | `-print` | 只打印依赖图（按拓扑分层）后退出，不做任何写操作 |
 | `-json <file>` | 把完整依赖图（含 open/closed）写到 JSON 文件；可与 `-print` 同用 |
 | `-j <N>` | 并发 worker 上限；0 表示用配置值 |

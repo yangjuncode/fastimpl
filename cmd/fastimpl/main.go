@@ -19,7 +19,7 @@ import (
 )
 
 // usageLine 是命令行用法说明。
-const usageLine = "usage: fastimpl [-print] [-json file] [-j N] [-config path] [-template path] [-repo-dir dir] [-tree-dir dir] [-work-dir dir] <spec-issue-iid>"
+const usageLine = "usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path] [-template path] [-repo-dir dir] [-tree-dir dir] [-work-dir dir] <spec-issue-iid>"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -46,6 +46,7 @@ func parseArguments(args []string, stderr io.Writer) (app.Options, error) {
 	flags := flag.NewFlagSet("fastimpl", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var opts app.Options
+	flags.BoolVar(&opts.Init, "init", false, "write fastimpl.toml and fastimpl.tmp.md into the work directory and exit")
 	flags.BoolVar(&opts.Print, "print", false, "print the dependency graph and exit without writing anything")
 	flags.StringVar(&opts.JSONPath, "json", "", "write the full dependency graph (with open/closed state) to this JSON file")
 	flags.IntVar(&opts.Parallelism, "j", 0, "maximum concurrent workers (0: use config or default)")
@@ -60,6 +61,14 @@ func parseArguments(args []string, stderr io.Writer) (app.Options, error) {
 	}
 	if err := flags.Parse(args); err != nil {
 		return app.Options{}, err
+	}
+	// -init 不需要 spec IID；给了反而说明用法有误。
+	if opts.Init {
+		if flags.NArg() != 0 {
+			flags.Usage()
+			return app.Options{}, errors.New("-init does not take a spec issue IID")
+		}
+		return opts, nil
 	}
 	if flags.NArg() != 1 {
 		flags.Usage()
