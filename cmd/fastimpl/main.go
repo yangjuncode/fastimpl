@@ -1,0 +1,68 @@
+// Command fastimpl 按 GitLab spec issue 的子任务阻塞关系分批并行运行
+// Devin worker：每个子任务在自己的 worktree 中工作，完成后由 fastimpl
+// 串行合入集成分支、推送并关闭 issue。
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/yangjuncode/fastimpl/app"
+)
+
+// usageLine 是命令行用法说明。
+const usageLine = "usage: fastimpl [-print] [-json file] [-j N] [-config path] [-template path] [-repo-dir dir] [-tree-dir dir] [-work-dir dir] <spec-issue-iid>"
+
+func main() {
+	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintln(os.Stderr, "fastimpl:", err)
+		os.Exit(1)
+	}
+}
+
+// run 解析命令行参数并交给 app.Run 执行。
+func run(args []string, stdout, stderr io.Writer) error {
+	opts, err := parseArguments(args, stderr)
+	if err != nil {
+		return err
+	}
+	return app.Run(context.Background(), opts, stdout, stderr)
+}
+
+// parseArguments 解析命令行；位置参数是 spec issue 的 IID。
+func parseArguments(args []string, stderr io.Writer) (app.Options, error) {
+	flags := flag.NewFlagSet("fastimpl", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	var opts app.Options
+	flags.BoolVar(&opts.Print, "print", false, "print the dependency graph and exit without writing anything")
+	flags.StringVar(&opts.JSONPath, "json", "", "write the full dependency graph (with open/closed state) to this JSON file")
+	flags.IntVar(&opts.Parallelism, "j", 0, "maximum concurrent workers (0: use config or default)")
+	flags.StringVar(&opts.ConfigPath, "config", "", "path to fastimpl.toml (default: <work-dir>/fastimpl.toml, fallback: <exe-dir>/fastimpl.toml)")
+	flags.StringVar(&opts.TemplatePath, "template", "", "worker prompt template (default: <work-dir>/fastimpl.tmp.md, fallback: <exe-dir>/fastimpl.tmp.md)")
+	flags.StringVar(&opts.RepoDir, "repo-dir", "", "target repository main checkout (default: locate within 8 levels up/down from work-dir)")
+	flags.StringVar(&opts.TreeDir, "tree-dir", "", "worktree parent directory (default: infer from existing worktrees, else <repo-dir>/.worktrees)")
+	flags.StringVar(&opts.WorkDir, "work-dir", "", "fastimpl working directory (default: current directory)")
+	flags.Usage = func() {
+		_, _ = io.WriteString(stderr, usageLine+"\n")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(args); err != nil {
+		return app.Options{}, err
+	}
+	if flags.NArg() != 1 {
+		flags.Usage()
+		return app.Options{}, errors.New("expected exactly one spec issue IID")
+	}
+	iid, err := strconv.Atoi(strings.TrimSpace(flags.Arg(0)))
+	if err != nil || iid <= 0 {
+		return app.Options{}, fmt.Errorf("spec issue IID must be a positive integer, got %q", flags.Arg(0))
+	}
+	opts.SpecIID = iid
+	return opts, nil
+}

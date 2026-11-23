@@ -1,0 +1,426 @@
+// Package github 通过 gh CLI 读写 GitHub：sub_issues 取子任务、
+// dependencies/blocked_by 取阻塞关联、启动 worker 前领取
+// （--add-assignee @me）、完成后关闭 issue。
+//
+// 与 GitLab 的差异（API 调研结论）：
+//   - 子任务是原生 sub-issues（可跨同 owner 仓库，≤100/parent，8 层深）；
+//   - blocked-by 是 dependencies API：GET/POST/DELETE
+//     /repos/{o}/{r}/issues/{n}/dependencies/blocked_by，
+//     仅 github.com 支持，GHES 没有——404 时降级为只解析正文
+//     "Blocked by: #n"；
+//   - issue 有三种 ID：number（路径/UI）、REST database id（写操作
+//     body 用）、GraphQL node_id；graph.Key{ProjectID,IID} 对应
+//     {repo 数据库 id, issue number}；
+//   - 所有调用显式带 --hostname 与 -R/--repo，不依赖 gh 推断。
+package github
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"os/exec"
+	"strconv"
+	"strings"
+)
+
+// Runner 执行 gh 命令；测试用假实现替换它。
+type Runner interface {
+	// Run 在 dir 中执行 gh，把 stdin 送入标准输入并返回标准输出。
+	Run(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error)
+}
+
+// ExecRunner 是调用真实 gh 的 Runner。
+type ExecRunner struct{}
+
+// Run 在仓库目录中执行 gh，不经过 shell 拼接，标准错误并入错误信息。
+func (ExecRunner) Run(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "gh", argv...)
+	cmd.Dir = dir
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("gh %s: %w: %s", strings.Join(argv, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
+}
+
+// Probe 用 gh 探测 host 是否是可达的 GitHub 实例：执行
+// `gh api --hostname <host> user`，连通且鉴权通过即认为上游是 GitHub。
+func Probe(ctx context.Context, runner Runner, dir, host string) bool {
+	_, err := runner.Run(ctx, dir, []string{"api", "--hostname", host, "user"}, nil)
+	return err == nil
+}
+
+// Issue 是一个 issue 的 REST 视图。
+type Issue struct {
+	Number int    `json:"number"` // 仓库内编号（对应 graph.Key.IID）
+	ID     int    `json:"id"`     // REST database id（写操作 body 用）
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	State  string `json:"state"` // open/closed
+	Type   *struct {
+		Name string `json:"name"`
+	} `json:"type"`
+	RepositoryURL string `json:"repository_url"` // 跨仓库关联时解析 repo id
+	Assignees     []struct {
+		Login string `json:"login"`
+	} `json:"assignees"`
+}
+
+// IsOpen 报告 issue 当前是否未关闭。
+func (i Issue) IsOpen() bool { return i.State == "open" }
+
+// TypeName 返回 issue type 名（GitHub issue types，可缺省）。
+func (i Issue) TypeName() string {
+	if i.Type == nil {
+		return "issue"
+	}
+	return i.Type.Name
+}
+
+// RepoIssue 是 issue 连同其所在仓库的 database id；
+// sub-issues 与 blocked-by 都可能跨同 owner 的仓库。
+type RepoIssue struct {
+	Issue
+	RepoID int // 仓库 REST database id（对应 graph.Key.ProjectID）
+}
+
+// Client 是面向单个 GitHub 仓库的 gh 适配器。
+type Client struct {
+	runner Runner
+	// dir 是执行 gh 的仓库目录。
+	dir string
+	// host 是 origin 的主机名（github.com 或 GHES），作为每个调用的显式主机。
+	host string
+	// repoRef 是 "owner/name"，作为写操作的显式 -R/--repo。
+	repoRef string
+	// repoID 是仓库的 REST database id（对应 graph.Key.ProjectID）。
+	repoID int
+	// login 是当前 gh 登录用户，用于领取判定。
+	login string
+	// repoNames 缓存 repo database id → "owner/name"；
+	// repoIDs 缓存反向映射。跨仓库关联在返回时登记，
+	// Issue/写操作经 repoNames 解析目标仓库。
+	repoNames map[int]string
+	repoIDs   map[string]int
+}
+
+// NewClient 探测项目身份与当前用户。wantPath 形如 "owner/repo"，必须来自
+// origin remote；返回的仓库与 origin 不一致时拒绝继续。
+func NewClient(ctx context.Context, runner Runner, dir, wantHost, wantPath string) (*Client, error) {
+	if wantHost == "" || wantPath == "" {
+		return nil, errors.New("origin host and path are required; fastimpl will not guess the GitHub repo")
+	}
+	repoJSON, err := runner.Run(ctx, dir, []string{"api", "--hostname", wantHost, "repos/" + wantPath}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("read repo identity: %w", err)
+	}
+	var repo struct {
+		ID       int    `json:"id"`
+		FullName string `json:"full_name"`
+	}
+	if err := json.Unmarshal(repoJSON, &repo); err != nil {
+		return nil, fmt.Errorf("decode repo identity: %w", err)
+	}
+	if repo.ID == 0 || repo.FullName == "" {
+		return nil, errors.New("repo identity is incomplete; run fastimpl inside the repository")
+	}
+	if !strings.EqualFold(repo.FullName, wantPath) {
+		return nil, fmt.Errorf("gh resolved repo %q, but origin is %q; run fastimpl in the origin's checkout", repo.FullName, wantPath)
+	}
+	userJSON, err := runner.Run(ctx, dir, []string{"api", "--hostname", wantHost, "user"}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("read current user: %w", err)
+	}
+	var user struct {
+		Login string `json:"login"`
+	}
+	if err := json.Unmarshal(userJSON, &user); err != nil {
+		return nil, fmt.Errorf("decode current user: %w", err)
+	}
+	if user.Login == "" {
+		return nil, errors.New("current user is unknown")
+	}
+	return &Client{
+		runner:    runner,
+		dir:       dir,
+		host:      wantHost,
+		repoRef:   repo.FullName,
+		repoID:    repo.ID,
+		login:     user.Login,
+		repoNames: map[int]string{repo.ID: repo.FullName},
+		repoIDs:   map[string]int{repo.FullName: repo.ID},
+	}, nil
+}
+
+// api 在以 origin 主机为显式参数的 gh 上执行一次只读 REST 调用。
+func (c *Client) api(ctx context.Context, args ...string) ([]byte, error) {
+	argv := append([]string{"api", "--hostname", c.host}, args...)
+	return c.runner.Run(ctx, c.dir, argv, nil)
+}
+
+// isNotFound 判定 gh api 的错误是否是 404（GHES 没有 dependencies API
+// 时据此降级；也用于 issue/parent 的可选检查）。
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "404") || strings.Contains(msg, "Not Found")
+}
+
+// repoPath 把 repo database id 解析成 "owner/name"；缓存未命中时经
+// `gh api repositories/<id>` 查询并登记双向缓存。
+func (c *Client) repoPath(ctx context.Context, repoID int) (string, error) {
+	if repoID == c.repoID {
+		return c.repoRef, nil
+	}
+	if path, ok := c.repoNames[repoID]; ok {
+		return path, nil
+	}
+	raw, err := c.api(ctx, fmt.Sprintf("repositories/%d", repoID))
+	if err != nil {
+		return "", fmt.Errorf("resolve repo id %d: %w", repoID, err)
+	}
+	var repo struct {
+		FullName string `json:"full_name"`
+	}
+	if err := json.Unmarshal(raw, &repo); err != nil || repo.FullName == "" {
+		return "", fmt.Errorf("resolve repo id %d: no full_name", repoID)
+	}
+	c.repoNames[repoID] = repo.FullName
+	c.repoIDs[repo.FullName] = repoID
+	return repo.FullName, nil
+}
+
+// repoIdentity 把 "owner/name" 解析成 repo database id 并登记缓存；
+// 已知路径直接返回。
+func (c *Client) repoIdentity(ctx context.Context, path string) (int, error) {
+	if path == c.repoRef {
+		return c.repoID, nil
+	}
+	if id, ok := c.repoIDs[path]; ok {
+		return id, nil
+	}
+	raw, err := c.api(ctx, "repos/"+path)
+	if err != nil {
+		return 0, fmt.Errorf("resolve repo %s: %w", path, err)
+	}
+	var repo struct {
+		ID int `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &repo); err != nil || repo.ID == 0 {
+		return 0, fmt.Errorf("resolve repo %s: no id", path)
+	}
+	c.repoNames[repo.ID] = path
+	c.repoIDs[path] = repo.ID
+	return repo.ID, nil
+}
+
+// pathFromIssueURL 从 issue.repository_url（形如
+// https://api.github.com/repos/owner/name）提取 "owner/name"。
+func pathFromIssueURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.Trim(strings.TrimPrefix(u.Path, "/repos/"), "/")
+}
+
+// bindRepo 确定 issue 所在仓库的 database id：repository_url 指向的
+// 仓库不是 origin 时解析/登记其 id。
+func (c *Client) bindRepo(ctx context.Context, issue Issue) (RepoIssue, error) {
+	path := pathFromIssueURL(issue.RepositoryURL)
+	if path == "" || strings.EqualFold(path, c.repoRef) {
+		return RepoIssue{Issue: issue, RepoID: c.repoID}, nil
+	}
+	id, err := c.repoIdentity(ctx, path)
+	if err != nil {
+		return RepoIssue{}, err
+	}
+	return RepoIssue{Issue: issue, RepoID: id}, nil
+}
+
+// decodePages 把 `gh api --paginate` 输出的连续 JSON 数组逐页解码。
+func decodePages[T any](raw []byte, what string) ([]T, error) {
+	var out []T
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	for decoder.More() {
+		var page []T
+		if err := decoder.Decode(&page); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", what, err)
+		}
+		out = append(out, page...)
+	}
+	return out, nil
+}
+
+// Spec 读取 spec issue。GitHub 任何 issue 都可挂 sub-issues；
+// 有 parent 时提示改用顶层 spec（parent 端点在 GHES 上 404，视为无父级）。
+func (c *Client) Spec(ctx context.Context, num int) (Issue, error) {
+	issue, err := c.Issue(ctx, c.repoID, num)
+	if err != nil {
+		return Issue{}, err
+	}
+	raw, err := c.api(ctx, fmt.Sprintf("repos/%s/issues/%d/parent", c.repoRef, num))
+	if err == nil {
+		var parent struct {
+			Number int `json:"number"`
+		}
+		if json.Unmarshal(raw, &parent) == nil && parent.Number != 0 {
+			return Issue{}, fmt.Errorf("issue %d is a sub-issue of #%d; pass the top-level spec issue", num, parent.Number)
+		}
+	} else if !isNotFound(err) {
+		return Issue{}, fmt.Errorf("check parent of issue %d: %w", num, err)
+	}
+	return issue, nil
+}
+
+// Issue 读取指定仓库中的一个 issue。
+func (c *Client) Issue(ctx context.Context, repoID, num int) (Issue, error) {
+	path, err := c.repoPath(ctx, repoID)
+	if err != nil {
+		return Issue{}, err
+	}
+	raw, err := c.api(ctx, fmt.Sprintf("repos/%s/issues/%d", path, num))
+	if err != nil {
+		return Issue{}, fmt.Errorf("read issue %s#%d: %w", path, num, err)
+	}
+	var issue Issue
+	if err := json.Unmarshal(raw, &issue); err != nil {
+		return Issue{}, fmt.Errorf("decode issue %s#%d: %w", path, num, err)
+	}
+	if issue.Number != num {
+		return Issue{}, fmt.Errorf("issue %s#%d returned number %d", path, num, issue.Number)
+	}
+	return issue, nil
+}
+
+// Children 分页读取 spec 的全部 sub-issues（无 GitLab 式 type 过滤，
+// 全部 sub-issue 都是工作项）。
+func (c *Client) Children(ctx context.Context, specNum int) ([]RepoIssue, error) {
+	raw, err := c.api(ctx, "--paginate", fmt.Sprintf("repos/%s/issues/%d/sub_issues", c.repoRef, specNum))
+	if err != nil {
+		return nil, fmt.Errorf("read sub_issues of #%d: %w", specNum, err)
+	}
+	issues, err := decodePages[Issue](raw, fmt.Sprintf("sub_issues of #%d", specNum))
+	if err != nil {
+		return nil, err
+	}
+	return c.bindAll(ctx, issues)
+}
+
+// BlockedBy 分页读取一个 issue 的 blocked-by 依赖（可跨仓库）。
+// dependencies API 仅 github.com 支持；404 表示 GHES 无此 API，
+// 返回空让调用方只靠正文 "Blocked by: #n" 降级解析。
+func (c *Client) BlockedBy(ctx context.Context, repoID, num int) ([]RepoIssue, error) {
+	path, err := c.repoPath(ctx, repoID)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := c.api(ctx, "--paginate", fmt.Sprintf("repos/%s/issues/%d/dependencies/blocked_by", path, num))
+	if err != nil {
+		if isNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read blocked_by of %s#%d: %w", path, num, err)
+	}
+	issues, err := decodePages[Issue](raw, fmt.Sprintf("blocked_by of %s#%d", path, num))
+	if err != nil {
+		return nil, err
+	}
+	return c.bindAll(ctx, issues)
+}
+
+// bindAll 给一组 issue 绑定仓库 database id。
+func (c *Client) bindAll(ctx context.Context, issues []Issue) ([]RepoIssue, error) {
+	out := make([]RepoIssue, 0, len(issues))
+	for _, issue := range issues {
+		bound, err := c.bindRepo(ctx, issue)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, bound)
+	}
+	return out, nil
+}
+
+// Claim 把 issue 指派给当前用户。
+// 调用前必须重新读取状态与指派；被他人领取的任务不得启动。
+func (c *Client) Claim(ctx context.Context, repoID, num int) error {
+	path, err := c.repoPath(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	_, err = c.runner.Run(ctx, c.dir, []string{"issue", "edit", strconv.Itoa(num), "--add-assignee", "@me", "-R", path, "--hostname", c.host}, nil)
+	return err
+}
+
+// Close 关闭一个 issue。
+func (c *Client) Close(ctx context.Context, repoID, num int) error {
+	path, err := c.repoPath(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	_, err = c.runner.Run(ctx, c.dir, []string{"issue", "close", strconv.Itoa(num), "-R", path, "--hostname", c.host}, nil)
+	return err
+}
+
+// Note 在 issue 上追加一条评论。
+func (c *Client) Note(ctx context.Context, repoID, num int, message string) error {
+	path, err := c.repoPath(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	_, err = c.runner.Run(ctx, c.dir, []string{"issue", "comment", strconv.Itoa(num), "--body", message, "-R", path, "--hostname", c.host}, nil)
+	return err
+}
+
+// EnsureMR 确保 sourceBranch → targetBranch 的 PR 存在：
+// 已有 open PR 返回其 html_url；否则经 REST 创建并返回 html_url。
+func (c *Client) EnsureMR(ctx context.Context, repoID int, sourceBranch, targetBranch, title string) (string, error) {
+	path, err := c.repoPath(ctx, repoID)
+	if err != nil {
+		return "", err
+	}
+	owner := strings.SplitN(path, "/", 2)[0]
+	raw, err := c.api(ctx, fmt.Sprintf("repos/%s/pulls?state=open&head=%s:%s", path, owner, sourceBranch))
+	if err != nil {
+		return "", fmt.Errorf("list pull requests for %s: %w", sourceBranch, err)
+	}
+	var prs []struct {
+		HTMLURL string `json:"html_url"`
+	}
+	if err := json.Unmarshal(raw, &prs); err != nil {
+		return "", fmt.Errorf("decode pull requests for %s: %w", sourceBranch, err)
+	}
+	if len(prs) > 0 && prs[0].HTMLURL != "" {
+		return prs[0].HTMLURL, nil
+	}
+	raw, err = c.api(ctx, "-X", "POST", "repos/"+path+"/pulls",
+		"-f", "head="+sourceBranch,
+		"-f", "base="+targetBranch,
+		"-f", "title="+title)
+	if err != nil {
+		return "", fmt.Errorf("create pull request %s -> %s: %w", sourceBranch, targetBranch, err)
+	}
+	var pr struct {
+		HTMLURL string `json:"html_url"`
+	}
+	if err := json.Unmarshal(raw, &pr); err != nil || pr.HTMLURL == "" {
+		return "", fmt.Errorf("decode created pull request for %s", sourceBranch)
+	}
+	return pr.HTMLURL, nil
+}
+
+// Login 返回当前 gh 登录用户。
+func (c *Client) Login() string { return c.login }
+
+// RepoID 返回 origin 仓库的 database id。
+func (c *Client) RepoID() int { return c.repoID }
