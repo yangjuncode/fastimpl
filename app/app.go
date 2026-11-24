@@ -26,7 +26,7 @@ import (
 
 // Options 是命令行（或 GUI）解析后的一次运行选项。
 type Options struct {
-	// Init 为真时把 fastimpl.toml 与 fastimpl.tmp.md 生成到
+	// Init 为真时把 fastimpl.toml 与 fastimpl.prompt.md 生成到
 	// work-dir 后退出：exe 目录已有同名文件则复制，没有用内置默认。
 	Init bool
 	// Print 为真时只读取并打印依赖图，不做任何写入。
@@ -38,7 +38,7 @@ type Options struct {
 	// ConfigPath 是配置文件路径。
 	ConfigPath string
 	// TemplatePath 是 worker 提示词模板路径；空表示先查
-	// <work-dir>/fastimpl.tmp.md，再查 <exe 目录>/fastimpl.tmp.md。
+	// <work-dir>/fastimpl.prompt.md，再查 <exe 目录>/fastimpl.prompt.md。
 	TemplatePath string
 	// RepoDir 是目标仓库主 checkout 目录；空表示从 work-dir 出发
 	// 向上/向下各搜至多 8 级，唯一命中即用（worktree.FindRoot）。

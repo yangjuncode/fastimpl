@@ -25,7 +25,7 @@
   - [快速开始](#快速开始)
   - [命令行参数](#命令行参数)
   - [配置文件 fastimpl.toml](#配置文件-fastimpltoml)
-  - [提示词模板 fastimpl.tmp.md](#提示词模板-fastimpltmpmd)
+  - [提示词模板 fastimpl.prompt.md](#提示词模板-fastimplpromptmd)
   - [目录解析约定](#目录解析约定)
   - [观察与排查](#观察与排查)
   - [中断与重跑](#中断与重跑)
@@ -197,7 +197,7 @@ fastimpl -print 42          # 先看 spec issue #42 的依赖图，不写任何�
 fastimpl 42                 # 正式运行
 ```
 
-`-init` 把 `fastimpl.toml` 与 `fastimpl.tmp.md` 生成到 work-dir：exe 同
+`-init` 把 `fastimpl.toml` 与 `fastimpl.prompt.md` 生成到 work-dir：exe 同
 目录已有同名文件就**复制**它（全局层已定制的内容会带过来），没有则写
 内置默认内容；已存在的文件不覆盖、只提示跳过。也可以不跑 `-init`——
 首次正常运行时默认文件会自动播种到 exe 同目录。
@@ -212,7 +212,7 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
 
 | 参数 | 说明 |
 |---|---|
-| `-init` | 把 fastimpl.toml / fastimpl.tmp.md 生成到 work-dir 后退出（不接 spec IID，已有文件不覆盖） |
+| `-init` | 把 fastimpl.toml / fastimpl.prompt.md 生成到 work-dir 后退出（不接 spec IID，已有文件不覆盖） |
 | `-print` | 只打印依赖图（按拓扑分层）后退出，不做任何写操作 |
 | `-json <file>` | 把完整依赖图（含 open/closed）写到 JSON 文件；可与 `-print` 同用 |
 | `-j <N>` | 并发 worker 上限；0 表示用配置值 |
@@ -251,9 +251,9 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
   herdr-core，后者直连已有 Unix socket。
 - **`retries = 0` 是合法值**（只尝试一次，不续写）。
 
-### 提示词模板 fastimpl.tmp.md
+### 提示词模板 fastimpl.prompt.md
 
-查找顺序与配置相同：`<work-dir>/fastimpl.tmp.md` > `<exe 目录>`，缺失时
+查找顺序与配置相同：`<work-dir>/fastimpl.prompt.md` > `<exe 目录>`，缺失时
 把内置默认模板播种到 exe 目录。模板中的占位符：
 
 - `{issue-no}` — 子任务 issue IID
@@ -326,9 +326,10 @@ files               文件查找约定：work-dir > exe 目录（config/prompt �
 worktree            git 操作：FindRoot/ResolveTreeDir/分支与 worktree CRUD/
                     merge/push/SyncBase/ConflictError
 gitlab / github     forge 客户端：依赖图源（Spec/Children/BlockedBy）+
-                    Forge 端口（IssueState/Claim/Close/Note/EnsureMR/Probe）
+                    forge.Forge 实现（IssueState/Claim/Close/Note/EnsureMR/Probe）
+forge               Forge 接口与 IssueInfo：issue/MR 操作抽象（调度器↔客户端共享）
 graph               依赖图：Build 传递闭包、Ready/Done、拓扑分层、文本/JSON 渲染
-prompt              fastimpl.tmp.md 加载/播种与 {issue-no}/{token} 渲染
+prompt              fastimpl.prompt.md 加载/播种与 {issue-no}/{token} 渲染
 worker              hcgo 终端管理：启动/发提示词/轮询 7501/读屏/停止；
                     FASTIMPL-READY 报告协议与令牌
 scheduler           调度核心：就绪即派、任务生命周期、串行集成、

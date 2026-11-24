@@ -1,6 +1,6 @@
 // Package files 实现 fastimpl 本地文件的统一查找约定：
 // 命令行显式路径 > <work-dir>/<name> > <exe 同目录>/<name>。
-// 用于配置（fastimpl.toml）、提示词模板（fastimpl.tmp.md）等文件。
+// 用于配置（fastimpl.toml）、提示词模板（fastimpl.prompt.md）等文件。
 package files
 
 import (

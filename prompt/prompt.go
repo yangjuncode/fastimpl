@@ -1,6 +1,6 @@
 // Package prompt 加载并渲染 worker 提示词模板。模板是文件，按
-// files.Resolve 的约定查找：<work-dir>/fastimpl.tmp.md 优先
-// （项目级定制），没有则用 <exe 同目录>/fastimpl.tmp.md（随程序
+// files.Resolve 的约定查找：<work-dir>/fastimpl.prompt.md 优先
+// （项目级定制），没有则用 <exe 同目录>/fastimpl.prompt.md（随程序
 // 分发的默认模板）；-template 可显式指定其他文件。
 package prompt
 
@@ -16,7 +16,7 @@ import (
 )
 
 // DefaultFile 是默认模板文件名，先在 work-dir 查找，再在 exe 目录查找。
-const DefaultFile = "fastimpl.tmp.md"
+const DefaultFile = "fastimpl.prompt.md"
 
 // DefaultTemplate 是模板文件都不存在时播种到 exe 目录的默认内容。
 // 报告协议行（FASTIMPL-READY <token>）是 fastimpl 与 worker 的契约，
