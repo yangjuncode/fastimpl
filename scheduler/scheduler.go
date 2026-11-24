@@ -464,16 +464,17 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	}
 	token := worker.NewToken()
 	text, err := prompt.Render(s.template, prompt.Vars{
-		IssueNo:   iid,
-		Token:     token,
-		SpecNo:    s.specIID,
-		Worktree:  dir,
-		WorkDir:   s.workDir,
-		RepoDir:   s.repo.Root,
-		IntBranch: s.branch,
-		Branch:    branch,
-		Forge:     s.forgeName,
-		ForgeCLI:  forgeCLI(s.forgeName),
+		IssueNo:       iid,
+		Token:         token,
+		SpecNo:        s.specIID,
+		Worktree:      dir,
+		WorkDir:       s.workDir,
+		RepoDir:       s.repo.Root,
+		IntBranch:     s.branch,
+		Branch:        branch,
+		Forge:         s.forgeName,
+		ForgeCLI:      forgeCLI(s.forgeName),
+		RequireReview: s.cfg.RequireReview,
 	})
 	if err != nil {
 		fail(fmt.Errorf("render prompt: %w", err))

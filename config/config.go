@@ -39,6 +39,8 @@ const DefaultConfig = `# fastimpl 配置（TOML）
 # agent_cmd = "devin --model swe-2-medium"  # worker 的 agent 命令行（按 shell
 #                                          # 规则拆分）；缺省为 devin [--model]
 # integration = "branch"           # 覆盖默认集成分支 issue-<spec>-integration
+# require_review = true            # worker 提示词是否强制 leader + 第三方
+#                                # （fusion-3rd-reviewer-swe2max）双审（默认 true）
 # hc_socket = "/run/user/1000/hc.sock"  # herdr-core socket（与 hc_binary 二选一）
 # hc_binary = "hc"                      # 或经 hc connect 连接
 #
@@ -94,6 +96,9 @@ type Config struct {
 	// Forge 是上游 forge 类型（ForgeGitLab|ForgeGitHub）；空表示按
 	// origin 主机名推断，推断不出按 ForgeGitLab。
 	Forge string
+	// RequireReview 控制 worker 提示词是否写入"leader + 第三方
+	// 独立审核全部通过"的硬性要求（默认 true）。
+	RequireReview bool
 	// SpecIID 是本次运行的 spec issue IID，由命令行给出。
 	SpecIID int
 	// ResumeBudget 是暂停后等待用户推进的时限。
@@ -102,16 +107,17 @@ type Config struct {
 
 // rawConfig 区分"未配置"与显式零值，使 retries = 0 不被默认值覆盖。
 type rawConfig struct {
-	Parallelism *int    `toml:"parallelism"`
-	Retries     *int    `toml:"retries"`
-	RepoDir     *string `toml:"repo_dir"`
-	TreeDir     *string `toml:"tree_dir"`
-	DevinModel  *string `toml:"devin_model"`
-	AgentCmd    *string `toml:"agent_cmd"`
-	Integration *string `toml:"integration"`
-	HcBinary    *string `toml:"hc_binary"`
-	HcSocket    *string `toml:"hc_socket"`
-	Forge       *string `toml:"forge"`
+	Parallelism   *int    `toml:"parallelism"`
+	Retries       *int    `toml:"retries"`
+	RepoDir       *string `toml:"repo_dir"`
+	TreeDir       *string `toml:"tree_dir"`
+	DevinModel    *string `toml:"devin_model"`
+	AgentCmd      *string `toml:"agent_cmd"`
+	Integration   *string `toml:"integration"`
+	RequireReview *bool   `toml:"require_review"`
+	HcBinary      *string `toml:"hc_binary"`
+	HcSocket      *string `toml:"hc_socket"`
+	Forge         *string `toml:"forge"`
 }
 
 // defaultParallelism 是未配置 parallelism 时的并发上限。
@@ -217,10 +223,11 @@ func Load(workDir, path string) (Config, error) {
 		}
 	}
 	cfg := Config{
-		Parallelism:  defaultParallelism(),
-		Retries:      DefaultRetries,
-		WorkDir:      workDir,
-		ResumeBudget: DefaultResumeBudget,
+		Parallelism:   defaultParallelism(),
+		Retries:       DefaultRetries,
+		WorkDir:       workDir,
+		RequireReview: true,
+		ResumeBudget:  DefaultResumeBudget,
 	}
 	applyRaw(&cfg, base)
 	applyRaw(&cfg, over)
@@ -269,6 +276,9 @@ func applyRaw(cfg *Config, raw rawConfig) {
 	}
 	if raw.Integration != nil {
 		cfg.Integration = *raw.Integration
+	}
+	if raw.RequireReview != nil {
+		cfg.RequireReview = *raw.RequireReview
 	}
 	if raw.HcBinary != nil {
 		cfg.HcBinary = *raw.HcBinary

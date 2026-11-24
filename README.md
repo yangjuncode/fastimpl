@@ -239,6 +239,7 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
 # devin_model = "swe-2-medium"          # devin --model 参数
 # agent_cmd = "devin --model swe-2-medium"  # worker 的 agent 命令行
 # integration = "branch"     # 覆盖默认集成分支 issue-<spec>-integration
+# require_review = true      # worker 提示词是否强制 leader + 第三方双审（默认 true）
 # hc_socket = "/run/user/1000/hc.sock"  # herdr-core socket（与 hc_binary 二选一）
 # hc_binary = "hc"                      # 或经 hc connect 连接
 ```
@@ -273,6 +274,8 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
   最终由 fastimpl 合入集成分支
 - `{{.Forge}}` — 上游 forge 类型（`gitlab`/`github`）
 - `{{.ForgeCLI}}` — 对应的 issue 命令行工具（`glab`/`gh`）
+- `{{.RequireReview}}` — 是否强制 leader + 第三方独立审核
+  （`require_review` 配置，默认 true）
 
 模板与 fastimpl 的**唯一契约是报告协议**：任务全部完成（含仓库要求的
 验证）后在回复末尾单独一行输出 `FASTIMPL-READY <token>`，随后最多六行

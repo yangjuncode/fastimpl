@@ -60,3 +60,27 @@ func TestDefaultTemplateBranch(t *testing.T) {
 		t.Fatalf("diff-dir branch wrong: %s", diff[:120])
 	}
 }
+
+// TestDefaultTemplateReviewToggle require_review 开关第三方审核段：
+// true 时包含 reviewer 与"两轮审核"，false 时整段不出现。
+func TestDefaultTemplateReviewToggle(t *testing.T) {
+	v := Vars{IssueNo: 1, Token: "t", Worktree: "/wt", WorkDir: "/wd", RepoDir: "/r", RequireReview: true}
+	on, err := Render(DefaultTemplate, v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(on, "fusion-3rd-reviewer-swe2max") || !strings.Contains(on, "两轮审核") {
+		t.Fatalf("review-on render missing reviewer clause")
+	}
+	v.RequireReview = false
+	off, err := Render(DefaultTemplate, v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(off, "fusion-3rd-reviewer") || strings.Contains(off, "两轮审核") {
+		t.Fatalf("review-off render still has reviewer clause")
+	}
+	if !strings.Contains(off, "验证后提交") || !strings.Contains(off, "验证全部通过") {
+		t.Fatalf("review-off render broken: %s", off[:200])
+	}
+}
