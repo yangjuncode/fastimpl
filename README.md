@@ -98,12 +98,36 @@
 
 | 对象 | 命名 | 目录 | 生命周期 |
 |---|---|---|---|
-| 集成分支 | `issue-<spec>-integration`（可被 `integration` 配置覆盖）；复用时也接受 `issue-<spec>`、`issue-<spec>-<描述>` | `<tree-dir>/<分支名>` | 运行开始时确保存在：已有则复用，否则按 `main → master → origin/HEAD` 顺序选基点创建 |
+| 集成分支 | `issue-<spec>-integration`（可被 `integration` 配置覆盖）；未配置时复用时也接受 `issue-<spec>`、`issue-<spec>-<描述>` | `<tree-dir>/<分支名>` | 运行开始时确保存在：优先复用协作者已推送的远程集成分支，其次复用本地 worktree/分支，都没有才从 base 新建（详见下节） |
 | 任务分支 | `issue-<iid>`（新建）；复用时接受 `issue-<iid>-<描述>` | `<tree-dir>/<分支名>` | 从集成分支创建；集成成功后与 worktree 一起删除 |
 | hc 终端 | `<repo名>-<分支名>`，如 `bf9100-issue-9`、集成终端 `bf9100-issue-8-integration` | — | repo 名取 origin 项目路径最后一段，多项目并行不撞名 |
 
 所有 git 操作都在 worktree 中进行，**主 checkout 不被触碰**——你可以
 照常使用自己的仓库目录。
+
+#### 集成分支的复用规则
+
+运行开始时 `EnsureIntegration` 先 `fetch origin`，再用
+`git ls-remote --heads origin` 取真实的远程分支列表作为候选（不用本地
+`refs/remotes/origin`——那里的缓存可能残留已删除的分支，窄 fetch
+refspec 下又会缺少真实分支；普通 fetch 也不会 prune）。之后：
+
+- **未配置 `integration`**：按 `issue-<spec>` / `issue-<spec>-<描述>`
+  边界匹配（`issue-<spec>0` 不算）。远程有多个候选 → 报错列出候选，
+  不交互。远程唯一候选 → 本地同名 worktree/分支存在就同步远端后复用，
+  本地没有任何匹配对象就按远程名建跟踪分支，本地匹配名与远程名不同则
+  报错列出两者（不自动改名或合并）。远程无候选 → 复用本地匹配
+  worktree/分支，都没有才按 `main → master → origin/HEAD` 选基点建
+  `issue-<spec>-integration`。
+- **配置了 `integration`**：只认该确切名字，其它 `issue-<spec>*`
+  本地/远程名字都不能顶替。同名 worktree/本地分支优先（远程也存在同名
+  分支时同步），否则跟踪 `origin/<want>`，都没有才从 base 新建配置名。
+
+被复用或合并的目录必须先验证：`symbolic-ref HEAD` 精确等于
+`refs/heads/<分支>`，且 `git rev-parse --git-common-dir` 与本仓库一致。
+普通仓库、别的仓库、detached HEAD 或停在其它分支一律报错并且不做任何
+修改。窄 fetch refspec 下会按单分支 refspec 补一次 fetch，并用单次
+`git -c` 记录 `branch.remote`/`branch.merge`，不改长期 fetch 配置。
 
 ### worker 生命周期与完成协议
 
@@ -151,6 +175,16 @@ SyncBase(origin/<base>)  →  merge --no-ff <任务分支>  →  push <集成分
   执行 `git merge origin/<base>`、解决冲突并提交（明确禁止 reset/
   rebase 丢弃已有成果），标记出现后重跑 `SyncBase` 验证。重试耗尽则
   置 `baseStuck` 跳过后续同步（任务合并照常），终端保留供排查。
+- **协作者远端更新**：若本地集成分支与真实的 `origin/<分支>` 都存在，
+  就在集成 worktree 里把远端合入本地。拒绝条件：该 worktree 有未提交
+  改动（`--untracked-files=all`）或已有未结束的 merge——两者都直接报错，
+  不动用户状态、绝不 abort 别人的操作。通过后用
+  `git merge-base HEAD refs/remotes/origin/<分支>` 判断共同祖先，exit 1
+  即无共同祖先 → 报错交由人工处理（其它错误照原样报出）。合并用
+  `git merge --ff --no-edit --no-squash`（即使仓库配了 `merge.ff=only`，
+  双方分叉也能正常产生 merge commit）；只有本次 merge 失败且确实留下
+  `MERGE_HEAD` 时才 `git merge --abort`，abort 自身失败也会如实报出，
+  绝不声称已恢复。全程不 reset/rebase、不丢提交，主 checkout 不切分支。
 - **推送与 MR**：启动时集成分支就位后立即 `push -u` 并 `EnsureMR`
   （GitLab MR / GitHub PR，目标为 base 分支）；之后每次集成成功再推送，
   MR 上的提交自然累积，可随时在页面上查看整体进度。

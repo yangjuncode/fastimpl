@@ -5,11 +5,13 @@ package worktree
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -97,18 +99,85 @@ func (r *Repo) findIssueBranch(ctx context.Context, iid int) string {
 	return ""
 }
 
-// findIssueDir 在 TreeDir 下查找已存在的 issue-<iid>(-*)? worktree 目录。
-func (r *Repo) findIssueDir(iid int) string {
+func exitCode(err error, want int) bool {
+	var ee *exec.ExitError
+	return errors.As(err, &ee) && ee.ExitCode() == want
+}
+
+func (r *Repo) fetchOrigin(ctx context.Context) error {
+	if _, err := r.run(ctx, r.Root, "fetch", "origin"); err != nil {
+		return fmt.Errorf("fetch origin: %w", err)
+	}
+	return nil
+}
+
+// remoteHeads 以 ls-remote 列出 origin 的真实分支：本地 refs/remotes 会残留
+// 已删除的分支（fetch 不带 --prune），窄 fetch refspec 下又会缺少真实分支。
+func (r *Repo) remoteHeads(ctx context.Context) (map[string]string, error) {
+	out, err := r.run(ctx, r.Root, "ls-remote", "--heads", "origin")
+	if err != nil {
+		return nil, fmt.Errorf("list origin branches: %w", err)
+	}
+	heads := map[string]string{}
+	for line := range strings.Lines(out) {
+		sha, ref, ok := strings.Cut(strings.TrimSpace(line), "\t")
+		if !ok {
+			continue
+		}
+		if name, ok := strings.CutPrefix(ref, "refs/heads/"); ok && name != "" {
+			heads[name] = sha
+		}
+	}
+	return heads, nil
+}
+
+func matchedHeads(heads map[string]string, iid int) []string {
+	var names []string
+	for name := range heads {
+		if issueName(name, iid) {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+func (r *Repo) localBranches(ctx context.Context, iid int) ([]string, error) {
+	out, err := r.run(ctx, r.Root, "for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads/")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, name := range strings.Split(strings.TrimSpace(out), "\n") {
+		if issueName(name, iid) {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
+func (r *Repo) issueDirs(iid int) []string {
 	entries, err := os.ReadDir(r.TreeDir)
 	if err != nil {
-		return ""
+		return nil
 	}
+	var dirs []string
 	for _, e := range entries {
+		dir := filepath.Join(r.TreeDir, e.Name())
 		if e.IsDir() && issueName(e.Name(), iid) {
-			if _, statErr := os.Stat(filepath.Join(r.TreeDir, e.Name(), ".git")); statErr == nil {
-				return filepath.Join(r.TreeDir, e.Name())
+			if _, statErr := os.Stat(filepath.Join(dir, ".git")); statErr == nil {
+				dirs = append(dirs, dir)
 			}
 		}
+	}
+	slices.Sort(dirs)
+	return dirs
+}
+
+// findIssueDir 在 TreeDir 下查找已存在的 issue-<iid>(-*)? worktree 目录。
+func (r *Repo) findIssueDir(iid int) string {
+	if dirs := r.issueDirs(iid); len(dirs) > 0 {
+		return dirs[0]
 	}
 	return ""
 }
@@ -135,43 +204,272 @@ func (r *Repo) baseName(ctx context.Context, base string) string {
 	return "main"
 }
 
-// baseRef 把基点名解析为可建分支的 ref：优先 origin/<base>。
+// baseRef 把基点名解析为可建分支的 ref：优先远程跟踪 ref，避免本地
+// 同名分支/tag 造成歧义。
 func (r *Repo) baseRef(ctx context.Context, base string) string {
-	if _, err := r.run(ctx, r.Root, "rev-parse", "--verify", "origin/"+base); err == nil {
-		return "origin/" + base
+	if _, err := r.run(ctx, r.Root, "rev-parse", "--verify", remoteRef(base)); err == nil {
+		return remoteRef(base)
 	}
 	return base
 }
 
+// chooseIntegration 决定集成分支名，并返回选中的真实远程分支 SHA（空表示
+// 没有远程候选）。want 非空时只认该确切名字；否则按 issue-<spec>(-*)?
+// 选远程唯一候选，多个候选或本地匹配名与它不同都报错，不交互。
+func chooseIntegration(spec int, want string, heads map[string]string, branches, dirs []string,
+	check func(dir, branch string) error) (name, sha string, err error) {
+	if want != "" {
+		return want, heads[want], nil
+	}
+	candidates := matchedHeads(heads, spec)
+	if len(candidates) > 1 {
+		return "", "", fmt.Errorf("multiple origin branches match issue-%d: %s; keep one or set the integration branch in config",
+			spec, strings.Join(candidates, ", "))
+	}
+	if len(candidates) == 0 {
+		if len(dirs) > 0 {
+			branch := filepath.Base(dirs[0])
+			if err := check(dirs[0], branch); err != nil {
+				return "", "", err
+			}
+			return branch, "", nil
+		}
+		if len(branches) > 0 {
+			return branches[0], "", nil
+		}
+		return IntegrationBranch(spec), "", nil
+	}
+	remote := candidates[0]
+	for _, dir := range dirs {
+		if filepath.Base(dir) != remote {
+			return "", "", fmt.Errorf("local worktree %s and origin/%s both match issue-%d with different names; "+
+				"align them by hand (or set the integration branch in config) and rerun", dir, remote, spec)
+		}
+		if err := check(dir, remote); err != nil {
+			return "", "", err
+		}
+	}
+	for _, branch := range branches {
+		if branch != remote {
+			return "", "", fmt.Errorf("local branch %s and origin/%s both match issue-%d with different names; "+
+				"align them by hand (or set the integration branch in config) and rerun", branch, remote, spec)
+		}
+	}
+	return remote, heads[remote], nil
+}
+
+func resolvePath(dir, p string) string {
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(dir, p)
+	}
+	p = filepath.Clean(p)
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		return real
+	}
+	return p
+}
+
+func (r *Repo) commonDir(ctx context.Context, dir string) (string, error) {
+	out, err := r.run(ctx, dir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	return resolvePath(dir, strings.TrimSpace(out)), nil
+}
+
+// verifyWorktree 确认 dir 是 r.Root 仓库中停在 refs/heads/<branch> 的
+// worktree。普通仓库、别的仓库、detached 或停在其它分支都报错，且不做
+// 任何修改。
+func (r *Repo) verifyWorktree(ctx context.Context, dir, branch string) error {
+	want := "refs/heads/" + branch
+	out, err := r.run(ctx, dir, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil {
+		return fmt.Errorf("directory %s is not a worktree on a branch (detached HEAD); it cannot hold %s", dir, branch)
+	}
+	if got := strings.TrimSpace(out); got != want {
+		return fmt.Errorf("directory %s is on %s, not %s; move it by hand and rerun", dir, got, want)
+	}
+	rootCommon, err := r.commonDir(ctx, r.Root)
+	if err != nil {
+		return err
+	}
+	dirCommon, err := r.commonDir(ctx, dir)
+	if err != nil {
+		return err
+	}
+	if dirCommon != rootCommon {
+		return fmt.Errorf("directory %s belongs to another repository (%s, want %s)", dir, dirCommon, rootCommon)
+	}
+	return nil
+}
+
+func remoteRef(name string) string {
+	return "refs/remotes/origin/" + name
+}
+
+func (r *Repo) ensureRemoteRef(ctx context.Context, name, sha string) error {
+	out, err := r.run(ctx, r.Root, "rev-parse", "--verify", "--quiet", remoteRef(name))
+	if err == nil && strings.TrimSpace(out) == sha {
+		return nil
+	}
+	spec := fmt.Sprintf("+refs/heads/%s:%s", name, remoteRef(name))
+	if _, err := r.run(ctx, r.Root, "fetch", "--refmap=", "origin", spec); err != nil {
+		return fmt.Errorf("fetch origin %s: %w", name, err)
+	}
+	return nil
+}
+
+func (r *Repo) ensureWorktree(ctx context.Context, branch string) (string, error) {
+	dir := filepath.Join(r.TreeDir, branch)
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		if err := r.verifyWorktree(ctx, dir, branch); err != nil {
+			return "", err
+		}
+		return dir, nil
+	}
+	if _, err := r.run(ctx, r.Root, "worktree", "add", dir, branch); err != nil {
+		return "", fmt.Errorf("add integration worktree %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+func (r *Repo) newBranch(ctx context.Context, branch, ref string) error {
+	if _, err := r.run(ctx, r.Root, "branch", branch, ref); err != nil {
+		return fmt.Errorf("create integration branch %s: %w", branch, err)
+	}
+	return nil
+}
+
+func (r *Repo) trackBranch(ctx context.Context, branch string) error {
+	spec := fmt.Sprintf("remote.origin.fetch=+refs/heads/%s:%s", branch, remoteRef(branch))
+	// 优先 --track；窄 refspec 下它不认可该跟踪 ref，此时仅先建分支。
+	if _, err := r.run(ctx, r.Root, "-c", spec, "branch", "--track", branch, remoteRef(branch)); err == nil {
+		return nil
+	}
+	if _, err := r.run(ctx, r.Root, "branch", branch, remoteRef(branch)); err != nil {
+		return fmt.Errorf("create integration branch %s: %w", branch, err)
+	}
+	return nil
+}
+
+func (r *Repo) syncBranch(ctx context.Context, dir, branch string) error {
+	if _, err := r.run(ctx, dir, "rev-parse", "-q", "--verify", "MERGE_HEAD"); err == nil {
+		return fmt.Errorf("worktree %s has an unfinished merge; finish or abort it by hand and rerun", dir)
+	} else if !exitCode(err, 1) {
+		return fmt.Errorf("check merge state in %s: %w", dir, err)
+	}
+	out, err := r.run(ctx, dir, "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return fmt.Errorf("check worktree %s: %w", dir, err)
+	}
+	if strings.TrimSpace(out) != "" {
+		return fmt.Errorf("worktree %s has uncommitted changes; commit or stash them before merging %s", dir, remoteRef(branch))
+	}
+	if _, err := r.run(ctx, dir, "merge-base", "HEAD", remoteRef(branch)); err != nil {
+		if exitCode(err, 1) {
+			return fmt.Errorf("local %s and %s have no common ancestor; merge them by hand and rerun", branch, remoteRef(branch))
+		}
+		return fmt.Errorf("compare %s with %s: %w", branch, remoteRef(branch), err)
+	}
+	_, mergeErr := r.run(ctx, dir, "merge", "--ff", "--no-edit", "--no-squash", remoteRef(branch))
+	if mergeErr == nil {
+		return nil
+	}
+	files, _ := r.run(ctx, dir, "diff", "--name-only", "--diff-filter=U")
+	var msg string
+	if list := strings.Fields(files); len(list) > 0 {
+		msg = fmt.Sprintf("merge %s into %s conflicts in: %s", remoteRef(branch), branch, strings.Join(list, " "))
+	} else {
+		msg = fmt.Sprintf("merge %s into %s: %v", remoteRef(branch), branch, mergeErr)
+	}
+	if _, err := r.run(ctx, dir, "rev-parse", "-q", "--verify", "MERGE_HEAD"); err != nil {
+		return fmt.Errorf("%s; nothing was changed", msg)
+	}
+	if _, err := r.run(ctx, dir, "merge", "--abort"); err != nil {
+		return fmt.Errorf("%s; merge --abort also failed, resolve it by hand in %s: %w", msg, dir, err)
+	}
+	return fmt.Errorf("%s; merge aborted, resolve by hand and rerun", msg)
+}
+
+func (r *Repo) applyIntegration(ctx context.Context, name, sha, baseName string) (branch, dir, base string, err error) {
+	branch = name
+	dir = filepath.Join(r.TreeDir, name)
+	if _, statErr := os.Stat(filepath.Join(dir, ".git")); statErr == nil {
+		if err := r.verifyWorktree(ctx, dir, name); err != nil {
+			return "", "", "", err
+		}
+	}
+	if !r.branchExists(ctx, name) {
+		if sha != "" {
+			err = r.trackBranch(ctx, name)
+		} else {
+			err = r.newBranch(ctx, name, r.baseRef(ctx, baseName))
+		}
+		if err != nil {
+			return "", "", "", err
+		}
+	}
+	if dir, err = r.ensureWorktree(ctx, name); err != nil {
+		return "", "", "", err
+	}
+	if sha != "" {
+		if err := r.syncBranch(ctx, dir, name); err != nil {
+			return "", "", "", err
+		}
+		if err := r.setUpstream(ctx, name); err != nil {
+			return "", "", "", err
+		}
+	}
+	return name, dir, baseName, nil
+}
+
+func (r *Repo) setUpstream(ctx context.Context, name string) error {
+	if out, err := r.run(ctx, r.Root, "rev-parse", "--abbrev-ref", name+"@{upstream}"); err == nil && strings.TrimSpace(out) == "origin/"+name {
+		return nil
+	}
+	spec := fmt.Sprintf("remote.origin.fetch=+refs/heads/%s:%s", name, remoteRef(name))
+	if _, err := r.run(ctx, r.Root, "-c", spec, "branch", "--set-upstream-to="+remoteRef(name), name); err != nil {
+		return fmt.Errorf("set upstream of %s to %s: %w", name, remoteRef(name), err)
+	}
+	return nil
+}
+
 // EnsureIntegration 确保 spec 的集成分支与它的 worktree 存在，
 // 返回分支名、worktree 目录与 MR 目标基点名。
-// 既有 issue-<spec>(-*)? 分支/worktree 直接复用；没有则按
-// main > master > origin/HEAD 顺序建分支，名称为 want（空时默认
-// issue-<spec>-integration，config integration 可覆盖）。
+// 候选以 fetch origin 后的 ls-remote 为准（本地 refs/remotes 会残留已删
+// 分支、窄 refspec 下又缺真实分支）；显式 want 只认该确切名字，否则选
+// issue-<spec>(-*)? 的远程唯一候选并同步远端，多个候选或本地匹配名与
+// 远程名不同则报错；远程无候选时复用本地匹配 worktree/分支，都没有才
+// 按 main > master > origin/HEAD 选基点建默认名。同步拒绝不干净或有
+// 未结束 merge 的 worktree，只在有共同祖先时合并。
 func (r *Repo) EnsureIntegration(ctx context.Context, spec int, base, want string) (branch, dir, baseName string, err error) {
-	baseName = r.baseName(ctx, base)
-	if err := os.MkdirAll(r.TreeDir, 0o755); err != nil {
+	if err = os.MkdirAll(r.TreeDir, 0o755); err != nil {
 		return "", "", "", fmt.Errorf("create tree dir %s: %w", r.TreeDir, err)
 	}
-	// worktree 目录已存在：直接复用（分支名以目录名为准）。
-	if existing := r.findIssueDir(spec); existing != "" {
-		return filepath.Base(existing), existing, baseName, nil
+	// 先 fetch 再定 baseName，避免旧 remote-tracking ref 导致误选 base。
+	if err = r.fetchOrigin(ctx); err != nil {
+		return "", "", "", err
 	}
-	branch = r.findIssueBranch(ctx, spec)
-	if branch == "" {
-		branch = want
-		if branch == "" {
-			branch = IntegrationBranch(spec)
+	baseName = r.baseName(ctx, base)
+	heads, err := r.remoteHeads(ctx)
+	if err != nil {
+		return "", "", "", err
+	}
+	branches, err := r.localBranches(ctx, spec)
+	if err != nil {
+		return "", "", "", err
+	}
+	check := func(dir, branch string) error { return r.verifyWorktree(ctx, dir, branch) }
+	name, sha, err := chooseIntegration(spec, want, heads, branches, r.issueDirs(spec), check)
+	if err != nil {
+		return "", "", "", err
+	}
+	if sha != "" {
+		if err := r.ensureRemoteRef(ctx, name, sha); err != nil {
+			return "", "", "", err
 		}
-		if _, err := r.run(ctx, r.Root, "branch", branch, r.baseRef(ctx, baseName)); err != nil {
-			return "", "", "", fmt.Errorf("create integration branch %s: %w", branch, err)
-		}
 	}
-	dir = filepath.Join(r.TreeDir, branch)
-	if _, err := r.run(ctx, r.Root, "worktree", "add", dir, branch); err != nil {
-		return "", "", "", fmt.Errorf("add integration worktree %s: %w", dir, err)
-	}
-	return branch, dir, baseName, nil
+	return r.applyIntegration(ctx, name, sha, baseName)
 }
 
 // Create 为子任务从 intBranch（实际集成分支名，含描述后缀/覆盖名）
