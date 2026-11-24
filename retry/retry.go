@@ -11,11 +11,12 @@ import (
 	"time"
 )
 
-// Attempts 是一次调用的最大尝试次数（含首次）。
-const Attempts = 5
+// Attempts 是一次调用的最大尝试次数（含首次）：弱网实例要求
+// 近乎"重试到成功"，100 次 × 最长 30s 间隔兜底约一小时。
+const Attempts = 100
 
 // maxBackoff 封顶单次退避时长。
-const maxBackoff = 10 * time.Second
+const maxBackoff = 30 * time.Second
 
 // Do 执行 fn：Transient 错误退避重试；成功、非瞬时错误或尝试
 // 耗尽时返回最后一次结果。ctx 取消立即返回，不再重试。
