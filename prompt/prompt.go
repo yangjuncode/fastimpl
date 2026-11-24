@@ -21,7 +21,7 @@ const DefaultFile = "fastimpl.prompt.md"
 // DefaultTemplate 是模板文件都不存在时播种到 exe 目录的默认内容。
 // 报告协议行（FASTIMPL-READY <token>）是 fastimpl 与 worker 的契约，
 // 定制时不要破坏这一行的格式；提交以 worktree HEAD 为准。
-const DefaultTemplate = `使用 implement 技能完成子任务 #{{.IssueNo}}。你的工作目录 {{.Worktree}} 是 fastimpl 为本任务创建的 git worktree——agent 进程的启动目录（cwd）就是它；新代码、提交都只在这里产生。fastimpl 的运行目录（work-dir）是 {{.WorkDir}}，其中包含主仓库 checkout 以及可能的其他目录，可作参考；一切修改只在 worktree 内进行。读取任务正文和评论，先说明任务标题。只在当前任务 worktree 中修改和提交；由 fastimpl 管理集成分支、推送、关闭 issue 和清理 worktree。完成实现与仓库要求的验证后，先由 leader 审核，再使用 fusion-3rd-reviewer-swe2max 独立审核。修复发现的问题，重新验证及审核后提交。只有实现、验证和两轮审核全部通过，且无未解决事项时，才在最终回复末尾按以下协议报告：单独一行由 FASTIMPL-READY、一个空格和令牌 {{.Token}} 拼接；随后最多六行，分别说明实现、验证结果、leader 审核、独立审核及阻塞情况。报告正文只包含上述结论，不复制代码、命令日志、凭据或 issue 原文。未达到条件则说明阻塞及剩余工作，不输出报告标记。
+const DefaultTemplate = `使用 implement 技能完成子任务 #{{.IssueNo}}。你的工作目录（cwd）是 fastimpl 的运行目录 {{.WorkDir}}，其中包含主仓库 checkout（{{.RepoDir}}）以及可能的其他目录，可自由查阅参考。本任务的代码产出目录是 git worktree {{.Worktree}}：所有新代码、修改、提交都在其中进行（可用 git -C {{.Worktree}}）；由 fastimpl 管理集成分支、推送、关闭 issue 和清理 worktree。读取任务正文和评论，先说明任务标题。只在 {{.Worktree}} 中修改和提交。完成实现与仓库要求的验证后，先由 leader 审核，再使用 fusion-3rd-reviewer-swe2max 独立审核。修复发现的问题，重新验证及审核后提交。只有实现、验证和两轮审核全部通过，且无未解决事项时，才在最终回复末尾按以下协议报告：单独一行由 FASTIMPL-READY、一个空格和令牌 {{.Token}} 拼接；随后最多六行，分别说明实现、验证结果、leader 审核、独立审核及阻塞情况。报告正文只包含上述结论，不复制代码、命令日志、凭据或 issue 原文。未达到条件则说明阻塞及剩余工作，不输出报告标记。
 `
 
 // Load 读取模板文件并返回文本。
@@ -56,11 +56,14 @@ type Vars struct {
 	// SpecNo 是 spec issue IID，写作 {{.SpecNo}}。
 	SpecNo int
 	// Worktree 是本任务的 git worktree 绝对路径，写作 {{.Worktree}}；
-	// 也是 agent 进程的启动目录（cwd 与之相同）。
+	// agent 的代码产出目录（与启动目录 work-dir 不同）。
 	Worktree string
 	// WorkDir 是 fastimpl 的运行目录（含主仓库 checkout 及可能的
-	// 其他目录），写作 {{.WorkDir}}；通常不是 worktree 的父目录。
+	// 其他目录），写作 {{.WorkDir}}；也是 agent 进程的启动目录。
 	WorkDir string
+	// RepoDir 是目标仓库主 checkout 的绝对路径，写作 {{.RepoDir}}；
+	// 供 agent 参考现有代码，不在其中修改。
+	RepoDir string
 }
 
 // legacyReplacer 把早期占位符写法 {issue-no}/{token}/{spec-no}/
@@ -72,6 +75,7 @@ var legacyReplacer = strings.NewReplacer(
 	"{spec-no}", "{{.SpecNo}}",
 	"{worktree}", "{{.Worktree}}",
 	"{work-dir}", "{{.WorkDir}}",
+	"{repo-dir}", "{{.RepoDir}}",
 )
 
 // Render 用 text/template 渲染模板；除 {{.Field}} 外可使用 if/range 等

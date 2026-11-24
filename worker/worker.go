@@ -39,8 +39,13 @@ type Params struct {
 	// Name 是终端名，与任务分支同名（issue-<iid> 或带描述后缀），
 	// 便于 `hc attach <name>` 直接进入；空时退化为 fastimpl-<spec>-<iid>。
 	Name string
-	// Worktree 是终端的工作目录（该任务的 worktree）。
+	// Worktree 是该任务的 git worktree（代码产出目录，提示词告知 agent）。
 	Worktree string
+	// Cwd 是终端进程的启动目录；空时默认 Worktree。
+	// 任务 worker 通常传 fastimpl 的 work-dir——外层工作区里可能
+	// 还有 agent 需要参考的其他目录；集成分支 agent 不传，
+	// 直接在自己的 worktree 里工作。
+	Cwd string
 	// Argv 是 agent 命令行（如 devin --model …），由 config.AgentArgv 给出。
 	Argv []string
 }
@@ -92,11 +97,15 @@ func taskLabels(specIID int, name string) map[string]string {
 	}
 }
 
-// StartWorker 在该任务 worktree 中启动 agent 交互终端并返回终端地址。
-// LLM 密钥变量显式清空，避免 core 继承到的值泄漏进 worker 环境。
+// StartWorker 在 p.Cwd（默认任务 worktree）中启动 agent 交互终端并返回
+// 终端地址。LLM 密钥变量显式清空，避免 core 继承到的值泄漏进 worker 环境。
 func (r *Runner) StartWorker(ctx context.Context, p Params) (addr string, err error) {
 	if len(p.Argv) == 0 {
-		return "", fmt.Errorf("start worker in %s: empty agent argv", p.Worktree)
+		return "", fmt.Errorf("start worker for %s: empty agent argv", p.Worktree)
+	}
+	cwd := p.Cwd
+	if cwd == "" {
+		cwd = p.Worktree
 	}
 	env := map[string]string{
 		config.LLMAPIKeyEnv:  "",
@@ -109,13 +118,13 @@ func (r *Runner) StartWorker(ctx context.Context, p Params) (addr string, err er
 	}
 	term, err := r.client.Run(hc.RunParams{
 		Argv:   p.Argv,
-		Cwd:    p.Worktree,
+		Cwd:    cwd,
 		Env:    env,
 		Name:   name,
 		Labels: taskLabels(p.SpecIID, name),
 	})
 	if err != nil {
-		return "", fmt.Errorf("start worker in %s: %w", p.Worktree, err)
+		return "", fmt.Errorf("start worker in %s: %w", cwd, err)
 	}
 	return term.Address, nil
 }

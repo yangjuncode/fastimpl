@@ -253,11 +253,11 @@ func (s *Scheduler) baseConflictPrompt(base string, files []string, token string
 }
 
 // conflictPrompt 是让 agent 自己解决集成冲突的续写提示词：
-// 在任务 worktree 中把集成分支合入本分支、解决冲突并提交，
-// 然后输出报告标记；fastimpl 之后再做干净合并。
-func conflictPrompt(intBranch string, files []string, token string) string {
-	return fmt.Sprintf("你的分支与集成分支 %s 存在冲突（%s）。请在当前 worktree 中执行 git merge %s，逐个解决冲突并提交。冲突解决并提交完成后，在回复末尾单独一行输出 %s %s，随后最多六行说明解决方式；未解决前不要输出该标记。",
-		intBranch, strings.Join(files, ", "), intBranch, worker.ReadyMarker, token)
+// 在任务 worktree（dir，不是 agent 的 cwd）中把集成分支合入本分支、
+// 解决冲突并提交，然后输出报告标记；fastimpl 之后再做干净合并。
+func conflictPrompt(dir, intBranch string, files []string, token string) string {
+	return fmt.Sprintf("你的分支与集成分支 %s 存在冲突（%s）。请在本任务 worktree %s 中执行 git merge %s（可用 git -C %s），逐个解决冲突并提交。冲突解决并提交完成后，在回复末尾单独一行输出 %s %s，随后最多六行说明解决方式；未解决前不要输出该标记。",
+		intBranch, strings.Join(files, ", "), dir, intBranch, dir, worker.ReadyMarker, token)
 }
 
 // captureReport 读取终端屏幕并解析本任务令牌的 READY 帧。
@@ -426,7 +426,11 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		IssueIID: iid,
 		Name:     termName,
 		Worktree: dir,
-		Argv:     s.agentArgv,
+		// agent 在外层工作区（work-dir）工作：其中可能还有它需要
+		// 参考的主 checkout 与其他目录；worktree 只作产出目录，
+		// 通过提示词告知。
+		Cwd:  s.workDir,
+		Argv: s.agentArgv,
 	})
 	if err != nil {
 		fail(fmt.Errorf("start worker: %w", err))
@@ -451,6 +455,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		SpecNo:   s.specIID,
 		Worktree: dir,
 		WorkDir:  s.workDir,
+		RepoDir:  s.repo.Root,
 	})
 	if err != nil {
 		fail(fmt.Errorf("render prompt: %w", err))
@@ -513,7 +518,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			}
 			attempts++
 			s.log.Info("merge conflict; asking worker to resolve", "key", key, "files", conflict.Files)
-			baseline, err = s.sessions.Prompt(ctx, addr, conflictPrompt(s.branch, conflict.Files, token))
+			baseline, err = s.sessions.Prompt(ctx, addr, conflictPrompt(dir, s.branch, conflict.Files, token))
 			if err != nil {
 				fail(fmt.Errorf("send conflict prompt: %w", err))
 				return
