@@ -207,7 +207,7 @@ func TestSchedulerRun(t *testing.T) {
 	// worker 在各自 worktree 里制造一次提交（Merge 需要真实差异）。
 	hookSessions := &commitSessions{fakeSessions: sessions, t: t}
 	cfg := config.Config{Parallelism: 4, SpecIID: 8}
-	s := New(cfg, repo, forge, g, hookSessions, "{issue-no}|{token}|{spec-no}", intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, forge, g, hookSessions, "{issue-no}|{token}|{spec-no}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +457,7 @@ func TestSchedulerBaseSyncConflict(t *testing.T) {
 
 	sessions := &baseSyncSessions{fakeSessions: &fakeSessions{}}
 	cfg := config.Config{Parallelism: 1, SpecIID: 8, Retries: 2}
-	s := New(cfg, repo, &fakeForge{}, g, sessions, "{issue-no}|{token}|{spec-no}", intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, &fakeForge{}, g, sessions, "{issue-no}|{token}|{spec-no}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +505,7 @@ func TestSchedulerConflictResolvedByAgent(t *testing.T) {
 
 	sessions := &conflictSessions{fakeSessions: &fakeSessions{}, intBranch: intBranch}
 	cfg := config.Config{Parallelism: 2, SpecIID: 8, Retries: 4}
-	s := New(cfg, repo, &fakeForge{}, g, sessions, "{issue-no}|{token}|{spec-no}", intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, &fakeForge{}, g, sessions, "{issue-no}|{token}|{spec-no}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +541,7 @@ func TestSchedulerInFlightSkipped(t *testing.T) {
 	forge := &fakeForge{inFlight: map[int]bool{9: true}}
 	sessions := &fakeSessions{}
 	cfg := config.Config{Parallelism: 1, SpecIID: 8}
-	s := New(cfg, repo, forge, g, sessions, "{issue-no}|{token}|{spec-no}", intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, forge, g, sessions, "{issue-no}|{token}|{spec-no}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	err = s.Run(ctx)
 	if err == nil || !strings.Contains(err.Error(), "needs attention") {
 		t.Fatalf("Run err = %v, want stalled needs-attention error", err)
@@ -579,7 +579,7 @@ func TestSchedulerRefreshInFlight(t *testing.T) {
 
 	forge := &fakeForge{inFlight: map[int]bool{9: true}}
 	cfg := config.Config{Parallelism: 1, SpecIID: 8}
-	s := New(cfg, repo, forge, g, &fakeSessions{}, "tpl", intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, forge, g, &fakeSessions{}, "tpl", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 
 	s.refreshStates(ctx)
 	n, _ := g.Lookup(graph.Key{ProjectID: 1, IID: 9})
@@ -619,7 +619,7 @@ func TestSchedulerWarnsDirtyBoard(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	forgeFake := &fakeForge{closedOn: map[int]bool{9: true}, boardDirty: map[int]bool{9: true}}
 	cfg := config.Config{Parallelism: 1, SpecIID: 8}
-	s := New(cfg, repo, forgeFake, g, &fakeSessions{}, "tpl", intDir, intBranch, baseName, []string{"devin"}, log)
+	s := New(cfg, repo, forgeFake, g, &fakeSessions{}, "tpl", repoDir, intDir, intBranch, baseName, []string{"devin"}, log)
 
 	s.refreshStates(ctx)
 	s.refreshStates(ctx) // 第二次刷新不应重复 warn

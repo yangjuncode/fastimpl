@@ -254,13 +254,21 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
 ### 提示词模板 fastimpl.prompt.md
 
 查找顺序与配置相同：`<work-dir>/fastimpl.prompt.md` > `<exe 目录>`，缺失时
-把内置默认模板播种到 exe 目录。模板中的占位符：
+把内置默认模板播种到 exe 目录。
 
-- `{issue-no}` — 子任务 issue IID
-- `{spec-no}` — spec issue IID
-- `{token}` — 本任务的随机报告令牌
-- `{worktree}` — fastimpl 为本任务创建的 git worktree 绝对路径
+模板按 Go `text/template` 渲染，可用 `{{if}}`/`{{range}}` 等全部动作
+语法。可用变量：
+
+- `{{.IssueNo}}` — 子任务 issue IID
+- `{{.SpecNo}}` — spec issue IID
+- `{{.Token}}` — 本任务的随机报告令牌
+- `{{.Worktree}}` — fastimpl 为本任务创建的 git worktree 绝对路径
   （agent 进程的启动目录 cwd 就是它）
+- `{{.WorkDir}}` — fastimpl 运行目录（含主仓库 checkout 及可能的
+  其他目录；与 worktree 不一定有父子关系）
+
+早期 `{issue-no}`、`{token}`、`{spec-no}`、`{worktree}`、`{work-dir}`
+写法仍被识别（渲染前统一改写为 `{{.Field}}`），已定制的旧模板无需改动。
 
 模板与 fastimpl 的**唯一契约是报告协议**：任务全部完成（含仓库要求的
 验证）后在回复末尾单独一行输出 `FASTIMPL-READY <token>`，随后最多六行

@@ -62,6 +62,7 @@ type Scheduler struct {
 	g         *graph.Graph
 	sessions  Sessions
 	template  string
+	workDir   string // fastimpl 运行目录，注入提示词的 {work-dir}/{{.WorkDir}}
 	intDir    string
 	log       *slog.Logger
 	specIID   int
@@ -79,7 +80,7 @@ type Scheduler struct {
 // New 组装调度器；所有依赖由 app 层注入，便于测试替换。
 // intDir/intBranch/baseName 均来自 EnsureIntegration 的实际返回，
 // 复用带描述后缀或配置覆盖的分支名时也能正确合并与推送。
-func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, g *graph.Graph, sessions Sessions, template, intDir, intBranch, baseName string, agentArgv []string, log *slog.Logger) *Scheduler {
+func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, g *graph.Graph, sessions Sessions, template, workDir, intDir, intBranch, baseName string, agentArgv []string, log *slog.Logger) *Scheduler {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -90,6 +91,7 @@ func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, g *graph.Graph, 
 		g:         g,
 		sessions:  sessions,
 		template:  template,
+		workDir:   workDir,
 		intDir:    intDir,
 		log:       log,
 		specIID:   g.Spec().IID,
@@ -448,6 +450,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		Token:    token,
 		SpecNo:   s.specIID,
 		Worktree: dir,
+		WorkDir:  s.workDir,
 	})
 	if err != nil {
 		fail(fmt.Errorf("render prompt: %w", err))

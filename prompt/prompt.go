@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"strconv"
 	"strings"
+	"text/template"
 
 	"github.com/yangjuncode/fastimpl/files"
 )
@@ -21,7 +21,7 @@ const DefaultFile = "fastimpl.prompt.md"
 // DefaultTemplate 是模板文件都不存在时播种到 exe 目录的默认内容。
 // 报告协议行（FASTIMPL-READY <token>）是 fastimpl 与 worker 的契约，
 // 定制时不要破坏这一行的格式；提交以 worktree HEAD 为准。
-const DefaultTemplate = `使用 implement 技能完成子任务 #{issue-no}。你的工作目录 {worktree} 是 fastimpl 为本任务创建的 git worktree——agent 进程的启动目录（cwd）就是它；新代码、提交都只在这里产生。读取任务正文和评论，先说明任务标题。只在当前任务 worktree 中修改和提交；由 fastimpl 管理集成分支、推送、关闭 issue 和清理 worktree。完成实现与仓库要求的验证后，先由 leader 审核，再使用 fusion-3rd-reviewer-swe2max 独立审核。修复发现的问题，重新验证及审核后提交。只有实现、验证和两轮审核全部通过，且无未解决事项时，才在最终回复末尾按以下协议报告：单独一行由 FASTIMPL-READY、一个空格和令牌 {token} 拼接；随后最多六行，分别说明实现、验证结果、leader 审核、独立审核及阻塞情况。报告正文只包含上述结论，不复制代码、命令日志、凭据或 issue 原文。未达到条件则说明阻塞及剩余工作，不输出报告标记。
+const DefaultTemplate = `使用 implement 技能完成子任务 #{{.IssueNo}}。你的工作目录 {{.Worktree}} 是 fastimpl 为本任务创建的 git worktree——agent 进程的启动目录（cwd）就是它；新代码、提交都只在这里产生。fastimpl 的运行目录（work-dir）是 {{.WorkDir}}，其中包含主仓库 checkout 以及可能的其他目录，可作参考；一切修改只在 worktree 内进行。读取任务正文和评论，先说明任务标题。只在当前任务 worktree 中修改和提交；由 fastimpl 管理集成分支、推送、关闭 issue 和清理 worktree。完成实现与仓库要求的验证后，先由 leader 审核，再使用 fusion-3rd-reviewer-swe2max 独立审核。修复发现的问题，重新验证及审核后提交。只有实现、验证和两轮审核全部通过，且无未解决事项时，才在最终回复末尾按以下协议报告：单独一行由 FASTIMPL-READY、一个空格和令牌 {{.Token}} 拼接；随后最多六行，分别说明实现、验证结果、leader 审核、独立审核及阻塞情况。报告正文只包含上述结论，不复制代码、命令日志、凭据或 issue 原文。未达到条件则说明阻塞及剩余工作，不输出报告标记。
 `
 
 // Load 读取模板文件并返回文本。
@@ -49,24 +49,41 @@ func Load(workDir, path string) (string, error) {
 
 // Vars 是模板渲染变量。
 type Vars struct {
-	// IssueNo 替换 {issue-no}。
+	// IssueNo 是子任务 issue IID，模板写作 {{.IssueNo}}。
 	IssueNo int
-	// Token 替换 {token}，是本次运行的报告令牌。
+	// Token 是本次运行的报告令牌，写作 {{.Token}}。
 	Token string
-	// SpecNo 替换 {spec-no}（模板可选使用）。
+	// SpecNo 是 spec issue IID，写作 {{.SpecNo}}。
 	SpecNo int
-	// Worktree 替换 {worktree}：本任务的 git worktree 绝对路径，
+	// Worktree 是本任务的 git worktree 绝对路径，写作 {{.Worktree}}；
 	// 也是 agent 进程的启动目录（cwd 与之相同）。
 	Worktree string
+	// WorkDir 是 fastimpl 的运行目录（含主仓库 checkout 及可能的
+	// 其他目录），写作 {{.WorkDir}}；通常不是 worktree 的父目录。
+	WorkDir string
 }
 
-// Render 用 Vars 替换模板中的占位符。
+// legacyReplacer 把早期占位符写法 {issue-no}/{token}/{spec-no}/
+// {worktree}/{work-dir} 改写成等价的 text/template 动作，
+// 让已播种/已定制的旧模板继续可用。
+var legacyReplacer = strings.NewReplacer(
+	"{issue-no}", "{{.IssueNo}}",
+	"{token}", "{{.Token}}",
+	"{spec-no}", "{{.SpecNo}}",
+	"{worktree}", "{{.Worktree}}",
+	"{work-dir}", "{{.WorkDir}}",
+)
+
+// Render 用 text/template 渲染模板；除 {{.Field}} 外可使用 if/range 等
+// 全部动作语法，旧式 {x} 占位符先统一改写为 {{.Field}} 再解析。
 func Render(tmpl string, v Vars) (string, error) {
-	replacer := strings.NewReplacer(
-		"{issue-no}", strconv.Itoa(v.IssueNo),
-		"{token}", v.Token,
-		"{spec-no}", strconv.Itoa(v.SpecNo),
-		"{worktree}", v.Worktree,
-	)
-	return replacer.Replace(tmpl), nil
+	t, err := template.New("prompt").Parse(legacyReplacer.Replace(tmpl))
+	if err != nil {
+		return "", fmt.Errorf("parse prompt template: %w", err)
+	}
+	var b strings.Builder
+	if err := t.Execute(&b, v); err != nil {
+		return "", fmt.Errorf("render prompt template: %w", err)
+	}
+	return b.String(), nil
 }
