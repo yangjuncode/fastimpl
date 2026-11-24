@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -80,6 +81,10 @@ type Scheduler struct {
 	// Run 结束后、所有任务 goroutine 退出后读取，无竞争）。
 	intAddr   string // 集成专属 agent 终端地址；空表示未启动
 	baseStuck bool   // base 冲突 agent 也未能解决，跳过后续同步
+	// claimWait 是发 claim 标记后的短等待，claimRecheck 是运行期复查
+	// 评论的间隔；测试注入 0/短间隔。
+	claimWait    time.Duration
+	claimRecheck time.Duration
 }
 
 // New 组装调度器；所有依赖由 app 层注入，便于测试替换。
@@ -90,21 +95,23 @@ func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, forgeName string
 		log = slog.Default()
 	}
 	return &Scheduler{
-		cfg:       cfg,
-		repo:      repo,
-		forge:     f,
-		forgeName: forgeName,
-		g:         g,
-		sessions:  sessions,
-		template:  template,
-		workDir:   workDir,
-		intDir:    intDir,
-		log:       log,
-		specIID:   g.Spec().IID,
-		branch:    intBranch,
-		baseName:  baseName,
-		agentArgv: agentArgv,
-		warned:    make(map[graph.Key]bool),
+		cfg:          cfg,
+		repo:         repo,
+		forge:        f,
+		forgeName:    forgeName,
+		g:            g,
+		sessions:     sessions,
+		template:     template,
+		workDir:      workDir,
+		intDir:       intDir,
+		log:          log,
+		specIID:      g.Spec().IID,
+		branch:       intBranch,
+		baseName:     baseName,
+		agentArgv:    agentArgv,
+		warned:       make(map[graph.Key]bool),
+		claimWait:    DefaultClaimWait,
+		claimRecheck: DefaultClaimRecheck,
 	}
 }
 
@@ -139,6 +146,11 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	defer refresh.Stop()
 	lastBeat := time.Now()
 	for {
+		if ctx.Err() != nil {
+			// 上游取消：不再派发，等已派任务把清理（停终端、释放认领与
+			// 本地锁）做完再返回，避免提前关 hc 连接导致清理竞争。
+			return s.drain(ctx, running, results)
+		}
 		ready := s.g.Ready()
 		for _, n := range ready {
 			if len(running) >= s.cfg.Parallelism {
@@ -176,23 +188,39 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case res := <-results:
 			lastBeat = time.Now()
 			delete(running, res.key)
-			switch {
-			case res.integrated:
-				s.g.SetState(res.key, graph.Integrated)
-				s.log.Info("task integrated", "key", res.key, "commit", res.commit)
-			case res.closed:
-				s.g.SetClosed(res.key, true)
-				s.log.Info("issue already closed; skipped", "key", res.key)
-			default:
-				s.g.SetState(res.key, graph.NeedsAttention)
-				s.log.Warn("task needs attention", "key", res.key, "reason", res.attention)
-			}
+			s.record(res)
 		case <-refresh.C:
 			s.refreshStates(ctx)
 		case <-time.After(Tick):
-		case <-ctx.Done():
-			return ctx.Err()
 		}
+	}
+}
+
+// drain 停止派发并等已派任务把清理（停终端、释放认领与本地锁）做完：
+// 结果照常更新图，但不再派新任务。返回 ctx 的原始错误。
+func (s *Scheduler) drain(ctx context.Context, running map[graph.Key]bool, results <-chan taskResult) error {
+	err := ctx.Err()
+	s.log.Warn("run cancelled; waiting for dispatched tasks to clean up", "running", len(running), "reason", err)
+	for len(running) > 0 {
+		res := <-results
+		delete(running, res.key)
+		s.record(res)
+	}
+	return err
+}
+
+// record 把一次结局写进图并记录日志。
+func (s *Scheduler) record(res taskResult) {
+	switch {
+	case res.integrated:
+		s.g.SetState(res.key, graph.Integrated)
+		s.log.Info("task integrated", "key", res.key, "commit", res.commit)
+	case res.closed:
+		s.g.SetClosed(res.key, true)
+		s.log.Info("issue already closed; skipped", "key", res.key)
+	default:
+		s.g.SetState(res.key, graph.NeedsAttention)
+		s.log.Warn("task needs attention", "key", res.key, "reason", res.attention)
 	}
 }
 
@@ -397,25 +425,89 @@ func (s *Scheduler) stopIntegrationAgent() {
 	}
 }
 
+// 任务收尾策略：是否需要停终端、是否保留两把锁。
+const (
+	// finishNone：还没有可能存活的终端，直接释放两把锁。
+	finishNone = iota
+	// finishKeep：无法确认终端已停止（启动结果不明/普通运行失败），
+	// 保留终端、本地锁与远端认领，等人工排查。
+	finishKeep
+	// finishStop：明确失锁或上游取消，尝试停终端，成功才释放。
+	finishStop
+)
+
 // runTask 执行一个任务的完整生命周期，结局经 results 回报。
 // 完成判定 = 屏幕上出现本任务令牌的 FASTIMPL-READY 行；
 // 没有标记时按 cfg.Retries 向同一终端续写提示词重试；
 // 合并冲突时让 agent 在任务 worktree 里解决后重试快速合并。
+//
+// 跨机器互斥靠两条链：本机 O_EXCL 本地锁，以及 issue 评论里的认领标记
+// （尽力仲裁，评论 API 没有原子互斥，短暂双运行要到复查才发现）。
 func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- taskResult) {
 	res := taskResult{key: key}
-	iid := key.IID
-	// report 把失败原因写到 issue 评论里再上报，方便人工接手。
-	report := func(err error, note string) {
-		if nerr := s.forge.Note(ctx, key.ProjectID, iid, note); nerr != nil {
-			s.log.Warn("issue note failed", "key", key, "err", nerr)
+	var note string
+	defer func() {
+		if note != "" {
+			nctx, cancel := s.cleanupCtx(ctx)
+			if nerr := s.forge.Note(nctx, key.ProjectID, key.IID, note); nerr != nil {
+				s.log.Warn("issue note failed", "key", key, "err", nerr)
+			}
+			cancel()
 		}
-		res.attention = err.Error()
+		// 清理先于结果发布：调度器看到结局时资源已回收。
 		results <- res
-	}
+	}()
+	// fail 记录一次普通运行失败：保留终端排查，稍后写一条 issue 报告。
 	fail := func(err error) {
-		report(err, "fastimpl: "+err.Error())
+		res.attention = err.Error()
+		note = "fastimpl: " + err.Error()
 	}
+	iid := key.IID
 
+	if !config.ValidInstanceID(s.cfg.InstanceID) {
+		res.attention = "instance_id is missing or unsafe; refusing to run without cross-machine identity"
+		s.log.Error("task refused", "key", key, "reason", res.attention)
+		return
+	}
+	token := worker.NewToken()
+	lock, err := AcquireTaskLock(s.repo.Root, iid, lockContent(os.Getpid(), s.cfg.InstanceID, token))
+	if err != nil {
+		res.attention = err.Error()
+		s.log.Warn("local task lock refused", "key", key, "err", err,
+			"hint", "confirm no worker for this issue is running, then delete the lock file")
+		return
+	}
+	// 收尾状态：markerPosted 表示 issue 上已有本次运行的 claim 标记；
+	// addr/termName 非空表示可能还有存活的终端。
+	markerPosted := false
+	addr, termName := "", ""
+	finish := finishNone
+	stopped := false
+	defer func() {
+		if finish == finishStop && addr != "" && !stopped {
+			if err := s.stopWorker(addr, termName); err != nil {
+				finish = finishKeep
+			} else {
+				stopped = true
+			}
+		}
+		switch finish {
+		case finishKeep:
+			lock.Keep()
+			s.keepBothLocks(key, token, lock.Path(), termName, addr)
+			return
+		case finishNone:
+			// 没有可能存活的终端，按顺序回收两把锁。
+		}
+		if markerPosted {
+			s.releaseMarker(ctx, key, token)
+		}
+		if err := lock.Release(); err != nil {
+			s.log.Warn("release local task lock failed", "key", key, "lock", lock.Path(), "err", err)
+		}
+	}()
+
+	s.log.Info("local task lock acquired", "key", key, "lock", lock.Path())
 	// 开跑前重读现场状态：建图快照可能已过期。
 	info, err := s.forge.IssueState(ctx, key.ProjectID, iid)
 	if err != nil {
@@ -423,21 +515,81 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		return
 	}
 	if !info.Open {
-		// 外部已关闭：依赖视为满足，不启动 worker。
 		res.closed = true
-		results <- res
 		return
 	}
 	if info.AssignedToOther {
-		fail(errors.New("issue 已被他人领取，不抢占"))
+		res.attention = s.noteFailure(ctx, key, "issue 已被他人领取，不抢占")
 		return
 	}
 	if info.InFlight {
-		fail(errors.New("issue 已在处理中（看板 status 为进行中），不抢占"))
+		res.attention = s.noteFailure(ctx, key, "issue 已在处理中（看板 status 为进行中），不抢占")
 		return
 	}
-	if err := s.forge.Claim(ctx, key.ProjectID, iid); err != nil {
-		fail(fmt.Errorf("claim issue: %w", err))
+
+	// 评论仲裁：已有活跃认领就只告警，不发新评论、不改 issue 状态。
+	winner, _, err := s.boundedRead(ctx, key, token)
+	if err != nil {
+		fail(fmt.Errorf("verify claim before starting: %w", err))
+		return
+	}
+	if winner != nil {
+		res.attention = claimBusy(winner).Error()
+		s.log.Warn("issue already claimed elsewhere; not starting",
+			"key", key, "instance", winner.instance, "claim", winner.token, "comment", winner.commentID)
+		return
+	}
+	if err := s.postMarker(ctx, key, claimKindYes, token); err != nil {
+		// POST 报错也可能已经落地：按同一 token 安全释放后放弃。
+		s.log.Warn("post claim marker failed; releasing the same token", "key", key, "err", err)
+		s.releaseMarker(ctx, key, token)
+		fail(fmt.Errorf("post claim marker: %w", err))
+		return
+	}
+	markerPosted = true
+	s.log.Info("claim marker posted", "key", key, "instance", s.cfg.InstanceID, "claim", token)
+	if !s.waitClaimWindow(ctx) {
+		fail(fmt.Errorf("wait for claim window: %w", ctx.Err()))
+		return
+	}
+	if err := s.confirmClaim(ctx, ctx, key, token); err != nil {
+		fail(fmt.Errorf("lose claim arbitration: %w", err))
+		return
+	}
+
+	// 获胜后重读：仍开放、无他人/占用才真正指派。
+	info, err = s.forge.IssueState(ctx, key.ProjectID, iid)
+	if err != nil {
+		fail(fmt.Errorf("re-read issue state: %w", err))
+		return
+	}
+	if !info.Open {
+		res.closed = true
+		return
+	}
+	if info.AssignedToOther || info.InFlight {
+		res.attention = "issue 已被他人领取或占用，不抢占"
+		return
+	}
+	if !info.AssignedToMe {
+		if err := s.forge.Claim(ctx, key.ProjectID, iid); err != nil {
+			fail(fmt.Errorf("claim issue: %w", err))
+			return
+		}
+	}
+	// 指派后回读：必须是本人、无他人、无占用才算领取成功。
+	info, err = s.forge.IssueState(ctx, key.ProjectID, iid)
+	if err != nil {
+		fail(fmt.Errorf("re-read issue state after claim: %w", err))
+		return
+	}
+	if !info.Open {
+		res.closed = true
+		return
+	}
+	if !info.AssignedToMe || info.AssignedToOther || info.InFlight {
+		fail(fmt.Errorf("claim not confirmed (open=%v me=%v other=%v in_flight=%v)",
+			info.Open, info.AssignedToMe, info.AssignedToOther, info.InFlight))
 		return
 	}
 	s.log.Info("issue claimed", "key", key)
@@ -454,8 +606,17 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	s.log.Info("worktree ready", "key", key, "dir", dir, "branch", branch)
 	// 终端名 <repo>-issue-<iid>：多项目并行时不会撞名，
 	// 且一眼能看出属于哪个仓库。
-	termName := s.repo.Name + "-" + branch
-	addr, err := s.sessions.StartWorker(ctx, worker.Params{
+	termName = s.repo.Name + "-" + branch
+	// 启动前最后确认一次：认领仍有效且任务未被取消，避免刚失锁就起终端。
+	if err := s.confirmClaim(ctx, ctx, key, token); err != nil {
+		fail(fmt.Errorf("verify claim before starting the worker: %w", err))
+		return
+	}
+	taskCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	// 从这里开始，任何失败都可能留下一个存活的终端。
+	finish = finishKeep
+	addr, err = s.sessions.StartWorker(taskCtx, worker.Params{
 		SpecIID:  s.specIID,
 		IssueIID: iid,
 		Name:     termName,
@@ -467,26 +628,34 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		Argv: s.agentArgv,
 	})
 	if err != nil {
+		// 启动结果不明确：可能已有终端，保留两把锁让人工确认。
 		fail(fmt.Errorf("start worker: %w", err))
+		s.log.Warn("start worker failed; keeping the local lock and the claim marker", "key", key, "terminal", termName, "err", err)
 		return
 	}
 	s.log.Info("worker running", "key", key, "terminal", termName, "addr", addr)
-	// worker 启动后的失败：保留终端让用户 hc attach 排查，不主动 Kill，
-	// 且把排查入口写进 issue 评论。
-	fail = func(err error) {
-		s.log.Warn("task needs attention", "key", key, "err", err, "inspect", "hc attach "+termName)
-		report(err, "fastimpl: "+err.Error()+"\n排查终端: hc attach "+termName)
+	monitor := s.watchClaim(taskCtx, key, token, cancel)
+	defer monitor.stop()
+	// stopAndRelease 在确认终端已停止后把收尾策略降级为"直接释放"。
+	stopAndRelease := func() error {
+		monitor.stop()
+		if err := s.stopWorker(addr, termName); err != nil {
+			return err
+		}
+		stopped = true
+		finish = finishNone
+		return nil
 	}
 
 	s.log.Info("awaiting worker boot", "key", key, "addr", addr)
-	if _, err := s.sessions.AwaitBoot(ctx, addr); err != nil {
-		fail(fmt.Errorf("await worker boot: %w", err))
+	if _, err := s.sessions.AwaitBoot(taskCtx, addr); err != nil {
+		s.taskFailed(taskCtx, key, "await worker boot", err, termName, &finish, &res, fail)
 		return
 	}
-	token := worker.NewToken()
+	reportToken := worker.NewToken()
 	text, err := prompt.Render(s.template, prompt.Vars{
 		IssueNo:       iid,
-		Token:         token,
+		Token:         reportToken,
 		SpecNo:        s.specIID,
 		Worktree:      dir,
 		WorkDir:       s.workDir,
@@ -498,58 +667,76 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		RequireReview: s.cfg.RequireReview,
 	})
 	if err != nil {
-		fail(fmt.Errorf("render prompt: %w", err))
+		s.taskFailed(taskCtx, key, "render prompt", err, termName, &finish, &res, fail)
 		return
 	}
-	baseline, err := s.sessions.Prompt(ctx, addr, text)
+	// 首次 Prompt 前明确重验自己的认领仍然有效。
+	if err := s.confirmClaim(taskCtx, ctx, key, token); err != nil {
+		s.taskFailed(taskCtx, key, "verify claim before prompt", err, termName, &finish, &res, fail)
+		return
+	}
+	baseline, err := s.sessions.Prompt(taskCtx, addr, text)
 	if err != nil {
-		fail(fmt.Errorf("send prompt: %w", err))
+		s.taskFailed(taskCtx, key, "send prompt", err, termName, &finish, &res, fail)
 		return
 	}
 	s.log.Info("prompt sent; waiting for report", "key", key)
 
 	attempts := 0 // 首提示之外已用的续写次数
 	for {
-		if _, err := s.sessions.WaitTurn(ctx, addr, baseline, worker.TurnBudget); err != nil {
-			fail(fmt.Errorf("wait worker turn: %w", err))
+		if _, err := s.sessions.WaitTurn(taskCtx, addr, baseline, worker.TurnBudget); err != nil {
+			s.taskFailed(taskCtx, key, "wait worker turn", err, termName, &finish, &res, fail)
 			return
 		}
-		_, repErr := s.captureReport(ctx, addr, token)
+		if err := s.confirmClaim(taskCtx, ctx, key, token); err != nil {
+			s.taskFailed(taskCtx, key, "verify claim before report", err, termName, &finish, &res, fail)
+			return
+		}
+		_, repErr := s.captureReport(taskCtx, addr, reportToken)
 		if repErr == nil {
 			// 标记出现：提交以 worktree HEAD 为准，然后快速合并。
-			commit, err := s.repo.HeadCommit(ctx, dir)
+			commit, err := s.repo.HeadCommit(taskCtx, dir)
 			if err != nil {
-				fail(fmt.Errorf("read HEAD of %s: %w", dir, err))
+				s.taskFailed(taskCtx, key, "read HEAD of "+dir, err, termName, &finish, &res, fail)
 				return
 			}
-			err = s.tryMerge(ctx, branch)
+			// 集成前再验一次：失锁后不能再合入/关 issue。
+			if err := s.confirmClaim(taskCtx, ctx, key, token); err != nil {
+				s.taskFailed(taskCtx, key, "verify claim before integrate", err, termName, &finish, &res, fail)
+				return
+			}
+			err = s.tryMerge(taskCtx, branch)
 			if err == nil {
+				if cause := context.Cause(taskCtx); cause != nil {
+					s.taskFailed(taskCtx, key, "merged but claim lost", cause, termName, &finish, &res, fail)
+					return
+				}
 				// Done 状态在 Close 之前：两端关闭 issue 都不会反向
 				// 更新看板状态，不置 Done 会让已关闭 issue 永远停在
 				// In progress。
-				if merr := s.forge.MarkDone(ctx, key.ProjectID, iid); merr != nil {
+				if merr := s.forge.MarkDone(taskCtx, key.ProjectID, iid); merr != nil {
 					s.log.Warn("mark issue done failed", "key", key, "err", merr)
 				}
-				if err := s.forge.Close(ctx, key.ProjectID, iid); err != nil {
-					fail(fmt.Errorf("close issue: %w", err))
+				if err := s.forge.Close(taskCtx, key.ProjectID, iid); err != nil {
+					s.taskFailed(taskCtx, key, "close issue", err, termName, &finish, &res, fail)
 					return
 				}
 				// 先退出 hc 进程再删 worktree：终端进程的 cwd 还在
 				// worktree 里，先停掉才不会引用已删除的目录。
-				if err := s.sessions.Stop(ctx, addr, s.specIID, termName); err != nil {
-					s.log.Warn("stop worker terminal failed", "key", key, "addr", addr, "err", err)
+				if err := stopAndRelease(); err != nil {
+					fail(fmt.Errorf("stop worker %s: %w", termName, err))
+					return
 				}
-				if err := s.repo.Remove(ctx, iid); err != nil {
+				if err := s.repo.Remove(taskCtx, iid); err != nil {
 					s.log.Warn("remove worktree failed", "key", key, "err", err)
 				}
 				res.integrated = true
 				res.commit = commit
-				results <- res
 				return
 			}
 			var conflict *worktree.ConflictError
 			if !errors.As(err, &conflict) {
-				fail(fmt.Errorf("integrate: %w", err))
+				s.taskFailed(taskCtx, key, "integrate", err, termName, &finish, &res, fail)
 				return
 			}
 			// 合并冲突：让 agent 在任务 worktree 解决后重试。
@@ -559,25 +746,152 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			}
 			attempts++
 			s.log.Info("merge conflict; asking worker to resolve", "key", key, "files", conflict.Files)
-			baseline, err = s.sessions.Prompt(ctx, addr, conflictPrompt(dir, s.branch, conflict.Files, token))
+			if err := s.confirmClaim(taskCtx, ctx, key, token); err != nil {
+				s.taskFailed(taskCtx, key, "verify claim before conflict prompt", err, termName, &finish, &res, fail)
+				return
+			}
+			baseline, err = s.sessions.Prompt(taskCtx, addr, conflictPrompt(dir, s.branch, conflict.Files, reportToken))
 			if err != nil {
-				fail(fmt.Errorf("send conflict prompt: %w", err))
+				s.taskFailed(taskCtx, key, "send conflict prompt", err, termName, &finish, &res, fail)
 				return
 			}
 			continue
 		}
 		// 没有完成标记：续写提示词重试，超过 retries 转人工。
 		if attempts >= s.cfg.Retries {
-			fail(fmt.Errorf("no %s after %d retries: %w", worker.ReadyMarker, attempts, repErr))
+			fail(fmt.Errorf("no %s after %d retries: %v", worker.ReadyMarker, attempts, repErr))
 			return
 		}
 		attempts++
-		baseline, err = s.sessions.Prompt(ctx, addr, worker.ContinuePrompt(token))
+		if err := s.confirmClaim(taskCtx, ctx, key, token); err != nil {
+			s.taskFailed(taskCtx, key, "verify claim before continue prompt", err, termName, &finish, &res, fail)
+			return
+		}
+		baseline, err = s.sessions.Prompt(taskCtx, addr, worker.ContinuePrompt(reportToken))
 		if err != nil {
-			fail(fmt.Errorf("send continue prompt: %w", err))
+			s.taskFailed(taskCtx, key, "send continue prompt", err, termName, &finish, &res, fail)
 			return
 		}
 	}
+}
+
+// taskFailed 归类一次失败：失锁或上游取消 → 停终端后释放；其它 →
+// 保留终端与两把锁并写一条报告。
+func (s *Scheduler) taskFailed(ctx context.Context, key graph.Key, what string, err error, termName string,
+	finish *int, res *taskResult, fail func(error)) {
+	cause := context.Cause(ctx)
+	reason := fmt.Sprintf("%s: %v", what, err)
+	switch {
+	case errors.Is(err, ErrClaimLost), errors.Is(cause, ErrClaimLost):
+		*finish = finishStop
+		res.attention = fmt.Sprintf("%s (task cancelled: %v)", reason, cause)
+		s.log.Warn("task stopped; the claim is no longer ours", "key", key, "reason", res.attention, "terminal", termName)
+	case cause != nil:
+		*finish = finishStop
+		res.attention = fmt.Sprintf("%s (task cancelled: %v)", reason, cause)
+		s.log.Warn("task stopped; parent context cancelled", "key", key, "reason", res.attention, "terminal", termName)
+	default:
+		s.log.Warn("task needs attention", "key", key, "err", err, "inspect", "hc attach "+termName)
+		fail(fmt.Errorf("%s\n排查终端: hc attach %s", err.Error(), termName))
+		res.attention = reason
+	}
+}
+
+// noteFailure 把预检得到的长期阻塞原因写进 issue 评论（方便人工接手），
+// 返回 attention 文案。认领竞争与本地锁不走这里，避免刷评论。
+func (s *Scheduler) noteFailure(ctx context.Context, key graph.Key, reason string) string {
+	nctx, cancel := s.cleanupCtx(ctx)
+	defer cancel()
+	if err := s.forge.Note(nctx, key.ProjectID, key.IID, "fastimpl: "+reason); err != nil {
+		s.log.Warn("issue note failed", "key", key, "err", err)
+	}
+	return reason
+}
+
+func (s *Scheduler) cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), ClaimReadBudget)
+}
+
+// stopWorker 用独立且有界的 context 停掉本任务终端，不受已取消的任务
+// context 影响，也不影响其他 worker。
+func (s *Scheduler) stopWorker(addr, termName string) error {
+	if addr == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), ClaimReadBudget)
+	defer cancel()
+	if err := s.sessions.Stop(ctx, addr, s.specIID, termName); err != nil {
+		s.log.Warn("stop worker terminal failed", "addr", addr, "terminal", termName, "err", err)
+		return err
+	}
+	return nil
+}
+
+// releaseMarker 尽力发 release 标记；失败只告警并给出人工处理指引。
+func (s *Scheduler) releaseMarker(ctx context.Context, key graph.Key, token string) {
+	rctx, cancel := s.cleanupCtx(ctx)
+	defer cancel()
+	if err := s.postMarker(rctx, key, claimKindNo, token); err != nil {
+		s.log.Warn("release claim marker failed; the stale claim blocks other machines until removed by hand",
+			"key", key, "instance", s.cfg.InstanceID, "claim", token,
+			"action", "delete the "+claimLine(claimKindYes, s.cfg.InstanceID, token)+" comment")
+		return
+	}
+	s.log.Info("claim marker released", "key", key, "claim", token)
+}
+
+// keepBothLocks 在无法确认 worker 已停止时保留本地锁与远端认领，
+// 打印明确的清理指引。
+func (s *Scheduler) keepBothLocks(key graph.Key, token, lockPath, termName, addr string) {
+	s.log.Warn("could not confirm the worker stopped; keeping the local lock and the claim marker",
+		"key", key, "terminal", termName, "addr", addr, "lock", lockPath,
+		"instance", s.cfg.InstanceID, "claim", token,
+		"action", "confirm that worker is stopped, then delete the local lock and the "+
+			claimLine(claimKindYes, s.cfg.InstanceID, token)+" comment")
+}
+
+// waitClaimWindow 在发 claim 后短暂等待并允许 ctx 取消。
+func (s *Scheduler) waitClaimWindow(ctx context.Context) bool {
+	if s.claimWait <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(s.claimWait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func errClaimLost(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrClaimLost, fmt.Sprintf(format, args...))
+}
+
+// confirmClaim 在关键节点重验自己的认领仍然最早有效：读取用父 ctx 的
+// 有界超时，读完后同时看任务 ctx 的 Cause（复查 goroutine 可能刚取消）。
+func (s *Scheduler) confirmClaim(ctx, parent context.Context, key graph.Key, token string) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	rctx, cancel := context.WithTimeout(parent, ClaimReadBudget)
+	defer cancel()
+	winner, mine, err := s.claimState(rctx, key, token)
+	if err != nil {
+		return fmt.Errorf("verify claim: %w", err)
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	if holdsClaim(winner, mine) {
+		return nil
+	}
+	if mine == nil {
+		return errClaimLost("our claim marker is gone from issue comments")
+	}
+	return errClaimLost("instance %s claimed earlier (claim %s, comment %d)",
+		winner.instance, winner.token, winner.commentID)
 }
 
 // Status 返回任务运行状态快照，供 CLI 状态行与 GUI 共用。

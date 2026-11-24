@@ -58,6 +58,9 @@ const (
 	LLMModelEnv   = "FASTIMPL_LLM_MODEL"
 )
 
+// exeDir 是可测试的接缝：返回可执行文件所在目录。
+var exeDir = files.ExeDir
+
 // DefaultResumeBudget 是任务暂停后等待人工推进的默认时限。
 const DefaultResumeBudget = 30 * time.Minute
 
@@ -97,6 +100,10 @@ type Config struct {
 	// RequireReview 控制 worker 提示词是否写入"leader + 第三方
 	// 独立审核全部通过"的硬性要求（默认 true）。
 	RequireReview bool
+	// InstanceID 是本机稳定标识，跨机器认领 issue 时写进评论标记。
+	// 只从 exe 同目录的 fastimpl.toml 读取，工作目录与 -config
+	// 都不能覆盖它。
+	InstanceID string
 	// SpecIID 是本次运行的 spec issue IID，由命令行给出。
 	SpecIID int
 	// ResumeBudget 是暂停后等待用户推进的时限。
@@ -115,6 +122,7 @@ type rawConfig struct {
 	HcBinary      *string `toml:"hc_binary"`
 	HcSocket      *string `toml:"hc_socket"`
 	Forge         *string `toml:"forge"`
+	InstanceID    *string `toml:"instance_id"`
 }
 
 // defaultParallelism 是未配置 parallelism 时的并发上限。
@@ -197,11 +205,11 @@ func splitCmd(s string) ([]string, error) {
 // DefaultConfig 播种到 exe 目录作为全局默认。
 // 命令行覆盖（-repo-dir 等）由调用方在 Load 之后叠加。
 func Load(workDir, path string) (Config, error) {
-	exeDir, err := files.ExeDir()
+	dir, err := exeDir()
 	if err != nil {
 		return Config{}, err
 	}
-	base, baseFound, err := readLayer(filepath.Join(exeDir, DefaultFile), false)
+	base, baseFound, err := readLayer(filepath.Join(dir, DefaultFile), false)
 	if err != nil {
 		return Config{}, err
 	}
@@ -214,9 +222,8 @@ func Load(workDir, path string) (Config, error) {
 		return Config{}, err
 	}
 	if path == "" && !baseFound && !overFound {
-		seed := filepath.Join(exeDir, DefaultFile)
-		if err := os.WriteFile(seed, []byte(DefaultConfig), 0o644); err != nil {
-			return Config{}, fmt.Errorf("seed config %s: %w", seed, err)
+		if err := SeedDefaultConfig(filepath.Join(dir, DefaultFile)); err != nil {
+			return Config{}, err
 		}
 	}
 	cfg := Config{
@@ -228,6 +235,16 @@ func Load(workDir, path string) (Config, error) {
 	}
 	applyRaw(&cfg, base)
 	applyRaw(&cfg, over)
+	// 机器标识只认 exe 同目录的全局层：工作目录与 -config 都不能覆盖，
+	// 否则同一台机器会因项目不同而变成两个实例。
+	if base.InstanceID != nil {
+		id := strings.TrimSpace(*base.InstanceID)
+		if !validInstanceID(id) {
+			return Config{}, fmt.Errorf("invalid instance_id %q in %s: use only [A-Za-z0-9._-], at most %d chars",
+				id, filepath.Join(dir, DefaultFile), maxInstanceIDLen)
+		}
+		cfg.InstanceID = id
+	}
 	scrubSecretEnv()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -328,6 +345,10 @@ func (c Config) Validate() error {
 	case "", ForgeGitLab, ForgeGitHub:
 	default:
 		return fmt.Errorf("forge must be %q or %q, got %q", ForgeGitLab, ForgeGitHub, c.Forge)
+	}
+	if c.InstanceID != "" && !validInstanceID(c.InstanceID) {
+		return fmt.Errorf("instance_id %q must contain only [A-Za-z0-9._-] and be at most %d chars",
+			c.InstanceID, maxInstanceIDLen)
 	}
 	return nil
 }

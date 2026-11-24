@@ -262,13 +262,14 @@ func (c *Client) IssueState(ctx context.Context, projectID, iid int) (forge.Issu
 			continue
 		}
 		for _, a := range w.Assignees.Nodes {
-			if a.Username == c.username {
+			if strings.EqualFold(a.Username, c.username) {
 				assignedToMe = true
 			} else {
 				info.AssignedToOther = true
 			}
 		}
 	}
+	info.AssignedToMe = assignedToMe
 	for _, w := range item.Widgets {
 		if w.Typename != "WorkItemWidgetStatus" {
 			continue
@@ -535,10 +536,52 @@ func (c *Client) issueCmd(ctx context.Context, projectID, iid int, argv ...strin
 	return err
 }
 
-// Claim 把 issue 指派给当前用户（--assignee @me）。
-// 调用方必须在启动 worker 前重新读取状态与指派；被他人领取的任务不得启动。
+// Claim 把 issue 指派给当前用户。--assignee +<username> 是加法：既有
+// 受理人不变，不替换他人指派（但仍不是相对网页改派的原子操作，最终
+// 以回读的指派状态为准）。调用方必须在启动 worker 前重新读取状态与
+// 指派；被他人领取的任务不得启动。
 func (c *Client) Claim(ctx context.Context, projectID, iid int) error {
-	return c.issueCmd(ctx, projectID, iid, "update", strconv.Itoa(iid), "--assignee", "@me")
+	return c.issueCmd(ctx, projectID, iid, "update", strconv.Itoa(iid), "--assignee", "+"+c.username)
+}
+
+// note 是 GitLab note 的 REST 视图。
+type note struct {
+	ID        int64  `json:"id"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"created_at"`
+	Author    struct {
+		ID int64 `json:"id"`
+	} `json:"author"`
+}
+
+// IssueComments 按服务端顺序读出 issue 的全部评论。--paginate 的输出
+// 可能是单个数组或多个连续数组，任一读取/解析失败都返回错误而不是空表。
+func (c *Client) IssueComments(ctx context.Context, projectID, iid int) ([]forge.IssueComment, error) {
+	raw, err := c.api(ctx, "--paginate",
+		fmt.Sprintf("projects/%s/issues/%d/notes?per_page=100", c.projectScope(projectID), iid))
+	if err != nil {
+		return nil, fmt.Errorf("read comments of %d!%d: %w", projectID, iid, err)
+	}
+	var out []forge.IssueComment
+	err = forge.DecodeArrays(raw, func(page []note) error {
+		for _, n := range page {
+			created, perr := time.Parse(time.RFC3339, n.CreatedAt)
+			if perr != nil {
+				return fmt.Errorf("decode created_at %q of note %d: %w", n.CreatedAt, n.ID, perr)
+			}
+			out = append(out, forge.IssueComment{
+				ID:        n.ID,
+				AuthorID:  n.Author.ID,
+				CreatedAt: created,
+				Body:      n.Body,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read comments of %d!%d: %w", projectID, iid, err)
+	}
+	return out, nil
 }
 
 // 默认看板状态名：GitLab 系统生命周期与 GitHub 原生枚举同名；

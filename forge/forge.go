@@ -2,12 +2,17 @@
 // 抽象接口与共享数据类型：调度器消费这些操作，gitlab/github 客户端实现。
 package forge
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // IssueInfo 是一次 issue 现场状态读取的结果（claim 前重读与周期刷新共用）。
 type IssueInfo struct {
 	// Open 表示 issue 在 forge 上仍开放。
 	Open bool
+	// AssignedToMe 表示当前登录用户是指派人之一。
+	AssignedToMe bool
 	// AssignedToOther 表示已指派给当前用户以外的人。
 	AssignedToOther bool
 	// InFlight 表示看板 status 为进行中且未指派给当前用户——他人或
@@ -19,11 +24,25 @@ type IssueInfo struct {
 	DoneOnBoard bool
 }
 
+// IssueComment 是 issue 上的一条评论（note）。
+type IssueComment struct {
+	// ID 是服务端评论 ID，用于稳定排序与日志定位。
+	ID int64
+	// AuthorID 是作者的服务端用户 ID。
+	AuthorID int64
+	// CreatedAt 是服务端创建时间，仲裁按它排序。
+	CreatedAt time.Time
+	// Body 是评论正文。
+	Body string
+}
+
 // Forge 是调度器需要的 issue/MR 操作；gitlab.Client 与 github.Client
 // 都满足本接口（GitLab 的 projectID 即 GitHub 的 repo database id）。
 type Forge interface {
 	// IssueState 读取 issue 的开关、领取、占用与看板终态。
 	IssueState(ctx context.Context, projectID, iid int) (IssueInfo, error)
+	// IssueComments 按服务端顺序读出 issue 的全部评论。
+	IssueComments(ctx context.Context, projectID, iid int) ([]IssueComment, error)
 	// Claim 把 issue 指派给当前用户。
 	Claim(ctx context.Context, projectID, iid int) error
 	// MarkInProgress 把 issue 的看板状态置为进行中（尽力而为：

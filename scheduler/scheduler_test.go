@@ -22,31 +22,127 @@ import (
 
 // fakeForge 记录 Claim/Close/Note/状态标记调用；closedOn/other 控制
 // IssueState；markErr 让状态标记失败，验证 warn-only 路径。
+// 评论按服务端模型保存（递增 ID、递增时间、按作者的 authorID），
+// 用于验证跨机器认领协议。
 type fakeForge struct {
-	mu         sync.Mutex
-	claimed    []graph.Key
-	doing      []graph.Key
-	done       []graph.Key
-	closed     []graph.Key
-	notes      []string
-	closedOn   map[int]bool // IssueState 返回 open=false
-	other      map[int]bool // IssueState 返回 assignedToOther=true
-	inFlight   map[int]bool // IssueState 返回 inFlight=true（他人处理中）
-	boardDirty map[int]bool // IssueState 返回 doneOnBoard=false（closed 但看板未终态）
-	markErr    map[int]bool // MarkInProgress/MarkDone 返回错误
+	mu       sync.Mutex
+	claimed  []graph.Key
+	doing    []graph.Key
+	done     []graph.Key
+	closed   []graph.Key
+	notes    []string
+	comments map[int][]forge.IssueComment // issue IID → 评论
+	nextID   int64
+	// commentCalls 记录 IssueComments 的调用次数（barrier 用）。
+	commentCalls int
+	clock        time.Time
+	closedOn     map[int]bool // IssueState 返回 open=false
+	other        map[int]bool // IssueState 返回 assignedToOther=true
+	inFlight     map[int]bool // IssueState 返回 inFlight=true（他人处理中）
+	boardDirty   map[int]bool // IssueState 返回 doneOnBoard=false（closed 但看板未终态）
+	markErr      map[int]bool // MarkInProgress/MarkDone 返回错误
+	myLogin      string       // Claim 后 AssignedToMe 判定用
+	authorID     int64        // Note 写入的评论作者 ID
+	// commentErr 让 IssueComments 报错；assigneeLost 让 Claim 后回读
+	// 仍不是本人（模拟指派没生效）；otherAfterClaim/closedAfterClaim
+	// 让 Claim 之后的状态回读变成他人领取/已关闭。
+	commentErr       error
+	assigneeLost     bool
+	claimNoteErr     error
+	otherAfterClaim  map[int]bool
+	closedAfterClaim map[int]bool
+	// stateErr/stateErrAt 让第 stateErrAt 次 IssueState 调用报错。
+	stateErr   error
+	stateErrAt int
+	stateCalls int
+	// claimBarrier 在读完评论后、返回前被调用（带上第几次读取与本次
+	// 读到的 claim 标记数），用来让两个实例在同一时刻竞争；nil 表示不等。
+	claimBarrier func(call, claims int)
+	// onComment 在每次写入评论后回调（用于让对手在看到标记后行动）。
+	onComment func(forge.IssueComment)
 }
 
 // IssueState 默认全部 open、未领取未占用、看板终态一致；
-// closedOn/other/inFlight/boardDirty 覆盖。
+// closedOn/other/inFlight/boardDirty 覆盖；Claim 会把 issue 记成本人
+// 指派（除非 assigneeLost）。
 func (f *fakeForge) IssueState(ctx context.Context, projectID, iid int) (forge.IssueInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.stateCalls++
+	if f.stateErr != nil && f.stateCalls == f.stateErrAt {
+		return forge.IssueInfo{}, f.stateErr
+	}
+	claimed := f.assignedToMe(iid)
+	other := f.other[iid]
+	closed := f.closedOn[iid]
+	if claimed {
+		other = other || f.otherAfterClaim[iid]
+		closed = closed || f.closedAfterClaim[iid]
+	}
 	return forge.IssueInfo{
-		Open:            !f.closedOn[iid],
-		AssignedToOther: f.other[iid],
+		Open:            !closed,
+		AssignedToMe:    claimed,
+		AssignedToOther: other,
 		InFlight:        f.inFlight[iid],
 		DoneOnBoard:     !f.boardDirty[iid],
 	}, nil
+}
+
+// assignedToMe 报告当前 fake 里 issue 是否指派给了本人。
+func (f *fakeForge) assignedToMe(iid int) bool {
+	if f.assigneeLost {
+		return false
+	}
+	for _, k := range f.claimed {
+		if k.IID == iid {
+			return true
+		}
+	}
+	return false
+}
+
+// IssueComments 返回当前全部评论（含服务端 ID/时间/author）。
+func (f *fakeForge) IssueComments(ctx context.Context, projectID, iid int) ([]forge.IssueComment, error) {
+	f.mu.Lock()
+	barrier := f.claimBarrier
+	err := f.commentErr
+	out := append([]forge.IssueComment{}, f.comments[iid]...)
+	f.commentCalls++
+	call := f.commentCalls
+	f.mu.Unlock()
+	if barrier != nil {
+		barrier(call, countClaims(out))
+	}
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// countClaims 数出评论里 claim 标记的条数。
+func countClaims(comments []forge.IssueComment) int {
+	n := 0
+	for _, c := range comments {
+		if kind, _, _, ok := parseClaim(c.Body); ok && kind == claimKindYes {
+			n++
+		}
+	}
+	return n
+}
+
+// addComment 以服务端身份在 iid 上追加一条评论，返回它。
+func (f *fakeForge) addComment(iid int, body string, authorID int64) forge.IssueComment {
+	f.nextID++
+	if f.clock.IsZero() {
+		f.clock = time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	f.clock = f.clock.Add(time.Second)
+	if f.comments == nil {
+		f.comments = map[int][]forge.IssueComment{}
+	}
+	c := forge.IssueComment{ID: f.nextID, AuthorID: authorID, CreatedAt: f.clock, Body: body}
+	f.comments[iid] = append(f.comments[iid], c)
+	return c
 }
 
 func (f *fakeForge) Claim(ctx context.Context, projectID, iid int) error {
@@ -85,8 +181,22 @@ func (f *fakeForge) Close(ctx context.Context, projectID, iid int) error {
 
 func (f *fakeForge) Note(ctx context.Context, projectID, iid int, message string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	if f.claimNoteErr != nil && strings.HasPrefix(message, claimVersion) {
+		err := f.claimNoteErr
+		f.mu.Unlock()
+		return err
+	}
 	f.notes = append(f.notes, fmt.Sprintf("%d!%d: %s", projectID, iid, message))
+	author := f.authorID
+	if author == 0 {
+		author = 100
+	}
+	c := f.addComment(iid, message, author)
+	hook := f.onComment
+	f.mu.Unlock()
+	if hook != nil {
+		hook(c)
+	}
 	return nil
 }
 
@@ -102,11 +212,18 @@ type fakeSessions struct {
 	nextID  int
 	// 测试用模板 "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}"，从渲染结果取令牌。
 	tokens map[string]string
+	// startErr/stopErr 让启动/停止失败；stops 记录停过的地址。
+	startErr error
+	stopErr  error
+	stops    []string
 }
 
 func (f *fakeSessions) StartWorker(ctx context.Context, p worker.Params) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.startErr != nil {
+		return "", f.startErr
+	}
 	f.nextID++
 	f.started = append(f.started, p)
 	return fmt.Sprintf("t%d", f.nextID), nil
@@ -124,6 +241,12 @@ func (f *fakeSessions) ReadScreen(ctx context.Context, addr string, lines int) (
 }
 
 func (f *fakeSessions) Stop(ctx context.Context, addr string, specIID int, taskName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stopErr != nil {
+		return f.stopErr
+	}
+	f.stops = append(f.stops, addr)
 	return nil
 }
 
@@ -153,6 +276,18 @@ var readyTokenRE = regexp.MustCompile(worker.ReadyMarker + `\s+(t[0-9a-f]+)`)
 
 func (f *fakeSessions) WaitTurn(ctx context.Context, addr string, baseline uint64, budget time.Duration) (worker.Record, error) {
 	return worker.Record{Turn: baseline + 1, Live: true, Status: "done"}, nil
+}
+
+// testInstanceID 是 scheduler 测试使用的稳定实例 ID。
+const testInstanceID = "test-box-1"
+
+// newTestScheduler 同 New，但把发 claim 后的等待与运行期复查间隔
+// 压到零/极短，测试不引入真实网络与真实等待。
+func newTestScheduler(cfg config.Config, repo *worktree.Repo, f forge.Forge, forgeName string, g *graph.Graph, sessions Sessions, template, workDir, intDir, intBranch, baseName string, agentArgv []string, log *slog.Logger) *Scheduler {
+	s := New(cfg, repo, f, forgeName, g, sessions, template, workDir, intDir, intBranch, baseName, agentArgv, log)
+	s.claimWait = 0
+	s.claimRecheck = 20 * time.Millisecond
+	return s
 }
 
 // initRepo 建一个带初始提交的临时 git 仓库。
@@ -206,8 +341,8 @@ func TestSchedulerRun(t *testing.T) {
 	sessions := &fakeSessions{}
 	// worker 在各自 worktree 里制造一次提交（Merge 需要真实差异）。
 	hookSessions := &commitSessions{fakeSessions: sessions, t: t}
-	cfg := config.Config{Parallelism: 4, SpecIID: 8}
-	s := New(cfg, repo, forge, "gitlab", g, hookSessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	cfg := config.Config{Parallelism: 4, SpecIID: 8, InstanceID: testInstanceID}
+	s := newTestScheduler(cfg, repo, forge, "gitlab", g, hookSessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -456,8 +591,8 @@ func TestSchedulerBaseSyncConflict(t *testing.T) {
 	g.Add(graph.Node{Key: graph.Key{ProjectID: 1, IID: 9}, Title: "task A", Kind: graph.KindChild})
 
 	sessions := &baseSyncSessions{fakeSessions: &fakeSessions{}}
-	cfg := config.Config{Parallelism: 1, SpecIID: 8, Retries: 2}
-	s := New(cfg, repo, &fakeForge{}, "gitlab", g, sessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	cfg := config.Config{Parallelism: 1, SpecIID: 8, Retries: 2, InstanceID: testInstanceID}
+	s := newTestScheduler(cfg, repo, &fakeForge{}, "gitlab", g, sessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -504,8 +639,8 @@ func TestSchedulerConflictResolvedByAgent(t *testing.T) {
 	g.Add(graph.Node{Key: graph.Key{ProjectID: 1, IID: 10}, Title: "task B", Kind: graph.KindChild})
 
 	sessions := &conflictSessions{fakeSessions: &fakeSessions{}, intBranch: intBranch}
-	cfg := config.Config{Parallelism: 2, SpecIID: 8, Retries: 4}
-	s := New(cfg, repo, &fakeForge{}, "gitlab", g, sessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	cfg := config.Config{Parallelism: 2, SpecIID: 8, Retries: 4, InstanceID: testInstanceID}
+	s := newTestScheduler(cfg, repo, &fakeForge{}, "gitlab", g, sessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -540,8 +675,8 @@ func TestSchedulerInFlightSkipped(t *testing.T) {
 
 	forge := &fakeForge{inFlight: map[int]bool{9: true}}
 	sessions := &fakeSessions{}
-	cfg := config.Config{Parallelism: 1, SpecIID: 8}
-	s := New(cfg, repo, forge, "gitlab", g, sessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	cfg := config.Config{Parallelism: 1, SpecIID: 8, InstanceID: testInstanceID}
+	s := newTestScheduler(cfg, repo, forge, "gitlab", g, sessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	err = s.Run(ctx)
 	if err == nil || !strings.Contains(err.Error(), "needs attention") {
 		t.Fatalf("Run err = %v, want stalled needs-attention error", err)
@@ -578,8 +713,8 @@ func TestSchedulerRefreshInFlight(t *testing.T) {
 	g.Add(graph.Node{Key: graph.Key{ProjectID: 1, IID: 9}, Title: "task A", Kind: graph.KindChild})
 
 	forge := &fakeForge{inFlight: map[int]bool{9: true}}
-	cfg := config.Config{Parallelism: 1, SpecIID: 8}
-	s := New(cfg, repo, forge, "gitlab", g, &fakeSessions{}, "tpl", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	cfg := config.Config{Parallelism: 1, SpecIID: 8, InstanceID: testInstanceID}
+	s := newTestScheduler(cfg, repo, forge, "gitlab", g, &fakeSessions{}, "tpl", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 
 	s.refreshStates(ctx)
 	n, _ := g.Lookup(graph.Key{ProjectID: 1, IID: 9})
@@ -618,8 +753,8 @@ func TestSchedulerWarnsDirtyBoard(t *testing.T) {
 	var buf strings.Builder
 	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	forgeFake := &fakeForge{closedOn: map[int]bool{9: true}, boardDirty: map[int]bool{9: true}}
-	cfg := config.Config{Parallelism: 1, SpecIID: 8}
-	s := New(cfg, repo, forgeFake, "gitlab", g, &fakeSessions{}, "tpl", repoDir, intDir, intBranch, baseName, []string{"devin"}, log)
+	cfg := config.Config{Parallelism: 1, SpecIID: 8, InstanceID: testInstanceID}
+	s := newTestScheduler(cfg, repo, forgeFake, "gitlab", g, &fakeSessions{}, "tpl", repoDir, intDir, intBranch, baseName, []string{"devin"}, log)
 
 	s.refreshStates(ctx)
 	s.refreshStates(ctx) // 第二次刷新不应重复 warn

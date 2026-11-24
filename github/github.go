@@ -30,8 +30,8 @@ import (
 	"github.com/yangjuncode/fastimpl/retry"
 	"net/url"
 	"os/exec"
-	"strconv"
 	"strings"
+	"time"
 )
 
 // Runner 执行 gh 命令；测试用假实现替换它。
@@ -99,10 +99,30 @@ type Issue struct {
 // IsOpen 报告 issue 当前是否未关闭。
 func (i Issue) IsOpen() bool { return i.State == "open" }
 
+// comment 是 GitHub issue comment 的 REST 视图。
+type comment struct {
+	ID        int64  `json:"id"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"created_at"`
+	User      struct {
+		ID int64 `json:"id"`
+	} `json:"user"`
+}
+
+// AssignedToMe 报告当前用户是否是指派人之一。
+func (i Issue) AssignedToMe(login string) bool {
+	for _, a := range i.Assignees {
+		if strings.EqualFold(a.Login, login) {
+			return true
+		}
+	}
+	return false
+}
+
 // AssignedToOther 报告 issue 是否已被当前用户之外的人领取。
 func (i Issue) AssignedToOther(login string) bool {
 	for _, a := range i.Assignees {
-		if a.Login != login {
+		if !strings.EqualFold(a.Login, login) {
 			return true
 		}
 	}
@@ -130,12 +150,7 @@ func (i Issue) InFlight(login string) bool {
 	if i.Status == nil || !inFlightStatuses[strings.ToLower(i.Status.Name)] {
 		return false
 	}
-	for _, a := range i.Assignees {
-		if a.Login == login {
-			return false
-		}
-	}
-	return true
+	return !i.AssignedToMe(login)
 }
 
 // TypeName 返回 issue type 名（GitHub issue types，可缺省）。
@@ -225,6 +240,22 @@ func NewClient(ctx context.Context, runner Runner, dir, wantHost, wantPath strin
 func (c *Client) api(ctx context.Context, args ...string) ([]byte, error) {
 	argv := append([]string{"api", "--hostname", c.host}, args...)
 	return c.runner.Run(ctx, c.dir, argv, nil)
+}
+
+// apiJSON 以显式 JSON body（经标准输入）执行一次 gh api 调用：
+// -f 不会按数组语法转 JSON，需要复合结构时只能走 --input -。
+func (c *Client) apiJSON(ctx context.Context, body any, args ...string) error {
+	argv := append([]string{"api", "--hostname", c.host}, args...)
+	var payload []byte
+	if body != nil {
+		var err error
+		if payload, err = json.Marshal(body); err != nil {
+			return fmt.Errorf("encode request body: %w", err)
+		}
+		argv = append(argv, "--input", "-")
+	}
+	_, err := c.runner.Run(ctx, c.dir, argv, payload)
+	return err
 }
 
 // isNotFound 判定 gh api 的错误是否是 404（GHES 没有 dependencies API
@@ -424,21 +455,56 @@ func (c *Client) IssueState(ctx context.Context, repoID, num int) (forge.IssueIn
 	}
 	return forge.IssueInfo{
 		Open:            iss.IsOpen(),
+		AssignedToMe:    iss.AssignedToMe(c.login),
 		AssignedToOther: iss.AssignedToOther(c.login),
 		InFlight:        iss.IsOpen() && iss.InFlight(c.login),
 		DoneOnBoard:     iss.DoneOnBoard(),
 	}, nil
 }
 
-// Claim 把 issue 指派给当前用户。
-// 调用前必须重新读取状态与指派；被他人领取的任务不得启动。
+// Claim 把 issue 以加法方式指派给当前用户（POST assignees）：既有
+// 受理人不变，不替换他人指派。调用前必须重新读取状态与指派；
+// 被他人领取的任务不得启动。
 func (c *Client) Claim(ctx context.Context, repoID, num int) error {
 	path, err := c.repoPath(ctx, repoID)
 	if err != nil {
 		return err
 	}
-	_, err = c.runner.Run(ctx, c.dir, []string{"issue", "edit", strconv.Itoa(num), "--add-assignee", "@me", "-R", path, "--hostname", c.host}, nil)
-	return err
+	return c.apiJSON(ctx, map[string][]string{"assignees": {c.login}},
+		"-X", "POST", fmt.Sprintf("repos/%s/issues/%d/assignees", path, num))
+}
+
+// IssueComments 按服务端顺序读出 issue 的全部评论。--paginate 的输出
+// 可能是单个数组或多个连续数组，任一读取/解析失败都返回错误而不是空表。
+func (c *Client) IssueComments(ctx context.Context, repoID, num int) ([]forge.IssueComment, error) {
+	path, err := c.repoPath(ctx, repoID)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := c.api(ctx, "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", path, num))
+	if err != nil {
+		return nil, fmt.Errorf("read comments of %s#%d: %w", path, num, err)
+	}
+	var out []forge.IssueComment
+	err = forge.DecodeArrays(raw, func(page []comment) error {
+		for _, n := range page {
+			created, perr := time.Parse(time.RFC3339, n.CreatedAt)
+			if perr != nil {
+				return fmt.Errorf("decode created_at %q of comment %d: %w", n.CreatedAt, n.ID, perr)
+			}
+			out = append(out, forge.IssueComment{
+				ID:        n.ID,
+				AuthorID:  n.User.ID,
+				CreatedAt: created,
+				Body:      n.Body,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read comments of %s#%d: %w", path, num, err)
+	}
+	return out, nil
 }
 
 // 默认看板状态名：GitHub 原生枚举值；GitLab 系统生命周期同名。
@@ -496,8 +562,7 @@ func (c *Client) Close(ctx context.Context, repoID, num int) error {
 	if err != nil {
 		return err
 	}
-	_, err = c.runner.Run(ctx, c.dir, []string{"issue", "close", strconv.Itoa(num), "-R", path, "--hostname", c.host}, nil)
-	return err
+	return c.apiJSON(ctx, nil, "-X", "PATCH", fmt.Sprintf("repos/%s/issues/%d", path, num), "-f", "state=closed")
 }
 
 // Note 在 issue 上追加一条评论。
@@ -506,7 +571,8 @@ func (c *Client) Note(ctx context.Context, repoID, num int, message string) erro
 	if err != nil {
 		return err
 	}
-	_, err = c.runner.Run(ctx, c.dir, []string{"issue", "comment", strconv.Itoa(num), "--body", message, "-R", path, "--hostname", c.host}, nil)
+	_, err = c.api(ctx, "-X", "POST", fmt.Sprintf("repos/%s/issues/%d/comments", path, num),
+		"-f", "body="+message)
 	return err
 }
 

@@ -5,6 +5,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -67,6 +68,13 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 		return initFiles(workDir, stdout)
 	}
 	log := slog.New(slog.NewTextHandler(stderr, nil))
+	// 真正调度前先确保本机稳定实例 ID（跨机器认领用）：尽早生成，
+	// 保证随后 config.Load 能读到它。只读的 -print 不生成。
+	if !opts.Print {
+		if _, err := config.EnsureInstanceID(); err != nil {
+			return err
+		}
+	}
 	cfg, err := config.Load(workDir, opts.ConfigPath)
 	if err != nil {
 		return err
@@ -171,16 +179,33 @@ func initFiles(workDir string, out io.Writer) error {
 	}
 	for _, p := range pairs {
 		dst := filepath.Join(workDir, p.name)
-		if _, err := os.Stat(dst); err == nil {
-			fmt.Fprintf(out, "%s already exists; skipped\n", dst)
-			continue
-		}
 		data, err := os.ReadFile(filepath.Join(exeDir, p.name))
 		if err != nil {
 			data = []byte(p.fallback)
 		}
-		if err := os.WriteFile(dst, data, 0o644); err != nil {
+		// 机器 ID 属于本机，-init 复制全局配置时不带进项目配置。
+		if p.name == config.DefaultFile {
+			data, err = config.StripInstanceID(data)
+			if err != nil {
+				return fmt.Errorf("prepare %s: %w", p.name, err)
+			}
+		}
+		// O_EXCL 创建：并发 -init 或已存在的文件都不会被覆盖。
+		f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			if errors.Is(err, os.ErrExist) {
+				fmt.Fprintf(out, "%s already exists; skipped\n", dst)
+				continue
+			}
 			return fmt.Errorf("write %s: %w", dst, err)
+		}
+		_, werr := f.Write(data)
+		cerr := f.Close()
+		if werr != nil {
+			return fmt.Errorf("write %s: %w", dst, werr)
+		}
+		if cerr != nil {
+			return fmt.Errorf("write %s: %w", dst, cerr)
 		}
 		fmt.Fprintf(out, "wrote %s\n", dst)
 	}

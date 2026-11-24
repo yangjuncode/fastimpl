@@ -136,8 +136,10 @@ refspec 下又会缺少真实分支；普通 fetch 也不会 prune）。之后�
 1. **预检**：claim 前重读 issue 现场状态（建图快照可能已过期）——
    已关闭 → 跳过并标记 `Closed`；已指派给他人 → `NeedsAttention`，
    不抢占。
-2. **领取**：`glab issue update --assignee @me` / `gh issue edit
-   --add-assignee @me`。
+2. **领取**：`glab issue update <iid> --assignee +<login>`（加法指派，保留
+   既有受理人）/ `gh api -X POST repos/<owner>/<repo>/issues/<num>/assignees
+   --input -`，body 为 `{"assignees":["<login>"]}`。之后回读确认仍是
+   本人指派、无他人、无占用才算领取成功。
 3. **建 worktree**：`git worktree add <dir> -b issue-<iid> <集成分支>`。
 4. **启动 hc 终端**：在任务 worktree 中运行 `agent_cmd`（默认
    `devin --permission-mode dangerous`），终端名 `<repo>-<分支>`，
@@ -285,6 +287,14 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
 - **`hc_binary` 与 `hc_socket` 互斥**：前者执行 `hc connect` 拉起/连接
   herdr-core，后者直连已有 Unix socket。
 - **`retries = 0` 是合法值**（只尝试一次，不续写）。
+- **`instance_id`** 是本机的稳定标识（形如 `机器名-随机哈希`，只允许
+  `[A-Za-z0-9._-]`，≤128 字符）。它**只从 `<exe 同目录>/fastimpl.toml`
+  读取**，`<work-dir>/fastimpl.toml` 与 `-config` 都不能覆盖。缺失时
+  fastimpl 在实际调度前（`-init`、`-print` 之外）自动生成并原子写回该
+  文件：ID 插在文件顶部，原有内容与权限保留，新文件权限 0600。跨进程
+  首次初始化用系统 temp 目录下的初始化锁保护，并发启动只会产生一个 ID。
+  `-init` 复制全局配置时会去掉 `instance_id`，不会把机器 ID 带进项目
+  配置。
 
 ### 提示词模板 fastimpl.prompt.md
 
@@ -355,6 +365,45 @@ forge      配置 forge > origin 主机名推断 > glab/gh 探测 > gitlab
   `issue-*` 分支与 worktree 会复用；集成分支存在则在其上继续。把上次
   needs-attention 的 issue 处理好（或确认它本就该被关闭）后直接再次
   `fastimpl <spec>` 即可续跑。
+
+### 跨机器认领与 stale 锁
+
+同一台机器上，fastimpl 用**本地锁文件**保证同仓库同 issue 只跑一个
+worker；不同机器之间用 **issue 评论里的认领标记**做尽力仲裁。
+
+- **本地锁**：`<系统 temp 目录>/fastimpl-<规范化仓库绝对路径 SHA256>-<issue-no>.lock`，
+  用 `O_EXCL` 创建，内容含 PID、`instance_id` 与本次 claim token。
+  并发时只有一个成功，其余告警并把这些任务转为 needs attention（不同
+  issue 互不影响）。仓库路径先取绝对/清理再 `EvalSymlinks`，经符号
+  链接别名进来也是同一把锁。释放前用文件身份（`SameFile`）确认没被
+  人工删掉重建，只删自己的文件。锁不自动过期。
+- **评论标记**：抢到本地锁后按下面的严格单行格式发一条注释，短暂等待
+  （默认 1 秒）后回读，只有自己的标记是**最早**的那条才算赢；运行期每
+  15 秒复查一次，一旦出现更早的活跃认领或自己的标记被删，就取消该任务
+  并停掉它的终端（不影响其他 worker）：
+
+  ```
+  fastimpl-claim/v1 claim <instance-id> <claim-id>
+  fastimpl-claim/v1 release <instance-id> <claim-id>
+  ```
+
+  仲裁按服务端 `created_at` 升序、同时间按评论 ID 升序；同一
+  (author, instance, claim-id) 保留首次出现的位置，`release` 只对已经
+  出现过的同作者认领立墓碑，重复 release 幂等，重复 claim 不会让已释放
+  的认领复活。机器 ID 是稳定的，重启后仍会被视为别的实例的旧认领，
+  不会自动接手。
+- **已知限制**：评论 API 没有原子互斥，仲裁是尽力而为——两个实例可能
+  短暂同时运行，直到某次复查才发现并让后到者退出；直接在网页上并发
+  人工操作同样不受该协议约束。
+- **遗留认领不会自动过期**：看到 `issue already claimed elsewhere` 的
+  告警时，先确认对应实例的 worker 确实已经不在跑，再**手工删除**那条
+  `fastimpl-claim/v1 claim …` 评论。
+- **遗留本地锁**：启动日志会给出锁文件路径。确认旧 worker 已停止后手工
+  `rm` 该锁文件即可；fastimpl 不会抢锁、也不会自动过期。
+- **两边都保留的情况**：如果 fastimpl 无法确认 worker 已停止（启动结果
+  不明确、停止失败），会同时保留本地锁与 claim 评论，并打印终端名、
+  锁路径、issue 与 claim token。按提示先确认对应 worker 已停止，再删
+  那条 claim 评论与本地锁。
 
 ## 安全约定
 
