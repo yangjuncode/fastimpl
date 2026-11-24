@@ -193,8 +193,12 @@ func (c *Client) api(ctx context.Context, args ...string) ([]byte, error) {
 }
 
 // apiStdin 同 api，但把 payload 经标准输入送入（GraphQL 查询体）。
+// 必须显式声明 Content-Type：--input 裸发 body 时 glab 不加任何
+// Content-Type，Rails 侧不按 JSON 解析，GraphQL 拿到空 query 报
+// "Unexpected end of document"。
 func (c *Client) apiStdin(ctx context.Context, payload []byte, args ...string) ([]byte, error) {
-	argv := append([]string{"api", "--hostname", c.host, "--input", "-"}, args...)
+	argv := append([]string{"api", "--hostname", c.host, "--input", "-",
+		"-H", "Content-Type: application/json"}, args...)
 	return c.runner.Run(ctx, c.dir, argv, payload)
 }
 
