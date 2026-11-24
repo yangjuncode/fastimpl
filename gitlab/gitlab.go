@@ -17,6 +17,7 @@ import (
 
 	"github.com/yangjuncode/fastimpl/config"
 	"github.com/yangjuncode/fastimpl/forge"
+	"github.com/yangjuncode/fastimpl/retry"
 )
 
 // Runner 执行 glab 命令；测试用假实现替换它。
@@ -30,7 +31,16 @@ type Runner interface {
 type ExecRunner struct{}
 
 // Run 在仓库目录中执行 glab，不经过 shell 拼接，标准错误并入错误信息。
+// 瞬时网络故障（dial/TLS 超时、连接拒绝、上游 5xx）退避重试——glab
+// 内部 HTTP 超时不对外配置，弱网实例只能靠重试扛抖动。
 func (ExecRunner) Run(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error) {
+	return retry.Do(ctx, "glab "+strings.Join(argv, " "), func() ([]byte, error) {
+		return execGlab(ctx, dir, argv, stdin)
+	})
+}
+
+// execGlab 执行单次 glab 调用（retry.Do 的重试体）。
+func execGlab(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "glab", argv...)
 	cmd.Dir = dir
 	// 子进程不继承 FASTIMPL_LLM_*，避免凭据经 glab 泄漏。

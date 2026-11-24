@@ -65,6 +65,7 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	if opts.Init {
 		return initFiles(workDir, stdout)
 	}
+	log := slog.New(slog.NewTextHandler(stderr, nil))
 	cfg, err := config.Load(workDir, opts.ConfigPath)
 	if err != nil {
 		return err
@@ -77,16 +78,27 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	log.Info("repository", "dir", repoDir, "work_dir", workDir)
 	repo := worktree.NewRepo(repoDir, "")
 	host, projectPath, err := repo.OriginCoordinate(ctx)
 	if err != nil {
 		return err
 	}
 	forge := resolveForge(ctx, cfg.Forge, host, repoDir)
-	fc, g, err := buildGraph(ctx, forge, repoDir, host, projectPath, opts.SpecIID)
+	log.Info("building dependency graph", "forge", forge, "origin", host+"/"+projectPath, "spec", opts.SpecIID)
+	fc, g, err := buildGraph(ctx, forge, repoDir, host, projectPath, opts.SpecIID, log)
 	if err != nil {
 		return err
 	}
+	var open, closed int
+	for _, n := range g.Snapshot() {
+		if n.Closed {
+			closed++
+		} else {
+			open++
+		}
+	}
+	log.Info("graph built", "nodes", len(g.Snapshot()), "open", open, "closed", closed)
 	if opts.JSONPath != "" {
 		if err := writeGraphJSON(g, opts.JSONPath); err != nil {
 			return err
@@ -111,6 +123,7 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	log.Info("integration worktree", "dir", intDir, "branch", branch, "base", baseName)
 	// 复用的集成分支可能落后 base，先同步上游再推送。
 	// base 同步冲突不阻塞本次运行：任务合并不受影响，冲突留给 MR。
 	if err := repo.SyncBase(ctx, intDir, baseName); err != nil {
@@ -129,13 +142,14 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	log.Info("connecting to herdr-core")
 	runner, err := worker.Dial(ctx, cfg.HcBinary, cfg.HcSocket)
 	if err != nil {
 		return err
 	}
 	defer runner.Close()
-	log := slog.New(slog.NewTextHandler(stderr, nil))
 	log.Info("integration ready", "branch", branch, "mr", mrURL)
+	log.Info("scheduler started", "parallelism", cfg.Parallelism, "agent", agentArgv)
 	sched := scheduler.New(cfg, repo, fc, forge, g, runner, tmpl, workDir, intDir, branch, baseName, agentArgv, log)
 	return sched.Run(ctx)
 }
@@ -240,21 +254,21 @@ func resolveTreeDir(ctx context.Context, flagDir, cfgDir, repoDir string) (strin
 
 // buildGraph 按 forge 建 client 并构建完整依赖图；返回的 client
 // 同时是调度器的 Forge 端口（Claim/Close/Note）。
-func buildGraph(ctx context.Context, kind, dir, host, projectPath string, specIID int) (forge.Forge, *graph.Graph, error) {
+func buildGraph(ctx context.Context, kind, dir, host, projectPath string, specIID int, log *slog.Logger) (forge.Forge, *graph.Graph, error) {
 	switch kind {
 	case config.ForgeGitLab:
 		client, err := gitlab.NewClient(ctx, gitlab.ExecRunner{}, dir, host, projectPath)
 		if err != nil {
 			return nil, nil, err
 		}
-		g, err := graph.Build(ctx, glabSource{c: client}, specIID)
+		g, err := graph.Build(ctx, glabSource{c: client, log: log}, specIID)
 		return client, g, err
 	case config.ForgeGitHub:
 		client, err := github.NewClient(ctx, github.ExecRunner{}, dir, host, projectPath)
 		if err != nil {
 			return nil, nil, err
 		}
-		g, err := graph.Build(ctx, ghSource{c: client}, specIID)
+		g, err := graph.Build(ctx, ghSource{c: client, log: log}, specIID)
 		return client, g, err
 	default:
 		return nil, nil, fmt.Errorf("unknown forge %q", kind)

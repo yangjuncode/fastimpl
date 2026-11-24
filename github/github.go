@@ -27,6 +27,7 @@ import (
 
 	"github.com/yangjuncode/fastimpl/config"
 	"github.com/yangjuncode/fastimpl/forge"
+	"github.com/yangjuncode/fastimpl/retry"
 	"net/url"
 	"os/exec"
 	"strconv"
@@ -43,7 +44,15 @@ type Runner interface {
 type ExecRunner struct{}
 
 // Run 在仓库目录中执行 gh，不经过 shell 拼接，标准错误并入错误信息。
+// 瞬时网络故障退避重试（见 retry.Do）。
 func (ExecRunner) Run(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error) {
+	return retry.Do(ctx, "gh "+strings.Join(argv, " "), func() ([]byte, error) {
+		return execGh(ctx, dir, argv, stdin)
+	})
+}
+
+// execGh 执行单次 gh 调用（retry.Do 的重试体）。
+func execGh(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "gh", argv...)
 	cmd.Dir = dir
 	// 子进程不继承 FASTIMPL_LLM_*，避免凭据经 gh 泄漏。

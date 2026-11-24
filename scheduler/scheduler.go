@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,9 @@ import (
 
 // Tick 是调度循环查看图变化的间隔。
 const Tick = 500 * time.Millisecond
+
+// heartbeatInterval 是在跑任务无事件时心跳日志的间隔。
+const heartbeatInterval = 2 * time.Minute
 
 // RefreshInterval 是周期重读 forge 上全部节点开关状态的间隔：
 // 外部关闭的依赖会立即释放后继，无需等任何任务完成。
@@ -133,6 +137,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	results := make(chan taskResult, s.cfg.Parallelism)
 	refresh := time.NewTicker(RefreshInterval)
 	defer refresh.Stop()
+	lastBeat := time.Now()
 	for {
 		ready := s.g.Ready()
 		for _, n := range ready {
@@ -144,6 +149,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			}
 			running[n.Key] = true
 			s.g.SetState(n.Key, graph.Running)
+			s.log.Info("task dispatched", "key", n.Key, "title", n.Title)
 			go s.runTask(ctx, n.Key, results)
 		}
 		if len(running) == 0 {
@@ -155,8 +161,20 @@ func (s *Scheduler) Run(ctx context.Context) error {
 				return s.stalledError()
 			}
 		}
+		// 心跳：任务在跑但长时间无事件时定期报一声在做什么——
+		// agent 一轮最长 TurnBudget，期间主循环完全静默。
+		if len(running) > 0 && time.Since(lastBeat) >= heartbeatInterval {
+			lastBeat = time.Now()
+			keys := make([]graph.Key, 0, len(running))
+			for k := range running {
+				keys = append(keys, k)
+			}
+			slices.SortFunc(keys, func(a, b graph.Key) int { return a.IID - b.IID })
+			s.log.Info("in progress", "running", len(running), "keys", keys)
+		}
 		select {
 		case res := <-results:
+			lastBeat = time.Now()
 			delete(running, res.key)
 			switch {
 			case res.integrated:
@@ -422,6 +440,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		fail(fmt.Errorf("claim issue: %w", err))
 		return
 	}
+	s.log.Info("issue claimed", "key", key)
 	// 看板状态标记尽力而为：GitHub 未开 preview、GitLab CE/低版本
 	// 都不支持，失败只记 warn 不阻塞任务。
 	if err := s.forge.MarkInProgress(ctx, key.ProjectID, iid); err != nil {
@@ -432,6 +451,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		fail(fmt.Errorf("create worktree: %w", err))
 		return
 	}
+	s.log.Info("worktree ready", "key", key, "dir", dir, "branch", branch)
 	// 终端名 <repo>-issue-<iid>：多项目并行时不会撞名，
 	// 且一眼能看出属于哪个仓库。
 	termName := s.repo.Name + "-" + branch
@@ -458,6 +478,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		report(err, "fastimpl: "+err.Error()+"\n排查终端: hc attach "+termName)
 	}
 
+	s.log.Info("awaiting worker boot", "key", key, "addr", addr)
 	if _, err := s.sessions.AwaitBoot(ctx, addr); err != nil {
 		fail(fmt.Errorf("await worker boot: %w", err))
 		return
@@ -485,6 +506,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		fail(fmt.Errorf("send prompt: %w", err))
 		return
 	}
+	s.log.Info("prompt sent; waiting for report", "key", key)
 
 	attempts := 0 // 首提示之外已用的续写次数
 	for {
