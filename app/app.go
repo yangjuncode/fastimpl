@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"time"
 
 	"github.com/yangjuncode/fastimpl/config"
 	"github.com/yangjuncode/fastimpl/files"
@@ -86,6 +87,7 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	}
 	forge := resolveForge(ctx, cfg.Forge, host, repoDir)
 	log.Info("building dependency graph", "forge", forge, "origin", host+"/"+projectPath, "spec", opts.SpecIID)
+	buildStart := time.Now()
 	fc, g, err := buildGraph(ctx, forge, repoDir, host, projectPath, opts.SpecIID, log)
 	if err != nil {
 		return err
@@ -98,7 +100,8 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 			open++
 		}
 	}
-	log.Info("graph built", "nodes", len(g.Snapshot()), "open", open, "closed", closed)
+	log.Info("graph built", "nodes", len(g.Snapshot()), "open", open, "closed", closed,
+		"elapsed", time.Since(buildStart).Round(time.Millisecond))
 	if opts.JSONPath != "" {
 		if err := writeGraphJSON(g, opts.JSONPath); err != nil {
 			return err
