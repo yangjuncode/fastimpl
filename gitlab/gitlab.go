@@ -301,7 +301,7 @@ func categoryDone(category string) bool {
 // WorkItemWidgetAssignees widget 里。故意不查 namespace
 // lifecycles——无 status 许可的命名空间查它会报错，而占用判定
 // 只需要 widget 本身。
-const gateQuery = `query($path: ID!, $iid: String!) { project(fullPath: $path) { workItems(iids: [$iid]) { nodes { state widgets { __typename ... on WorkItemWidgetStatus { status { name category } } ... on WorkItemWidgetAssignees { assignees { nodes { username } } } } } } } } }`
+const gateQuery = `query($path: ID!, $iid: String!) { project(fullPath: $path) { workItems(iids: [$iid]) { nodes { state widgets { __typename ... on WorkItemWidgetStatus { status { name category } } ... on WorkItemWidgetAssignees { assignees { nodes { username } } } } } } } }`
 
 // gateReply 是 gateQuery 的应答结构。
 type gateReply struct {
@@ -715,13 +715,17 @@ func statusGID(ns *struct {
 }
 
 // updateWorkItemStatus 经 workItemUpdate mutation 写入目标 status GID。
+// GID 直接内联进 mutation：statusWidget.status 的 scalar 类型名在
+// GitLab 版本间不稳定（旧版 WorkItemsStatusesStatusID，新版
+// WorkItemStatusID），变量声明会随之报 "isn't a defined input type"；
+// 内联字符串两种 scalar 都能解析。
 func (c *Client) updateWorkItemStatus(ctx context.Context, workItemGID, statusGID string) error {
+	itemJSON, _ := json.Marshal(workItemGID)
+	statusJSON, _ := json.Marshal(statusGID)
+	mutation := fmt.Sprintf(`mutation { workItemUpdate(input: {id: %s, statusWidget: {status: %s}}) { errors } }`,
+		itemJSON, statusJSON)
 	payload, err := json.Marshal(map[string]any{
-		"query": statusMutation,
-		"variables": map[string]any{
-			"id":     workItemGID,
-			"status": statusGID,
-		},
+		"query": mutation,
 	})
 	if err != nil {
 		return fmt.Errorf("encode status update: %w", err)
@@ -754,9 +758,6 @@ func (c *Client) updateWorkItemStatus(ctx context.Context, workItemGID, statusGI
 	}
 	return nil
 }
-
-// statusMutation 把 work item 的 status widget 置为目标 status GID。
-const statusMutation = `mutation($id: WorkItemID!, $status: WorkItemStatusID!) { workItemUpdate(input: {id: $id, statusWidget: {status: $status}}) { errors } }`
 
 // Close 关闭一个 issue。
 func (c *Client) Close(ctx context.Context, projectID, iid int) error {

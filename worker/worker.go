@@ -240,7 +240,13 @@ func (r *Runner) Prompt(ctx context.Context, addr, text string) (baseline uint64
 	if !before.Settled() {
 		return 0, fmt.Errorf("worker terminal %s is %s, not ready for a prompt", addr, before.Status)
 	}
-	turn, started, err := r.Send(ctx, addr, text, before.Status)
+	// hc 的 if 守卫枚举只有 idle/working；devin 等 agent 空闲时报
+	// done，无法作为守卫值，此时靠上面的 Settled 快照判定、不设守卫。
+	guard := before.Status
+	if guard != "idle" && guard != "working" {
+		guard = ""
+	}
+	turn, started, err := r.Send(ctx, addr, text, guard)
 	if err != nil {
 		return 0, fmt.Errorf("send prompt to %s: %w", addr, err)
 	}

@@ -38,21 +38,32 @@ func ParseReport(screen, token string) (Report, error) {
 	if start < 0 {
 		return Report{}, fmt.Errorf("%w: no %s line for this run", ErrNoFrame, ReadyMarker)
 	}
-	lines := strings.Split(trimmed[start:], "\n")
-	if strings.TrimSpace(lines[0]) != marker {
-		return Report{}, fmt.Errorf("%w: malformed %s line %q", ErrNoFrame, ReadyMarker, strings.TrimSpace(lines[0]))
+	rest := trimmed[start+len(marker):]
+	// 令牌后必须紧跟空白或结束，防止匹配到同前缀的更长了令牌。
+	if rest != "" && rest[0] != ' ' && rest[0] != '\t' && rest[0] != '\n' {
+		return Report{}, fmt.Errorf("%w: malformed %s line %q", ErrNoFrame, ReadyMarker, strings.TrimSpace(trimmed[start:]))
 	}
+	// 报告正文可能跟在令牌同一行（agent 未严格换行），取该剩余
+	// 行加后续行，共至多六行；终端硬换行产生的续行同样收集。
+	parts := strings.Split(rest, "\n")
 	rep := Report{Token: token}
-	end := 1
-	for i := 1; i < len(lines) && i <= 6; i++ {
-		line := strings.TrimSpace(lines[i])
+	end := 0
+	for i := 0; i < len(parts) && len(rep.Lines) < 6; i++ {
+		line := strings.TrimSpace(parts[i])
 		if line == "" {
-			break
+			if len(rep.Lines) > 0 {
+				break
+			}
+			continue
 		}
 		rep.Lines = append(rep.Lines, line)
 		end = i + 1
 	}
-	rep.Text = strings.Join(lines[:end], "\n")
+	if end == 0 {
+		rep.Text = marker
+	} else {
+		rep.Text = marker + strings.Join(parts[:end], "\n")
+	}
 	return rep, nil
 }
 
