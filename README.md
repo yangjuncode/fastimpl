@@ -259,6 +259,8 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
 - `{issue-no}` — 子任务 issue IID
 - `{spec-no}` — spec issue IID
 - `{token}` — 本任务的随机报告令牌
+- `{worktree}` — fastimpl 为本任务创建的 git worktree 绝对路径
+  （agent 进程的启动目录 cwd 就是它）
 
 模板与 fastimpl 的**唯一契约是报告协议**：任务全部完成（含仓库要求的
 验证）后在回复末尾单独一行输出 `FASTIMPL-READY <token>`，随后最多六行

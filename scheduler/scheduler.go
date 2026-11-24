@@ -245,9 +245,9 @@ func (s *Scheduler) intTermName() string {
 // baseConflictPrompt 发给集成 worktree 专属 agent 的提示词：
 // 让它自己执行 git merge origin/<base> 解决上游冲突并提交；
 // 明确禁止丢弃集成分支上已有的任务成果。
-func baseConflictPrompt(base string, files []string, token string) string {
-	return fmt.Sprintf("你在集成分支的 worktree 中工作。请执行 git merge origin/%s 把上游合入集成分支，逐个解决冲突（当前冲突文件：%s）并提交合并。集成分支上已有其他任务的成果，禁止 reset、rebase 或 checkout 丢弃任何已有提交。冲突解决并完成合并提交后，在回复末尾单独一行输出 %s %s；未完成前不要输出该标记。",
-		base, strings.Join(files, ", "), worker.ReadyMarker, token)
+func (s *Scheduler) baseConflictPrompt(base string, files []string, token string) string {
+	return fmt.Sprintf("你的工作目录 %s 是 fastimpl 创建的集成分支 worktree（agent 启动目录即此目录）。请执行 git merge origin/%s 把上游合入集成分支，逐个解决冲突（当前冲突文件：%s）并提交合并。集成分支上已有其他任务的成果，禁止 reset、rebase 或 checkout 丢弃任何已有提交。冲突解决并完成合并提交后，在回复末尾单独一行输出 %s %s；未完成前不要输出该标记。",
+		s.intDir, base, strings.Join(files, ", "), worker.ReadyMarker, token)
 }
 
 // conflictPrompt 是让 agent 自己解决集成冲突的续写提示词：
@@ -322,7 +322,7 @@ func (s *Scheduler) resolveBaseConflict(ctx context.Context, files []string) err
 		s.log.Info("integration worker running", "terminal", termName, "addr", addr)
 	}
 	token := worker.NewToken()
-	baseline, err := s.sessions.Prompt(ctx, s.intAddr, baseConflictPrompt(s.baseName, files, token))
+	baseline, err := s.sessions.Prompt(ctx, s.intAddr, s.baseConflictPrompt(s.baseName, files, token))
 	if err != nil {
 		return fmt.Errorf("send base-conflict prompt: %w", err)
 	}
@@ -444,9 +444,10 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	}
 	token := worker.NewToken()
 	text, err := prompt.Render(s.template, prompt.Vars{
-		IssueNo: iid,
-		Token:   token,
-		SpecNo:  s.specIID,
+		IssueNo:  iid,
+		Token:    token,
+		SpecNo:   s.specIID,
+		Worktree: dir,
 	})
 	if err != nil {
 		fail(fmt.Errorf("render prompt: %w", err))
