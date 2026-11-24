@@ -271,6 +271,8 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
   冲突时 agent 需知道跟谁比较
 - `{{.Branch}}` — 本任务的工作分支名：agent 的提交落在它上面，
   最终由 fastimpl 合入集成分支
+- `{{.Forge}}` — 上游 forge 类型（`gitlab`/`github`）
+- `{{.ForgeCLI}}` — 对应的 issue 命令行工具（`glab`/`gh`）
 
 模板与 fastimpl 的**唯一契约是报告协议**：任务全部完成（含仓库要求的
 验证）后在回复末尾单独一行输出 `FASTIMPL-READY <token>`，随后最多六行

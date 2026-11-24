@@ -136,7 +136,7 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	defer runner.Close()
 	log := slog.New(slog.NewTextHandler(stderr, nil))
 	log.Info("integration ready", "branch", branch, "mr", mrURL)
-	sched := scheduler.New(cfg, repo, fc, g, runner, tmpl, workDir, intDir, branch, baseName, agentArgv, log)
+	sched := scheduler.New(cfg, repo, fc, forge, g, runner, tmpl, workDir, intDir, branch, baseName, agentArgv, log)
 	return sched.Run(ctx)
 }
 

@@ -59,10 +59,11 @@ type Scheduler struct {
 	cfg       config.Config
 	repo      *worktree.Repo
 	forge     forge.Forge
+	forgeName string // forge 类型（gitlab|github），注入提示词的 {{.Forge}}
 	g         *graph.Graph
 	sessions  Sessions
 	template  string
-	workDir   string // fastimpl 运行目录，注入提示词的 {work-dir}/{{.WorkDir}}
+	workDir   string // fastimpl 运行目录，注入提示词的 {{.WorkDir}}
 	intDir    string
 	log       *slog.Logger
 	specIID   int
@@ -80,7 +81,7 @@ type Scheduler struct {
 // New 组装调度器；所有依赖由 app 层注入，便于测试替换。
 // intDir/intBranch/baseName 均来自 EnsureIntegration 的实际返回，
 // 复用带描述后缀或配置覆盖的分支名时也能正确合并与推送。
-func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, g *graph.Graph, sessions Sessions, template, workDir, intDir, intBranch, baseName string, agentArgv []string, log *slog.Logger) *Scheduler {
+func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, forgeName string, g *graph.Graph, sessions Sessions, template, workDir, intDir, intBranch, baseName string, agentArgv []string, log *slog.Logger) *Scheduler {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -88,6 +89,7 @@ func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, g *graph.Graph, 
 		cfg:       cfg,
 		repo:      repo,
 		forge:     f,
+		forgeName: forgeName,
 		g:         g,
 		sessions:  sessions,
 		template:  template,
@@ -100,6 +102,18 @@ func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, g *graph.Graph, 
 		agentArgv: agentArgv,
 		warned:    make(map[graph.Key]bool),
 	}
+}
+
+// forgeCLI 返回 forge 类型对应的 issue 命令行工具名；
+// 未识别的类型返回空（提示词相应段自行退化）。
+func forgeCLI(name string) string {
+	switch name {
+	case config.ForgeGitLab:
+		return "glab"
+	case config.ForgeGitHub:
+		return "gh"
+	}
+	return ""
 }
 
 // taskResult 是一个任务 goroutine 的结局。
@@ -458,6 +472,8 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		RepoDir:   s.repo.Root,
 		IntBranch: s.branch,
 		Branch:    branch,
+		Forge:     s.forgeName,
+		ForgeCLI:  forgeCLI(s.forgeName),
 	})
 	if err != nil {
 		fail(fmt.Errorf("render prompt: %w", err))
