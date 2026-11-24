@@ -269,10 +269,8 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
   agent 的代码产出目录（修改与提交只在这里进行）
 - `{{.IntBranch}}` — 集成分支名：fastimpl 把各任务分支合并于此，
   冲突时 agent 需知道跟谁比较
-
-早期 `{issue-no}`、`{token}`、`{spec-no}`、`{worktree}`、`{work-dir}`、
-`{repo-dir}`、`{int-branch}` 写法仍被识别（渲染前统一改写为
-`{{.Field}}`），已定制的旧模板无需改动。
+- `{{.Branch}}` — 本任务的工作分支名：agent 的提交落在它上面，
+  最终由 fastimpl 合入集成分支
 
 模板与 fastimpl 的**唯一契约是报告协议**：任务全部完成（含仓库要求的
 验证）后在回复末尾单独一行输出 `FASTIMPL-READY <token>`，随后最多六行

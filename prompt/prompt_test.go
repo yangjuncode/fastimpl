@@ -5,14 +5,15 @@ import (
 	"testing"
 )
 
-// TestRenderLegacyPlaceholders 旧式 {x} 占位符继续生效。
-func TestRenderLegacyPlaceholders(t *testing.T) {
-	out, err := Render("{issue-no}|{token}|{spec-no}|{worktree}|{work-dir}|{repo-dir}",
-		Vars{IssueNo: 7, Token: "t9", SpecNo: 3, Worktree: "/wt", WorkDir: "/wd", RepoDir: "/r"})
+// TestRenderVars 全部字段经 {{.Field}} 渲染。
+func TestRenderVars(t *testing.T) {
+	out, err := Render("{{.IssueNo}}|{{.Token}}|{{.SpecNo}}|{{.Worktree}}|{{.WorkDir}}|{{.RepoDir}}|{{.IntBranch}}|{{.Branch}}",
+		Vars{IssueNo: 7, Token: "t9", SpecNo: 3, Worktree: "/wt", WorkDir: "/wd", RepoDir: "/r",
+			IntBranch: "issue-3-integration", Branch: "issue-7"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out != "7|t9|3|/wt|/wd|/r" {
+	if out != "7|t9|3|/wt|/wd|/r|issue-3-integration|issue-7" {
 		t.Fatalf("out %q", out)
 	}
 }

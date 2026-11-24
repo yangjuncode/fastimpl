@@ -457,6 +457,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		WorkDir:   s.workDir,
 		RepoDir:   s.repo.Root,
 		IntBranch: s.branch,
+		Branch:    branch,
 	})
 	if err != nil {
 		fail(fmt.Errorf("render prompt: %w", err))

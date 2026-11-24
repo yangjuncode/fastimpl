@@ -100,7 +100,7 @@ type fakeSessions struct {
 	mu      sync.Mutex
 	started []worker.Params
 	nextID  int
-	// 测试用模板 "{issue-no}|{token}|{spec-no}"，从渲染结果取令牌。
+	// 测试用模板 "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}"，从渲染结果取令牌。
 	tokens map[string]string
 }
 
@@ -207,7 +207,7 @@ func TestSchedulerRun(t *testing.T) {
 	// worker 在各自 worktree 里制造一次提交（Merge 需要真实差异）。
 	hookSessions := &commitSessions{fakeSessions: sessions, t: t}
 	cfg := config.Config{Parallelism: 4, SpecIID: 8}
-	s := New(cfg, repo, forge, g, hookSessions, "{issue-no}|{token}|{spec-no}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, forge, g, hookSessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +457,7 @@ func TestSchedulerBaseSyncConflict(t *testing.T) {
 
 	sessions := &baseSyncSessions{fakeSessions: &fakeSessions{}}
 	cfg := config.Config{Parallelism: 1, SpecIID: 8, Retries: 2}
-	s := New(cfg, repo, &fakeForge{}, g, sessions, "{issue-no}|{token}|{spec-no}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, &fakeForge{}, g, sessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +505,7 @@ func TestSchedulerConflictResolvedByAgent(t *testing.T) {
 
 	sessions := &conflictSessions{fakeSessions: &fakeSessions{}, intBranch: intBranch}
 	cfg := config.Config{Parallelism: 2, SpecIID: 8, Retries: 4}
-	s := New(cfg, repo, &fakeForge{}, g, sessions, "{issue-no}|{token}|{spec-no}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, &fakeForge{}, g, sessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	if err := s.Run(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +541,7 @@ func TestSchedulerInFlightSkipped(t *testing.T) {
 	forge := &fakeForge{inFlight: map[int]bool{9: true}}
 	sessions := &fakeSessions{}
 	cfg := config.Config{Parallelism: 1, SpecIID: 8}
-	s := New(cfg, repo, forge, g, sessions, "{issue-no}|{token}|{spec-no}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	s := New(cfg, repo, forge, g, sessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
 	err = s.Run(ctx)
 	if err == nil || !strings.Contains(err.Error(), "needs attention") {
 		t.Fatalf("Run err = %v, want stalled needs-attention error", err)
