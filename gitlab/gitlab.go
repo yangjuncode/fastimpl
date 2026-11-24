@@ -253,12 +253,19 @@ func (c *Client) IssueState(ctx context.Context, projectID, iid int) (forge.Issu
 	item := reply.Data.Project.WorkItems.Nodes[0]
 	info.Open = strings.EqualFold(item.State, "open") || strings.EqualFold(item.State, "opened")
 	info.DoneOnBoard = true // 无 status widget 时无可判、无可修
+	// 先收集指派人：widget 顺序不保证 assignees 在 status 之前，
+	// 而 InFlight 判定需要它。
 	assignedToMe := false
-	for _, a := range item.Assignees.Nodes {
-		if a.Username == c.username {
-			assignedToMe = true
-		} else {
-			info.AssignedToOther = true
+	for _, w := range item.Widgets {
+		if w.Typename != "WorkItemWidgetAssignees" {
+			continue
+		}
+		for _, a := range w.Assignees.Nodes {
+			if a.Username == c.username {
+				assignedToMe = true
+			} else {
+				info.AssignedToOther = true
+			}
 		}
 	}
 	for _, w := range item.Widgets {
@@ -290,9 +297,11 @@ func categoryDone(category string) bool {
 }
 
 // gateQuery 是 IssueState 的一次性查询：开关、指派人、status widget。
-// 故意不查 namespace lifecycles——无 status 许可的命名空间查它会
-// 报错，而占用判定只需要 widget 本身。
-const gateQuery = `query($path: ID!, $iid: String!) { project(fullPath: $path) { workItems(iids: [$iid]) { nodes { state assignees { nodes { username } } widgets { __typename ... on WorkItemWidgetStatus { status { name category } } } } } } }`
+// WorkItem 没有顶层 assignees 字段，指派人挂在
+// WorkItemWidgetAssignees widget 里。故意不查 namespace
+// lifecycles——无 status 许可的命名空间查它会报错，而占用判定
+// 只需要 widget 本身。
+const gateQuery = `query($path: ID!, $iid: String!) { project(fullPath: $path) { workItems(iids: [$iid]) { nodes { state widgets { __typename ... on WorkItemWidgetStatus { status { name category } } ... on WorkItemWidgetAssignees { assignees { nodes { username } } } } } } } } }`
 
 // gateReply 是 gateQuery 的应答结构。
 type gateReply struct {
@@ -303,18 +312,18 @@ type gateReply struct {
 		Project *struct {
 			WorkItems struct {
 				Nodes []struct {
-					State     string `json:"state"`
-					Assignees struct {
-						Nodes []struct {
-							Username string `json:"username"`
-						} `json:"nodes"`
-					} `json:"assignees"`
+					State   string `json:"state"`
 					Widgets []struct {
 						Typename string `json:"__typename"`
 						Status   *struct {
 							Name     string `json:"name"`
 							Category string `json:"category"`
 						} `json:"status"`
+						Assignees struct {
+							Nodes []struct {
+								Username string `json:"username"`
+							} `json:"nodes"`
+						} `json:"assignees"`
 					} `json:"widgets"`
 				} `json:"nodes"`
 			} `json:"workItems"`
