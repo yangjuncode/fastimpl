@@ -91,6 +91,10 @@ type Node struct {
 	// Closed 表示 issue 在 forge 上已关闭（视为已完成，不再调度，
 	// 但保留在图中供画依赖图）。
 	Closed bool
+	// InFlight 表示 issue 在 forge 的看板 status 为进行中——他人或
+	// 别的 agent 正在处理（周期性刷新的结果）；不就绪，看板退回
+	// 空闲后自动恢复调度。
+	InFlight bool
 	// Deps 是本项 blocked-by 的目标：全部 Closed 或 Integrated 后本项就绪。
 	Deps []Key
 }
@@ -169,6 +173,15 @@ func (g *Graph) SetClosed(k Key, closed bool) {
 	}
 }
 
+// SetInFlight 标记节点在 forge 上的占用状态（周期性刷新的结果）。
+func (g *Graph) SetInFlight(k Key, inFlight bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if n, ok := g.nodes[k]; ok {
+		n.InFlight = inFlight
+	}
+}
+
 // schedulableLocked 报告节点是否是本运行管理的工作项：只有与 spec
 // 同项目的节点才由 agent 执行；跨项目节点（GitLab 跨项目 blocker、
 // GitHub 跨仓库 sub-issue）只作为依赖 gate 留在图中。
@@ -176,11 +189,11 @@ func (g *Graph) schedulableLocked(n *Node) bool {
 	return n.Key.ProjectID == g.spec.ProjectID
 }
 
-// readyLocked 报告节点当前是否可调度：issue 未关闭、状态为 Pending、
-// 与 spec 同项目、全部前置节点已关闭或已集成。
+// readyLocked 报告节点当前是否可调度：issue 未关闭、未被他人占用、
+// 状态为 Pending、与 spec 同项目、全部前置节点已关闭或已集成。
 // 前置是开放的跨项目节点时本项一直不就绪（外部 blocker 只能等外部关闭）。
 func (g *Graph) readyLocked(n *Node) bool {
-	if n.Closed || n.State != Pending || !g.schedulableLocked(n) {
+	if n.Closed || n.State != Pending || n.InFlight || !g.schedulableLocked(n) {
 		return false
 	}
 	for _, dep := range n.Deps {

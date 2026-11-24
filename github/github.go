@@ -1,6 +1,7 @@
 // Package github 通过 gh CLI 读写 GitHub：sub_issues 取子任务、
 // dependencies/blocked_by 取阻塞关联、启动 worker 前领取
-// （--add-assignee @me）、完成后关闭 issue。
+// （--add-assignee @me）并把原生 status 置为 In progress，
+// 完成时置 Done 后关闭 issue。
 //
 // 与 GitLab 的差异（API 调研结论）：
 //   - 子任务是原生 sub-issues（可跨同 owner 仓库，≤100/parent，8 层深）；
@@ -11,6 +12,9 @@
 //   - issue 有三种 ID：number（路径/UI）、REST database id（写操作
 //     body 用）、GraphQL node_id；graph.Key{ProjectID,IID} 对应
 //     {repo 数据库 id, issue number}；
+//   - issue status 是 2026-11-23 起的公开预览功能：PATCH issue 写
+//     status 字段，未加入 preview 的账号/GHES 会被静默忽略，
+//     因此写入后回读响应验证；
 //   - 所有调用显式带 --hostname 与 -R/--repo，不依赖 gh 推断。
 package github
 
@@ -22,6 +26,7 @@ import (
 	"fmt"
 
 	"github.com/yangjuncode/fastimpl/config"
+	"github.com/yangjuncode/fastimpl/forge"
 	"net/url"
 	"os/exec"
 	"strconv"
@@ -68,7 +73,12 @@ type Issue struct {
 	Title  string `json:"title"`
 	Body   string `json:"body"`
 	State  string `json:"state"` // open/closed
-	Type   *struct {
+	// Status 是原生看板状态（2026-11 公开预览）；preview 未启用时为 null。
+	Status *struct {
+		Name     string `json:"name"`
+		Category string `json:"category"`
+	} `json:"status"`
+	Type *struct {
 		Name string `json:"name"`
 	} `json:"type"`
 	RepositoryURL string `json:"repository_url"` // 跨仓库关联时解析 repo id
@@ -88,6 +98,35 @@ func (i Issue) AssignedToOther(login string) bool {
 		}
 	}
 	return false
+}
+
+// inFlightStatuses 是原生 status 中"已被占用"的枚举名：
+// In progress 正在处理、In review 已送审——接手会与现有人冲突。
+// GitHub status 是固定系统枚举，按名判定即可。
+var inFlightStatuses = map[string]bool{"in progress": true, "in review": true}
+
+// doneStatuses 是原生 status 的终态枚举名：已关闭 issue 停在这些
+// 状态即为看板一致；停在 todo 列（Backlog/Todo/进行中）则不一致。
+var doneStatuses = map[string]bool{"done": true, "not planned": true, "duplicate": true}
+
+// DoneOnBoard 报告看板 status 是否已在终态；preview 未启用
+// （status 为 null）时视为无可判，返回 true。
+func (i Issue) DoneOnBoard() bool {
+	return i.Status == nil || doneStatuses[strings.ToLower(i.Status.Name)]
+}
+
+// InFlight 报告 issue 是否被他人/其他 agent 占用：看板 status 是
+// 进行中枚举且未指派给当前用户；指派给本人的视为可续做，不算占用。
+func (i Issue) InFlight(login string) bool {
+	if i.Status == nil || !inFlightStatuses[strings.ToLower(i.Status.Name)] {
+		return false
+	}
+	for _, a := range i.Assignees {
+		if a.Login == login {
+			return false
+		}
+	}
+	return true
 }
 
 // TypeName 返回 issue type 名（GitHub issue types，可缺省）。
@@ -365,13 +404,21 @@ func (c *Client) bindAll(ctx context.Context, issues []Issue) ([]RepoIssue, erro
 	return out, nil
 }
 
-// IssueState 返回 issue 的开关与领取状态（claim 前重读与周期刷新共用）。
-func (c *Client) IssueState(ctx context.Context, repoID, num int) (open, assignedToOther bool, err error) {
+// IssueState 返回 issue 的开关、领取、占用与看板终态（claim 前重读与
+// 周期刷新共用）。InFlight 表示看板 status 是进行中枚举且未指派给
+// 当前用户——他人或别的 agent 正在处理，不应抢占；preview 未启用
+// 时 status 为 null，InFlight 恒为 false、DoneOnBoard 恒为 true。
+func (c *Client) IssueState(ctx context.Context, repoID, num int) (forge.IssueInfo, error) {
 	iss, err := c.Issue(ctx, repoID, num)
 	if err != nil {
-		return false, false, err
+		return forge.IssueInfo{}, err
 	}
-	return iss.IsOpen(), iss.AssignedToOther(c.login), nil
+	return forge.IssueInfo{
+		Open:            iss.IsOpen(),
+		AssignedToOther: iss.AssignedToOther(c.login),
+		InFlight:        iss.IsOpen() && iss.InFlight(c.login),
+		DoneOnBoard:     iss.DoneOnBoard(),
+	}, nil
 }
 
 // Claim 把 issue 指派给当前用户。
@@ -383,6 +430,55 @@ func (c *Client) Claim(ctx context.Context, repoID, num int) error {
 	}
 	_, err = c.runner.Run(ctx, c.dir, []string{"issue", "edit", strconv.Itoa(num), "--add-assignee", "@me", "-R", path, "--hostname", c.host}, nil)
 	return err
+}
+
+// 默认看板状态名：GitHub 原生枚举值；GitLab 系统生命周期同名。
+const (
+	statusInProgress = "In progress"
+	statusDone       = "Done"
+)
+
+// MarkInProgress 把 issue 的原生 status 置为 In progress（2026-11
+// 公开预览功能）。preview 未启用时 status 参数被静默忽略——回读
+// 响应验证生效，未生效报错由调用方降级为 warn。
+func (c *Client) MarkInProgress(ctx context.Context, repoID, num int) error {
+	return c.setStatus(ctx, repoID, num, statusInProgress)
+}
+
+// MarkDone 把 issue 的原生 status 置为 Done；status=Done 会自动
+// 关闭 issue，调用方仍会照常执行 Close 兜底。
+func (c *Client) MarkDone(ctx context.Context, repoID, num int) error {
+	return c.setStatus(ctx, repoID, num, statusDone)
+}
+
+// setStatus 经 REST PATCH 设置 issue 的原生 status 并回读响应
+// 验证确实生效。
+func (c *Client) setStatus(ctx context.Context, repoID, num int, name string) error {
+	path, err := c.repoPath(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	raw, err := c.api(ctx, "-X", "PATCH",
+		fmt.Sprintf("repos/%s/issues/%d", path, num),
+		"-f", "status="+name)
+	if err != nil {
+		return err
+	}
+	var issue struct {
+		Status *struct {
+			Name string `json:"name"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(raw, &issue); err != nil {
+		return fmt.Errorf("decode issue %s#%d after status update: %w", path, num, err)
+	}
+	if issue.Status == nil {
+		return errors.New("issue status unsupported (preview not enabled?)")
+	}
+	if !strings.EqualFold(issue.Status.Name, name) {
+		return fmt.Errorf("status of %s#%d is %q, want %q", path, num, issue.Status.Name, name)
+	}
+	return nil
 }
 
 // Close 关闭一个 issue。

@@ -1,5 +1,6 @@
 // Package gitlab 通过 glab CLI 读写 GitLab：取 spec issue 的子任务、
-// 阻塞关联，启动 worker 前领取（assignee=@me），完成后关闭 issue。
+// 阻塞关联，启动 worker 前领取（assignee=@me）并把 work item status
+// 置为 In progress，完成时置 Done 后关闭 issue。
 // 所有调用显式携带 --hostname/--repo，不依赖 glab 从 remote 推断。
 package gitlab
 
@@ -15,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/yangjuncode/fastimpl/config"
+	"github.com/yangjuncode/fastimpl/forge"
 )
 
 // Runner 执行 glab 命令；测试用假实现替换它。
@@ -200,13 +202,110 @@ func escape(path string) string {
 	return url.PathEscape(path)
 }
 
-// IssueState 返回 issue 的开关与领取状态（claim 前重读与周期刷新共用）。
-func (c *Client) IssueState(ctx context.Context, projectID, iid int) (open, assignedToOther bool, err error) {
-	iss, err := c.Issue(ctx, projectID, iid)
+// IssueState 返回 issue 的开关、领取、占用与看板终态（claim 前重读与
+// 周期刷新共用）。InFlight 表示看板 status 在 in_progress 类目
+// 且未指派给当前用户——他人或别的 agent 正在处理，不应抢占；
+// 指派给本人的 in progress 视为可续做，不算占用。
+// 一次 GraphQL 查询同取 state/assignees/status widget；
+// 不支持 status 的实例没有 STATUS widget，InFlight/DoneOnBoard
+// 都按"无可判"处理。
+func (c *Client) IssueState(ctx context.Context, projectID, iid int) (forge.IssueInfo, error) {
+	var info forge.IssueInfo
+	path, err := c.projectFullPath(ctx, projectID)
 	if err != nil {
-		return false, false, err
+		return info, err
 	}
-	return iss.IsOpen(), iss.AssignedToOther(c.username), nil
+	payload, err := json.Marshal(map[string]any{
+		"query":     gateQuery,
+		"variables": map[string]any{"path": path, "iid": strconv.Itoa(iid)},
+	})
+	if err != nil {
+		return info, fmt.Errorf("encode gate query: %w", err)
+	}
+	raw, err := c.apiStdin(ctx, payload, "graphql")
+	if err != nil {
+		return info, fmt.Errorf("read state of %d!%d: %w", projectID, iid, err)
+	}
+	var reply gateReply
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return info, fmt.Errorf("decode state of %d!%d: %w", projectID, iid, err)
+	}
+	if len(reply.Errors) > 0 {
+		return info, fmt.Errorf("read state of %d!%d: %s", projectID, iid, reply.Errors[0].Message)
+	}
+	if reply.Data.Project == nil || len(reply.Data.Project.WorkItems.Nodes) == 0 {
+		return info, fmt.Errorf("work item %d!%d not found", projectID, iid)
+	}
+	item := reply.Data.Project.WorkItems.Nodes[0]
+	info.Open = strings.EqualFold(item.State, "open") || strings.EqualFold(item.State, "opened")
+	info.DoneOnBoard = true // 无 status widget 时无可判、无可修
+	assignedToMe := false
+	for _, a := range item.Assignees.Nodes {
+		if a.Username == c.username {
+			assignedToMe = true
+		} else {
+			info.AssignedToOther = true
+		}
+	}
+	for _, w := range item.Widgets {
+		if w.Typename != "WorkItemWidgetStatus" {
+			continue
+		}
+		info.DoneOnBoard = w.Status != nil && categoryDone(w.Status.Category)
+		if w.Status != nil && statusInFlight(w.Status.Category) && !assignedToMe {
+			info.InFlight = true
+		}
+	}
+	// 已关闭的 issue 可能残留 In progress 状态（close 不改 status），
+	// 只在仍开放时才视为占用。
+	info.InFlight = info.InFlight && info.Open
+	return info, nil
+}
+
+// statusInFlight 报告 status category 是否表示"进行中"
+// （IN_PROGRESS/in_progress/inProgress 归一判定）。
+func statusInFlight(category string) bool {
+	return strings.EqualFold(strings.ReplaceAll(category, "_", ""), "inprogress")
+}
+
+// categoryDone 报告 status category 是否表示终态
+// （DONE/CANCELED——已关闭 issue 留在此类目即为一致）。
+func categoryDone(category string) bool {
+	c := strings.ToLower(strings.ReplaceAll(category, "_", ""))
+	return c == "done" || c == "canceled" || c == "cancelled"
+}
+
+// gateQuery 是 IssueState 的一次性查询：开关、指派人、status widget。
+// 故意不查 namespace lifecycles——无 status 许可的命名空间查它会
+// 报错，而占用判定只需要 widget 本身。
+const gateQuery = `query($path: ID!, $iid: String!) { project(fullPath: $path) { workItems(iids: [$iid]) { nodes { state assignees { nodes { username } } widgets { __typename ... on WorkItemWidgetStatus { status { name category } } } } } } }`
+
+// gateReply 是 gateQuery 的应答结构。
+type gateReply struct {
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+	Data struct {
+		Project *struct {
+			WorkItems struct {
+				Nodes []struct {
+					State     string `json:"state"`
+					Assignees struct {
+						Nodes []struct {
+							Username string `json:"username"`
+						} `json:"nodes"`
+					} `json:"assignees"`
+					Widgets []struct {
+						Typename string `json:"__typename"`
+						Status   *struct {
+							Name     string `json:"name"`
+							Category string `json:"category"`
+						} `json:"status"`
+					} `json:"widgets"`
+				} `json:"nodes"`
+			} `json:"workItems"`
+		} `json:"project"`
+	} `json:"data"`
 }
 
 // Issue 读取指定项目中的一个 issue，并校验返回的项目与编号。
@@ -417,6 +516,224 @@ func (c *Client) issueCmd(ctx context.Context, projectID, iid int, argv ...strin
 func (c *Client) Claim(ctx context.Context, projectID, iid int) error {
 	return c.issueCmd(ctx, projectID, iid, "update", strconv.Itoa(iid), "--assignee", "@me")
 }
+
+// 默认看板状态名：GitLab 系统生命周期与 GitHub 原生枚举同名；
+// 群组自定义 lifecycle 改了名字时需要相应调整。
+const (
+	statusInProgress = "In progress"
+	statusDone       = "Done"
+)
+
+// MarkInProgress 把 issue 的 work item status 置为 In progress。
+// 实例不支持 status（CE/低版本无 widget）或状态名不在 lifecycle 中
+// 时报错，由调用方降级为 warn——状态是辅助标记，不阻塞任务。
+func (c *Client) MarkInProgress(ctx context.Context, projectID, iid int) error {
+	return c.setStatus(ctx, projectID, iid, statusInProgress)
+}
+
+// MarkDone 把 issue 的 work item status 置为 Done；Done 类目会自动
+// 关闭 issue，调用方仍会照常执行 Close 兜底。
+func (c *Client) MarkDone(ctx context.Context, projectID, iid int) error {
+	return c.setStatus(ctx, projectID, iid, statusDone)
+}
+
+// setStatus 把 issue/task 的 work item status 置为 name：
+// 一次 GraphQL 查询取回 work item GID、类型、当前 status 与根命名
+// 空间全部 lifecycle 状态表，解析出目标 status 的 GID 后经
+// workItemUpdate 写入；已是目标状态时跳过写。
+func (c *Client) setStatus(ctx context.Context, projectID, iid int, name string) error {
+	path, err := c.projectFullPath(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	payload, err := statusQueryPayload(path, iid)
+	if err != nil {
+		return err
+	}
+	raw, err := c.apiStdin(ctx, payload, "graphql")
+	if err != nil {
+		return fmt.Errorf("read status of %d!%d: %w", projectID, iid, err)
+	}
+	var reply statusReply
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return fmt.Errorf("decode status of %d!%d: %w", projectID, iid, err)
+	}
+	if len(reply.Errors) > 0 {
+		return fmt.Errorf("read status of %d!%d: %s", projectID, iid, reply.Errors[0].Message)
+	}
+	if reply.Data.Project == nil || len(reply.Data.Project.WorkItems.Nodes) == 0 {
+		return fmt.Errorf("work item %d!%d not found", projectID, iid)
+	}
+	item := reply.Data.Project.WorkItems.Nodes[0]
+	var current string
+	supported := false
+	for _, w := range item.Widgets {
+		if w.Typename == "WorkItemWidgetStatus" {
+			supported = true
+			if w.Status != nil {
+				current = w.Status.Name
+			}
+		}
+	}
+	if !supported {
+		return fmt.Errorf("%d!%d: work item status unsupported on this instance", projectID, iid)
+	}
+	if strings.EqualFold(current, name) {
+		return nil
+	}
+	gid, err := statusGID(reply.Data.Namespace, item.WorkItemType.Name, name)
+	if err != nil {
+		return fmt.Errorf("resolve status %q for %d!%d: %w", name, projectID, iid, err)
+	}
+	return c.updateWorkItemStatus(ctx, item.ID, gid)
+}
+
+// projectFullPath 返回项目的完整路径：origin 直接用 projectPath，
+// 跨项目经 repoRefFor 解析（返回的 "host/path" 去掉主机名）。
+func (c *Client) projectFullPath(ctx context.Context, projectID int) (string, error) {
+	if projectID == c.projectID {
+		return c.projectPath, nil
+	}
+	ref, err := c.repoRefFor(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimPrefix(ref, c.host+"/"), nil
+}
+
+// statusQueryPayload 编码 work item status 查询：同一请求取回目标
+// work item 的身份/类型/当前 status 与根命名空间的 lifecycle 状态表。
+// lifecycle 挂在 root namespace 上，取项目路径第一段。
+func statusQueryPayload(path string, iid int) ([]byte, error) {
+	ns, _, _ := strings.Cut(path, "/")
+	return json.Marshal(map[string]any{
+		"query": statusQuery,
+		"variables": map[string]any{
+			"path": path,
+			"ns":   ns,
+			"iid":  strconv.Itoa(iid),
+		},
+	})
+}
+
+// statusQuery 同时查询 work item 与根命名空间 lifecycle。
+const statusQuery = `query($path: ID!, $ns: ID!, $iid: String!) { project(fullPath: $path) { workItems(iids: [$iid]) { nodes { id workItemType { name } widgets { __typename ... on WorkItemWidgetStatus { status { name } } } } } } namespace(fullPath: $ns) { lifecycles { nodes { workItemTypes { name } statuses { id name } } } } }`
+
+// statusReply 是 statusQuery 的应答结构。
+type statusReply struct {
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+	Data struct {
+		Project *struct {
+			WorkItems struct {
+				Nodes []struct {
+					ID           string `json:"id"`
+					WorkItemType struct {
+						Name string `json:"name"`
+					} `json:"workItemType"`
+					Widgets []struct {
+						Typename string `json:"__typename"`
+						Status   *struct {
+							Name string `json:"name"`
+						} `json:"status"`
+					} `json:"widgets"`
+				} `json:"nodes"`
+			} `json:"workItems"`
+		} `json:"project"`
+		Namespace *struct {
+			Lifecycles struct {
+				Nodes []lifecycleNode `json:"nodes"`
+			} `json:"lifecycles"`
+		} `json:"namespace"`
+	} `json:"data"`
+}
+
+// lifecycleNode 是一个命名空间 lifecycle：适用的 work item 类型
+// 与该 lifecycle 下的全部状态。
+type lifecycleNode struct {
+	WorkItemTypes []struct {
+		Name string `json:"name"`
+	} `json:"workItemTypes"`
+	Statuses []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"statuses"`
+}
+
+// statusGID 按 work item 类型找到对应 lifecycle，再按状态名解析
+// 目标 status 的 GID；无 lifecycle 或状态名不存在时报错。
+func statusGID(ns *struct {
+	Lifecycles struct {
+		Nodes []lifecycleNode `json:"nodes"`
+	} `json:"lifecycles"`
+}, typeName, want string) (string, error) {
+	if ns != nil {
+		for _, lc := range ns.Lifecycles.Nodes {
+			typed := false
+			for _, t := range lc.WorkItemTypes {
+				if strings.EqualFold(t.Name, typeName) {
+					typed = true
+					break
+				}
+			}
+			if !typed {
+				continue
+			}
+			for _, st := range lc.Statuses {
+				if strings.EqualFold(st.Name, want) {
+					return st.ID, nil
+				}
+			}
+			return "", fmt.Errorf("lifecycle for %s has no status %q", typeName, want)
+		}
+	}
+	return "", fmt.Errorf("no lifecycle found for work item type %q", typeName)
+}
+
+// updateWorkItemStatus 经 workItemUpdate mutation 写入目标 status GID。
+func (c *Client) updateWorkItemStatus(ctx context.Context, workItemGID, statusGID string) error {
+	payload, err := json.Marshal(map[string]any{
+		"query": statusMutation,
+		"variables": map[string]any{
+			"id":     workItemGID,
+			"status": statusGID,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("encode status update: %w", err)
+	}
+	raw, err := c.apiStdin(ctx, payload, "graphql")
+	if err != nil {
+		return fmt.Errorf("update work item status: %w", err)
+	}
+	var reply struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+		Data struct {
+			WorkItemUpdate *struct {
+				Errors []string `json:"errors"`
+			} `json:"workItemUpdate"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return fmt.Errorf("decode status update: %w", err)
+	}
+	if len(reply.Errors) > 0 {
+		return fmt.Errorf("update work item status: %s", reply.Errors[0].Message)
+	}
+	if reply.Data.WorkItemUpdate == nil {
+		return errors.New("update work item status: empty response")
+	}
+	if len(reply.Data.WorkItemUpdate.Errors) > 0 {
+		return fmt.Errorf("update work item status: %s", reply.Data.WorkItemUpdate.Errors[0])
+	}
+	return nil
+}
+
+// statusMutation 把 work item 的 status widget 置为目标 status GID。
+const statusMutation = `mutation($id: WorkItemID!, $status: WorkItemStatusID!) { workItemUpdate(input: {id: $id, statusWidget: {status: $status}}) { errors } }`
 
 // Close 关闭一个 issue。
 func (c *Client) Close(ctx context.Context, projectID, iid int) error {

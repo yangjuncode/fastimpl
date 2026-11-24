@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/yangjuncode/fastimpl/config"
+	"github.com/yangjuncode/fastimpl/forge"
 	"github.com/yangjuncode/fastimpl/graph"
 	"github.com/yangjuncode/fastimpl/prompt"
 	"github.com/yangjuncode/fastimpl/worker"
@@ -27,21 +28,6 @@ const Tick = 500 * time.Millisecond
 // RefreshInterval 是周期重读 forge 上全部节点开关状态的间隔：
 // 外部关闭的依赖会立即释放后继，无需等任何任务完成。
 const RefreshInterval = 10 * time.Minute
-
-// Forge 是调度器需要的 issue/MR 操作；gitlab.Client 与 github.Client
-// 都满足本接口（GitLab 的 projectID 即 GitHub 的 repo database id）。
-type Forge interface {
-	// IssueState 返回 issue 的开关与领取状态（claim 前重读与周期刷新共用）。
-	IssueState(ctx context.Context, projectID, iid int) (open, assignedToOther bool, err error)
-	// Claim 把 issue 指派给当前用户。
-	Claim(ctx context.Context, projectID, iid int) error
-	// Close 关闭一个 issue。
-	Close(ctx context.Context, projectID, iid int) error
-	// Note 在 issue 上追加一条评论。
-	Note(ctx context.Context, projectID, iid int, message string) error
-	// EnsureMR 确保集成分支到目标分支的 MR/PR 存在，返回其 URL。
-	EnsureMR(ctx context.Context, projectID int, sourceBranch, targetBranch, title string) (string, error)
-}
 
 // Sessions 是调度器需要的 worker 终端操作；worker.Runner 满足本接口，
 // 测试用假实现替换。
@@ -72,7 +58,7 @@ type TaskRuntime struct {
 type Scheduler struct {
 	cfg       config.Config
 	repo      *worktree.Repo
-	forge     Forge
+	forge     forge.Forge
 	g         *graph.Graph
 	sessions  Sessions
 	template  string
@@ -80,9 +66,10 @@ type Scheduler struct {
 	log       *slog.Logger
 	specIID   int
 	branch    string
-	baseName  string     // 集成分支的基点（origin/<baseName>），用于上游同步
-	agentArgv []string   // worker 的 agent 命令行（config.AgentArgv 给出）
-	integrate sync.Mutex // 集成分支上的 merge/push 串行化
+	baseName  string             // 集成分支的基点（origin/<baseName>），用于上游同步
+	agentArgv []string           // worker 的 agent 命令行（config.AgentArgv 给出）
+	warned    map[graph.Key]bool // 已告警过的"closed 但看板未终态"节点，防重复刷日志
+	integrate sync.Mutex         // 集成分支上的 merge/push 串行化
 	// 以下两个字段只在 integrate 锁内读写（stopIntegrationAgent 在
 	// Run 结束后、所有任务 goroutine 退出后读取，无竞争）。
 	intAddr   string // 集成专属 agent 终端地址；空表示未启动
@@ -92,14 +79,14 @@ type Scheduler struct {
 // New 组装调度器；所有依赖由 app 层注入，便于测试替换。
 // intDir/intBranch/baseName 均来自 EnsureIntegration 的实际返回，
 // 复用带描述后缀或配置覆盖的分支名时也能正确合并与推送。
-func New(cfg config.Config, repo *worktree.Repo, forge Forge, g *graph.Graph, sessions Sessions, template, intDir, intBranch, baseName string, agentArgv []string, log *slog.Logger) *Scheduler {
+func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, g *graph.Graph, sessions Sessions, template, intDir, intBranch, baseName string, agentArgv []string, log *slog.Logger) *Scheduler {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Scheduler{
 		cfg:       cfg,
 		repo:      repo,
-		forge:     forge,
+		forge:     f,
 		g:         g,
 		sessions:  sessions,
 		template:  template,
@@ -109,6 +96,7 @@ func New(cfg config.Config, repo *worktree.Repo, forge Forge, g *graph.Graph, se
 		branch:    intBranch,
 		baseName:  baseName,
 		agentArgv: agentArgv,
+		warned:    make(map[graph.Key]bool),
 	}
 }
 
@@ -174,19 +162,32 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 }
 
-// refreshStates 周期重读所有节点在 forge 上的开关状态：
-// 外部关闭的依赖释放后继，重新打开的恢复 gating。
+// refreshStates 周期重读所有节点在 forge 上的开关与占用状态：
+// 外部关闭的依赖释放后继，重新打开的恢复 gating；看板被他人接管
+// 的节点标记 InFlight 不就绪，退回空闲后自动恢复。
 // 单个节点读取失败只告警不中断本次刷新。
 func (s *Scheduler) refreshStates(ctx context.Context) {
 	for _, n := range s.g.Snapshot() {
-		open, _, err := s.forge.IssueState(ctx, n.Key.ProjectID, n.Key.IID)
+		info, err := s.forge.IssueState(ctx, n.Key.ProjectID, n.Key.IID)
 		if err != nil {
 			s.log.Warn("refresh issue state failed", "key", n.Key, "err", err)
 			continue
 		}
-		if n.Closed == open {
-			s.g.SetClosed(n.Key, !open)
-			s.log.Info("issue state refreshed", "key", n.Key, "closed", !open)
+		if n.Closed == info.Open {
+			s.g.SetClosed(n.Key, !info.Open)
+			s.log.Info("issue state refreshed", "key", n.Key, "closed", !info.Open)
+		}
+		if n.InFlight != info.InFlight {
+			s.g.SetInFlight(n.Key, info.InFlight)
+			s.log.Info("issue occupancy refreshed", "key", n.Key, "in_flight", info.InFlight)
+		}
+		// 已关闭但看板 status 未进终态：只告警提醒人工修正，
+		// 不自动改——不动非本运行执行的 issue 的看板。每节点每轮
+		// 只 warn 一次，防止周期刷新刷日志。
+		if !info.Open && !info.DoneOnBoard && !s.warned[n.Key] {
+			s.warned[n.Key] = true
+			s.log.Warn("issue closed but board status not in a done column; fix manually",
+				"key", n.Key)
 		}
 	}
 }
@@ -194,7 +195,7 @@ func (s *Scheduler) refreshStates(ctx context.Context) {
 // stalledError 报告调度停滞：无可就绪、无在跑、图未完成。
 // 列出 needs attention 的节点与被开放跨项目前置卡住的节点。
 func (s *Scheduler) stalledError() error {
-	var attention, blocked []string
+	var attention, blocked, occupied []string
 	for _, n := range s.g.Snapshot() {
 		if n.Closed {
 			continue
@@ -203,7 +204,9 @@ func (s *Scheduler) stalledError() error {
 		case graph.NeedsAttention:
 			attention = append(attention, n.Key.String())
 		case graph.Pending:
-			if n.Key.ProjectID == s.g.Spec().ProjectID && s.hasOpenForeignDep(n) {
+			if n.InFlight {
+				occupied = append(occupied, n.Key.String())
+			} else if n.Key.ProjectID == s.g.Spec().ProjectID && s.hasOpenForeignDep(n) {
 				blocked = append(blocked, n.Key.String())
 			}
 		}
@@ -211,6 +214,9 @@ func (s *Scheduler) stalledError() error {
 	msg := "scheduler stalled"
 	if len(attention) > 0 {
 		msg += fmt.Sprintf("; needs attention: %v", attention)
+	}
+	if len(occupied) > 0 {
+		msg += fmt.Sprintf("; occupied (in progress elsewhere): %v", occupied)
 	}
 	if len(blocked) > 0 {
 		msg += fmt.Sprintf("; blocked by open cross-project deps: %v", blocked)
@@ -377,24 +383,33 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	}
 
 	// 开跑前重读现场状态：建图快照可能已过期。
-	open, assignedToOther, err := s.forge.IssueState(ctx, key.ProjectID, iid)
+	info, err := s.forge.IssueState(ctx, key.ProjectID, iid)
 	if err != nil {
 		fail(fmt.Errorf("read issue state: %w", err))
 		return
 	}
-	if !open {
+	if !info.Open {
 		// 外部已关闭：依赖视为满足，不启动 worker。
 		res.closed = true
 		results <- res
 		return
 	}
-	if assignedToOther {
+	if info.AssignedToOther {
 		fail(errors.New("issue 已被他人领取，不抢占"))
+		return
+	}
+	if info.InFlight {
+		fail(errors.New("issue 已在处理中（看板 status 为进行中），不抢占"))
 		return
 	}
 	if err := s.forge.Claim(ctx, key.ProjectID, iid); err != nil {
 		fail(fmt.Errorf("claim issue: %w", err))
 		return
+	}
+	// 看板状态标记尽力而为：GitHub 未开 preview、GitLab CE/低版本
+	// 都不支持，失败只记 warn 不阻塞任务。
+	if err := s.forge.MarkInProgress(ctx, key.ProjectID, iid); err != nil {
+		s.log.Warn("mark issue in progress failed", "key", key, "err", err)
 	}
 	dir, branch, err := s.repo.Create(ctx, s.branch, iid)
 	if err != nil {
@@ -459,6 +474,12 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			}
 			err = s.tryMerge(ctx, branch)
 			if err == nil {
+				// Done 状态在 Close 之前：两端关闭 issue 都不会反向
+				// 更新看板状态，不置 Done 会让已关闭 issue 永远停在
+				// In progress。
+				if merr := s.forge.MarkDone(ctx, key.ProjectID, iid); merr != nil {
+					s.log.Warn("mark issue done failed", "key", key, "err", merr)
+				}
 				if err := s.forge.Close(ctx, key.ProjectID, iid); err != nil {
 					fail(fmt.Errorf("close issue: %w", err))
 					return

@@ -14,32 +14,65 @@ import (
 	"time"
 
 	"github.com/yangjuncode/fastimpl/config"
+	"github.com/yangjuncode/fastimpl/forge"
 	"github.com/yangjuncode/fastimpl/graph"
 	"github.com/yangjuncode/fastimpl/worker"
 	"github.com/yangjuncode/fastimpl/worktree"
 )
 
-// fakeForge 记录 Claim/Close/Note 调用；closedOn/other 控制 IssueState。
+// fakeForge 记录 Claim/Close/Note/状态标记调用；closedOn/other 控制
+// IssueState；markErr 让状态标记失败，验证 warn-only 路径。
 type fakeForge struct {
-	mu       sync.Mutex
-	claimed  []graph.Key
-	closed   []graph.Key
-	notes    []string
-	closedOn map[int]bool // IssueState 返回 open=false
-	other    map[int]bool // IssueState 返回 assignedToOther=true
+	mu         sync.Mutex
+	claimed    []graph.Key
+	doing      []graph.Key
+	done       []graph.Key
+	closed     []graph.Key
+	notes      []string
+	closedOn   map[int]bool // IssueState 返回 open=false
+	other      map[int]bool // IssueState 返回 assignedToOther=true
+	inFlight   map[int]bool // IssueState 返回 inFlight=true（他人处理中）
+	boardDirty map[int]bool // IssueState 返回 doneOnBoard=false（closed 但看板未终态）
+	markErr    map[int]bool // MarkInProgress/MarkDone 返回错误
 }
 
-// IssueState 默认全部 open 且未领取；closedOn/other 覆盖。
-func (f *fakeForge) IssueState(ctx context.Context, projectID, iid int) (bool, bool, error) {
+// IssueState 默认全部 open、未领取未占用、看板终态一致；
+// closedOn/other/inFlight/boardDirty 覆盖。
+func (f *fakeForge) IssueState(ctx context.Context, projectID, iid int) (forge.IssueInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return !f.closedOn[iid], f.other[iid], nil
+	return forge.IssueInfo{
+		Open:            !f.closedOn[iid],
+		AssignedToOther: f.other[iid],
+		InFlight:        f.inFlight[iid],
+		DoneOnBoard:     !f.boardDirty[iid],
+	}, nil
 }
 
 func (f *fakeForge) Claim(ctx context.Context, projectID, iid int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claimed = append(f.claimed, graph.Key{ProjectID: projectID, IID: iid})
+	return nil
+}
+
+func (f *fakeForge) MarkInProgress(ctx context.Context, projectID, iid int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.markErr[iid] {
+		return fmt.Errorf("status unsupported")
+	}
+	f.doing = append(f.doing, graph.Key{ProjectID: projectID, IID: iid})
+	return nil
+}
+
+func (f *fakeForge) MarkDone(ctx context.Context, projectID, iid int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.markErr[iid] {
+		return fmt.Errorf("status unsupported")
+	}
+	f.done = append(f.done, graph.Key{ProjectID: projectID, IID: iid})
 	return nil
 }
 
@@ -169,7 +202,7 @@ func TestSchedulerRun(t *testing.T) {
 	g.Add(graph.Node{Key: graph.Key{ProjectID: 1, IID: 10}, Title: "task B", Kind: graph.KindChild, Deps: []graph.Key{{ProjectID: 1, IID: 9}}})
 	g.Add(graph.Node{Key: graph.Key{ProjectID: 1, IID: 11}, Title: "closed task", Kind: graph.KindChild})
 
-	forge := &fakeForge{closedOn: map[int]bool{11: true}}
+	forge := &fakeForge{closedOn: map[int]bool{11: true}, markErr: map[int]bool{10: true}}
 	sessions := &fakeSessions{}
 	// worker 在各自 worktree 里制造一次提交（Merge 需要真实差异）。
 	hookSessions := &commitSessions{fakeSessions: sessions, t: t}
@@ -191,6 +224,18 @@ func TestSchedulerRun(t *testing.T) {
 	}
 	if len(closed) != 2 {
 		t.Fatalf("closed %v, want 2 issues", closed)
+	}
+	// 状态标记：#9 记录 In progress→Done；#10 标记失败只 warn，
+	// 不阻塞领取/集成/关闭。
+	forge.mu.Lock()
+	doing := append([]graph.Key{}, forge.doing...)
+	done := append([]graph.Key{}, forge.done...)
+	forge.mu.Unlock()
+	if len(doing) != 1 || doing[0].IID != 9 {
+		t.Fatalf("doing marks %v, want [9] (#10 fails → warn only)", doing)
+	}
+	if len(done) != 1 || done[0].IID != 9 {
+		t.Fatalf("done marks %v, want [9] (#10 fails → warn only)", done)
 	}
 	sessions.mu.Lock()
 	started := len(sessions.started)
@@ -476,5 +521,113 @@ func TestSchedulerConflictResolvedByAgent(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(intDir, "conflict.txt"))
 	if err != nil || string(got) != "resolved\n" {
 		t.Fatalf("conflict.txt = %q err=%v, want resolved", got, err)
+	}
+}
+
+// TestSchedulerInFlightSkipped 看板 status 为进行中的 issue（他人或
+// 别的 agent 正在处理）不领取：不 claim、不建 worktree、不启动
+// worker，任务转 needs attention 后调度停滞报错。
+func TestSchedulerInFlightSkipped(t *testing.T) {
+	repoDir := initRepo(t)
+	repo := worktree.NewRepo(repoDir, filepath.Join(repoDir, ".wt"))
+	ctx := context.Background()
+	intBranch, intDir, baseName, err := repo.EnsureIntegration(ctx, 8, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := graph.New(graph.Key{ProjectID: 1, IID: 8})
+	g.Add(graph.Node{Key: graph.Key{ProjectID: 1, IID: 9}, Title: "task A", Kind: graph.KindChild})
+
+	forge := &fakeForge{inFlight: map[int]bool{9: true}}
+	sessions := &fakeSessions{}
+	cfg := config.Config{Parallelism: 1, SpecIID: 8}
+	s := New(cfg, repo, forge, g, sessions, "{issue-no}|{token}|{spec-no}", intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	err = s.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "needs attention") {
+		t.Fatalf("Run err = %v, want stalled needs-attention error", err)
+	}
+	forge.mu.Lock()
+	claimed := append([]graph.Key{}, forge.claimed...)
+	notes := append([]string{}, forge.notes...)
+	forge.mu.Unlock()
+	if len(claimed) != 0 {
+		t.Fatalf("claimed %v, want none (in-flight issue must not be claimed)", claimed)
+	}
+	sessions.mu.Lock()
+	started := len(sessions.started)
+	sessions.mu.Unlock()
+	if started != 0 {
+		t.Fatalf("workers started = %d, want 0", started)
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "处理中") {
+		t.Fatalf("notes %v, want one in-flight notice", notes)
+	}
+}
+
+// TestSchedulerRefreshInFlight 周期刷新同步占用状态：被他人接管的
+// pending 节点标记 InFlight 后不再就绪；看板退回空闲后恢复就绪。
+func TestSchedulerRefreshInFlight(t *testing.T) {
+	repoDir := initRepo(t)
+	repo := worktree.NewRepo(repoDir, filepath.Join(repoDir, ".wt"))
+	ctx := context.Background()
+	intBranch, intDir, baseName, err := repo.EnsureIntegration(ctx, 8, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := graph.New(graph.Key{ProjectID: 1, IID: 8})
+	g.Add(graph.Node{Key: graph.Key{ProjectID: 1, IID: 9}, Title: "task A", Kind: graph.KindChild})
+
+	forge := &fakeForge{inFlight: map[int]bool{9: true}}
+	cfg := config.Config{Parallelism: 1, SpecIID: 8}
+	s := New(cfg, repo, forge, g, &fakeSessions{}, "tpl", intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+
+	s.refreshStates(ctx)
+	n, _ := g.Lookup(graph.Key{ProjectID: 1, IID: 9})
+	if !n.InFlight {
+		t.Fatal("node not marked in-flight after refresh")
+	}
+	if ready := g.Ready(); len(ready) != 0 {
+		t.Fatalf("ready %v, want empty (occupied node must not be ready)", ready)
+	}
+	forge.mu.Lock()
+	forge.inFlight[9] = false
+	forge.mu.Unlock()
+	s.refreshStates(ctx)
+	n, _ = g.Lookup(graph.Key{ProjectID: 1, IID: 9})
+	if n.InFlight {
+		t.Fatal("node still in-flight after status reverted")
+	}
+	if ready := g.Ready(); len(ready) != 1 {
+		t.Fatalf("ready %v, want node back after in-flight cleared", ready)
+	}
+}
+
+// TestSchedulerWarnsDirtyBoard 已关闭但看板未终态的 issue：
+// 刷新时只 warn 一次提醒人工修正，不自动改、不重复刷日志。
+func TestSchedulerWarnsDirtyBoard(t *testing.T) {
+	repoDir := initRepo(t)
+	repo := worktree.NewRepo(repoDir, filepath.Join(repoDir, ".wt"))
+	ctx := context.Background()
+	intBranch, intDir, baseName, err := repo.EnsureIntegration(ctx, 8, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := graph.New(graph.Key{ProjectID: 1, IID: 8})
+	g.Add(graph.Node{Key: graph.Key{ProjectID: 1, IID: 9}, Title: "task A", Kind: graph.KindChild, Closed: true})
+
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	forgeFake := &fakeForge{closedOn: map[int]bool{9: true}, boardDirty: map[int]bool{9: true}}
+	cfg := config.Config{Parallelism: 1, SpecIID: 8}
+	s := New(cfg, repo, forgeFake, g, &fakeSessions{}, "tpl", intDir, intBranch, baseName, []string{"devin"}, log)
+
+	s.refreshStates(ctx)
+	s.refreshStates(ctx) // 第二次刷新不应重复 warn
+	out := buf.String()
+	if !strings.Contains(out, "board status not in a done column") {
+		t.Fatalf("log %q, want dirty-board warn", out)
+	}
+	if n := strings.Count(out, "board status not in a done column"); n != 1 {
+		t.Fatalf("warn count = %d, want 1 (dedup)", n)
 	}
 }

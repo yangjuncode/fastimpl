@@ -14,6 +14,7 @@ import (
 
 	"github.com/yangjuncode/fastimpl/config"
 	"github.com/yangjuncode/fastimpl/files"
+	"github.com/yangjuncode/fastimpl/forge"
 	"github.com/yangjuncode/fastimpl/github"
 	"github.com/yangjuncode/fastimpl/gitlab"
 	"github.com/yangjuncode/fastimpl/graph"
@@ -239,8 +240,8 @@ func resolveTreeDir(ctx context.Context, flagDir, cfgDir, repoDir string) (strin
 
 // buildGraph 按 forge 建 client 并构建完整依赖图；返回的 client
 // 同时是调度器的 Forge 端口（Claim/Close/Note）。
-func buildGraph(ctx context.Context, forge, dir, host, projectPath string, specIID int) (scheduler.Forge, *graph.Graph, error) {
-	switch forge {
+func buildGraph(ctx context.Context, kind, dir, host, projectPath string, specIID int) (forge.Forge, *graph.Graph, error) {
+	switch kind {
 	case config.ForgeGitLab:
 		client, err := gitlab.NewClient(ctx, gitlab.ExecRunner{}, dir, host, projectPath)
 		if err != nil {
@@ -256,7 +257,7 @@ func buildGraph(ctx context.Context, forge, dir, host, projectPath string, specI
 		g, err := graph.Build(ctx, ghSource{c: client}, specIID)
 		return client, g, err
 	default:
-		return nil, nil, fmt.Errorf("unknown forge %q", forge)
+		return nil, nil, fmt.Errorf("unknown forge %q", kind)
 	}
 }
 

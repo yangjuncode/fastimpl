@@ -83,12 +83,14 @@ func (g *Graph) WritePlan(w io.Writer) error {
 			state := "open"
 			if n.Closed {
 				state = "closed"
+			} else if n.InFlight {
+				state = "in-flight"
 			}
 			deps := "-"
 			if len(n.Deps) > 0 {
 				deps = g.joinDisplay(n.Deps)
 			}
-			fmt.Fprintf(&b, "  %-6s %-8s %-6s %-40s deps: %s\n",
+			fmt.Fprintf(&b, "  %-6s %-8s %-9s %-40s deps: %s\n",
 				g.displayKey(n.Key), n.Kind, state, n.Title, deps)
 		}
 	}
@@ -114,6 +116,7 @@ type jsonNode struct {
 	Type      string   `json:"type,omitempty"`
 	Kind      string   `json:"kind"`  // child|external
 	State     string   `json:"state"` // open|closed
+	InFlight  bool     `json:"in_flight,omitempty"`
 	Deps      []string `json:"deps"`
 }
 
@@ -153,6 +156,7 @@ func (g *Graph) WriteJSON(w io.Writer) error {
 			Type:      n.Type,
 			Kind:      n.Kind.String(),
 			State:     state,
+			InFlight:  n.InFlight,
 			Deps:      make([]string, 0, len(n.Deps)),
 		}
 		for _, dep := range n.Deps {
