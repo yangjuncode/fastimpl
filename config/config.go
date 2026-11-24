@@ -35,9 +35,9 @@ const DefaultConfig = `# fastimpl 配置（TOML）
 #                                # 都不给时从 work-dir 向上/下各搜 8 级取唯一仓库）
 # tree_dir = "/abs/path"           # worktree 父目录（也可 -tree-dir；都不给时
 #                                # 推断：既有 worktree 统一父目录 > <repo_dir>/.worktrees）
-# devin_model = "swe-2-medium"     # devin --model 参数
-# agent_cmd = "devin --model swe-2-medium"  # worker 的 agent 命令行（按 shell
-#                                          # 规则拆分）；缺省为 devin [--model]
+# agent_cmd = "devin --permission-mode dangerous"  # worker 的 agent 命令行
+#                                                 # （按 shell 规则拆分）；
+#                                                 # 缺省即此
 # integration = "branch"           # 覆盖默认集成分支 issue-<spec>-integration
 # require_review = true            # worker 提示词是否强制 leader + 第三方
 #                                # （fusion-3rd-reviewer-swe2max）双审（默认 false）
@@ -82,10 +82,8 @@ type Config struct {
 	Parallelism int
 	// Retries 是单个任务在首次尝试之外的重试次数，0 表示只尝试一次。
 	Retries int
-	// DevinModel 非空时作为 `devin --model` 的参数。
-	DevinModel string
 	// AgentCmd 是 worker 的 agent 命令行（含参数，按 shell 规则拆分）。
-	// 空时使用 devin [--model DevinModel]；配置后原样使用，
+	// 空时使用 devin --permission-mode dangerous；配置后原样使用，
 	// 由用户自带模型、权限等参数。
 	AgentCmd string
 	// Integration 非空时覆盖默认集成分支 issue-<spec>-integration。
@@ -111,7 +109,6 @@ type rawConfig struct {
 	Retries       *int    `toml:"retries"`
 	RepoDir       *string `toml:"repo_dir"`
 	TreeDir       *string `toml:"tree_dir"`
-	DevinModel    *string `toml:"devin_model"`
 	AgentCmd      *string `toml:"agent_cmd"`
 	Integration   *string `toml:"integration"`
 	RequireReview *bool   `toml:"require_review"`
@@ -125,17 +122,17 @@ func defaultParallelism() int {
 	return max(runtime.NumCPU()-1, 8)
 }
 
+// defaultAgentArgv 是未配置 agent_cmd 时的 worker 命令行：devin
+// 需要 --permission-mode dangerous 才能自主改代码。
+var defaultAgentArgv = []string{"devin", "--permission-mode", "dangerous"}
+
 // AgentArgv 返回 worker 的 agent 命令 argv：agent_cmd 已配置时按
-// shell 规则拆分，否则使用 devin [--model DevinModel]。
+// shell 规则拆分，否则使用 defaultAgentArgv。
 func (c Config) AgentArgv() ([]string, error) {
 	if strings.TrimSpace(c.AgentCmd) != "" {
 		return splitCmd(c.AgentCmd)
 	}
-	argv := []string{"devin"}
-	if c.DevinModel != "" {
-		argv = append(argv, "--model", c.DevinModel)
-	}
-	return argv, nil
+	return append([]string{}, defaultAgentArgv...), nil
 }
 
 // splitCmd 按简化 shell 规则拆分命令行：空格分词、单双引号、
@@ -267,9 +264,6 @@ func applyRaw(cfg *Config, raw rawConfig) {
 	}
 	if raw.TreeDir != nil {
 		cfg.TreeDir = *raw.TreeDir
-	}
-	if raw.DevinModel != nil {
-		cfg.DevinModel = *raw.DevinModel
 	}
 	if raw.AgentCmd != nil {
 		cfg.AgentCmd = *raw.AgentCmd

@@ -115,12 +115,12 @@
 2. **领取**：`glab issue update --assignee @me` / `gh issue edit
    --add-assignee @me`。
 3. **建 worktree**：`git worktree add <dir> -b issue-<iid> <集成分支>`。
-4. **启动 hc 终端**：在任务 worktree 中运行 `agent_cmd`（默认 `devin
-   [--model …]`），终端名 `<repo>-<分支>`，日志立即打印
-   `worker running key=<proj!iid> terminal=<名> addr=<地址>`。
+4. **启动 hc 终端**：在任务 worktree 中运行 `agent_cmd`（默认
+   `devin --permission-mode dangerous`），终端名 `<repo>-<分支>`，
+   日志立即打印 `worker running key=<proj!iid> terminal=<名> addr=<地址>`。
 5. **等启动**：轮询 OSC 7501 状态到 idle/done（上限 5 分钟）。
-6. **发提示词**：渲染模板 `{issue-no}` `{spec-no}` `{token}`（token 是
-   本任务随机的报告令牌）后发送。
+6. **发提示词**：渲染模板（`{{.IssueNo}}` `{{.SpecNo}}` `{{.Token}}` 等，
+   token 是本任务随机的报告令牌）后发送。
 7. **等一轮结束**：轮询到轮次前进且状态 idle/done（上限 90 分钟）。
 8. **判定完成**：读终端屏幕，找本任务令牌的 **`FASTIMPL-READY <token>`**
    行。fastimpl **不做任何 LLM 判定**——完成与否只看这一个标记，
@@ -176,8 +176,9 @@ SyncBase(origin/<base>)  →  merge --no-ff <任务分支>  →  push <集成分
   issue 读写、MR/PR 创建权限。
 - **`hc`**（herdr-core CLI）：管理 agent 终端；或一个已在运行的
   herdr-core socket（`hc_socket`）。
-- **agent CLI**：默认 `devin`；也可通过 `agent_cmd` 换成 codex、claude
-  等任何能接受文本提示词并按协议输出标记的命令行 agent。
+- **agent CLI**：默认 `devin --permission-mode dangerous`；也可通过
+  `agent_cmd` 换成 codex、claude 等任何能接受文本提示词并按协议
+  输出标记的命令行 agent。
 - 目标仓库的 origin 指向对应的 GitLab/GitHub 主机。
 
 ### 安装
@@ -236,8 +237,7 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
                              # 推断不出用 glab/gh 探测，最后按 gitlab
 # repo_dir = "/abs/path"     # 目标仓库主 checkout
 # tree_dir = "/abs/path"     # worktree 父目录
-# devin_model = "swe-2-medium"          # devin --model 参数
-# agent_cmd = "devin --model swe-2-medium"  # worker 的 agent 命令行
+# agent_cmd = "devin --permission-mode dangerous"  # worker 的 agent 命令行
 # integration = "branch"     # 覆盖默认集成分支 issue-<spec>-integration
 # require_review = true      # worker 提示词是否强制 leader + 第三方双审（默认 false）
 # hc_socket = "/run/user/1000/hc.sock"  # herdr-core socket（与 hc_binary 二选一）
@@ -247,7 +247,7 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
 要点：
 
 - **`agent_cmd`** 按简化 shell 规则拆分（空格分词、单双引号、反斜杠
-  转义）。未配置时退化为 `devin [--model <devin_model>]`。
+  转义）。未配置时退化为 `devin --permission-mode dangerous`。
 - **`hc_binary` 与 `hc_socket` 互斥**：前者执行 `hc connect` 拉起/连接
   herdr-core，后者直连已有 Unix socket。
 - **`retries = 0` 是合法值**（只尝试一次，不续写）。

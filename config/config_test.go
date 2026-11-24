@@ -50,9 +50,10 @@ func TestValidateForge(t *testing.T) {
 }
 
 func TestAgentArgv(t *testing.T) {
-	// 缺省：devin + devin_model。
-	argv, err := Config{DevinModel: "m1"}.AgentArgv()
-	if err != nil || len(argv) != 3 || argv[0] != "devin" || argv[2] != "m1" {
+	// 缺省：devin --permission-mode dangerous。
+	argv, err := Config{}.AgentArgv()
+	if err != nil || len(argv) != 3 || argv[0] != "devin" ||
+		argv[1] != "--permission-mode" || argv[2] != "dangerous" {
 		t.Fatalf("default argv = %v err=%v", argv, err)
 	}
 	// agent_cmd 覆盖：含引号与转义。

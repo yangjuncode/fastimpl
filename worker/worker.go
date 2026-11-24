@@ -46,7 +46,8 @@ type Params struct {
 	// 还有 agent 需要参考的其他目录；集成分支 agent 不传，
 	// 直接在自己的 worktree 里工作。
 	Cwd string
-	// Argv 是 agent 命令行（如 devin --model …），由 config.AgentArgv 给出。
+	// Argv 是 agent 命令行（默认 devin --permission-mode dangerous），
+	// 由 config.AgentArgv 给出。
 	Argv []string
 }
 
