@@ -40,7 +40,7 @@ const DefaultConfig = `# fastimpl 配置（TOML）
 #                                          # 规则拆分）；缺省为 devin [--model]
 # integration = "branch"           # 覆盖默认集成分支 issue-<spec>-integration
 # require_review = true            # worker 提示词是否强制 leader + 第三方
-#                                # （fusion-3rd-reviewer-swe2max）双审（默认 true）
+#                                # （fusion-3rd-reviewer-swe2max）双审（默认 false）
 # hc_socket = "/run/user/1000/hc.sock"  # herdr-core socket（与 hc_binary 二选一）
 # hc_binary = "hc"                      # 或经 hc connect 连接
 #
@@ -226,7 +226,7 @@ func Load(workDir, path string) (Config, error) {
 		Parallelism:   defaultParallelism(),
 		Retries:       DefaultRetries,
 		WorkDir:       workDir,
-		RequireReview: true,
+		RequireReview: false,
 		ResumeBudget:  DefaultResumeBudget,
 	}
 	applyRaw(&cfg, base)
