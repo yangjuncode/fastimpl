@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/yangjuncode/fastimpl/config"
 	"github.com/yangjuncode/fastimpl/forge"
@@ -788,12 +789,26 @@ func (c *Client) EnsureMR(ctx context.Context, projectID int, sourceBranch, targ
 	if len(mrs) > 0 && mrs[0].WebURL != "" {
 		return mrs[0].WebURL, nil
 	}
-	raw, err = c.api(ctx, "-X", "POST", "projects/"+scope+"/merge_requests",
-		"-f", "source_branch="+sourceBranch,
-		"-f", "target_branch="+targetBranch,
-		"-f", "title="+title)
-	if err != nil {
-		return "", fmt.Errorf("create merge request %s -> %s: %w", sourceBranch, targetBranch, err)
+	// 集成分支通常刚推送：GitLab REST 校验 source_branch 存在性可能
+	// 滞后于 ref 更新，"does not exist" 按可见性竞争做有限重试。
+	var cerr error
+	for attempt := 0; ; attempt++ {
+		raw, cerr = c.api(ctx, "-X", "POST", "projects/"+scope+"/merge_requests",
+			"-f", "source_branch="+sourceBranch,
+			"-f", "target_branch="+targetBranch,
+			"-f", "title="+title)
+		if cerr == nil {
+			break
+		}
+		lower := strings.ToLower(cerr.Error())
+		if !strings.Contains(lower, "source_branch") || !strings.Contains(lower, "does not exist") || attempt >= 5 {
+			return "", fmt.Errorf("create merge request %s -> %s: %w", sourceBranch, targetBranch, cerr)
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
 	}
 	var mr struct {
 		WebURL string `json:"web_url"`
