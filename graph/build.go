@@ -50,6 +50,38 @@ type Source interface {
 	Issue(ctx context.Context, k Key) (IssueInfo, error)
 }
 
+// Phase 是建图所处阶段，供进度视图说明当前在等什么。
+type Phase string
+
+const (
+	// PhaseSpec 正在读取并校验父 issue。
+	PhaseSpec Phase = "spec"
+	// PhaseSeeds 正在拉取直接子任务与 spec 自身的前置。
+	PhaseSeeds Phase = "seeds"
+	// PhaseExpand 正在沿 blocked-by 展开传递闭包。
+	PhaseExpand Phase = "expand"
+	// PhaseCheck 闭包已收敛，正在做环与上限检查。
+	PhaseCheck Phase = "check"
+	// PhaseDone 建图成功完成。
+	PhaseDone Phase = "done"
+)
+
+// BuildProgress 是一次建图进度。目标数不固定：闭包每读一个节点
+// 可能发现新的前置，所以 Discovered 只会随读取增长，不声称占
+// 总数的百分比——调用方应显示"已发现 N / 已读取 M"这样的绝对数。
+type BuildProgress struct {
+	// Phase 是当前阶段。
+	Phase Phase
+	// Discovered 是已发现（入队）的节点数，不含 spec 自身。
+	Discovered int
+	// Read 是已读取完成（成功或失败）的节点数。
+	Read int
+	// Open 是已读取节点中在 forge 上仍开放的个数。
+	Open int
+	// Closed 是已读取节点中在 forge 上已关闭的个数。
+	Closed int
+}
+
 // Build 建立 spec 的完整依赖图：
 //  1. src.Spec 校验父 issue；src.Children 与 spec 自身 blocked-by
 //     并行拉取；type=task 的直接子任务作为 KindChild 种子。
@@ -61,18 +93,36 @@ type Source interface {
 //  4. 完成后每个开放节点都是潜在工作项：外部 blocker 与子任务一样
 //     走 claim → worktree → agent → 集成 → close 流程。
 func Build(ctx context.Context, src Source, specIID int) (*Graph, error) {
+	return BuildWithProgress(ctx, src, specIID, nil)
+}
+
+// BuildWithProgress 同 Build，另在单消费线程上按阶段上报进度。
+// report 为 nil 时与 Build 等价。report 只在消费线程同步调用，
+// 不会并发，也绝不与 src 的读取并发；每次调用都带当时的完整
+// 计数快照，最后的 PhaseDone 在环检查通过后才发出。
+func BuildWithProgress(ctx context.Context, src Source, specIID int, report func(BuildProgress)) (*Graph, error) {
+	progress := BuildProgress{Phase: PhaseSpec}
+	send := func() {
+		if report != nil {
+			report(progress)
+		}
+	}
+	send()
 	spec, err := src.Spec(ctx, specIID)
 	if err != nil {
 		return nil, err
 	}
 	g := New(spec.Key)
 	g.specTitle = spec.Title
+	g.specOpen = spec.Open
 
 	// 出错即取消，让在途的 glab/gh 子进程尽快退出。
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// 子任务列表与 spec 自身的 blocked-by 并行拉取。
+	progress.Phase = PhaseSeeds
+	send()
 	var children []ChildRef
 	var specLinks []Key
 	var childErr, specErr error
@@ -105,6 +155,7 @@ func Build(ctx context.Context, src Source, specIID int) (*Graph, error) {
 		if !seen[k] {
 			seen[k] = true
 			queue = append(queue, pending{k, kind})
+			progress.Discovered++
 		}
 	}
 	for _, child := range children {
@@ -119,6 +170,8 @@ func Build(ctx context.Context, src Source, specIID int) (*Graph, error) {
 	if len(queue) == 0 {
 		return nil, fmt.Errorf("issue %d has no child tasks", specIID)
 	}
+	progress.Phase = PhaseExpand
+	send()
 
 	jobs := make(chan pending)
 	results := make(chan fetchResult)
@@ -148,21 +201,25 @@ func Build(ctx context.Context, src Source, specIID int) (*Graph, error) {
 			outstanding++
 		case r := <-results:
 			outstanding--
+			progress.Read++
 			if r.err != nil {
 				if firstErr == nil {
 					firstErr = r.err
 					cancel()
 				}
 				queue = nil
+				send()
 				continue
 			}
 			if firstErr != nil {
+				send()
 				continue
 			}
 			if len(g.nodes) >= maxNodes {
 				firstErr = fmt.Errorf("dependency graph exceeds %d nodes", maxNodes)
 				cancel()
 				queue = nil
+				send()
 				continue
 			}
 			g.Add(Node{
@@ -173,9 +230,15 @@ func Build(ctx context.Context, src Source, specIID int) (*Graph, error) {
 				Closed: !r.info.Open,
 				Deps:   r.deps,
 			})
+			if r.info.Open {
+				progress.Open++
+			} else {
+				progress.Closed++
+			}
 			for _, dep := range r.deps {
 				push(dep, KindExternal)
 			}
+			send()
 		}
 	}
 	close(jobs)
@@ -183,9 +246,13 @@ func Build(ctx context.Context, src Source, specIID int) (*Graph, error) {
 	if firstErr != nil {
 		return nil, firstErr
 	}
+	progress.Phase = PhaseCheck
+	send()
 	if cycle := g.findCycle(); len(cycle) > 0 {
 		return nil, fmt.Errorf("dependency cycle detected: %s", joinKeys(cycle))
 	}
+	progress.Phase = PhaseDone
+	send()
 	return g, nil
 }
 

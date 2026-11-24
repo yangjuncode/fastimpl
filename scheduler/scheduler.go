@@ -49,10 +49,16 @@ type Sessions interface {
 
 // TaskRuntime 是调度器维护的每个任务的运行数据。
 type TaskRuntime struct {
-	// Key 是任务身份。
+	// Key 是任务身份；集成专用 agent 用 spec 的 Key。
 	Key graph.Key
 	// Addr 是当前 worker 会话的 hc 终端地址；无运行时为空。
 	Addr string
+	// Label 是终端名（<repo>-issue-<iid>，集成分支的是
+	// <repo>-<分支名>），供状态视图给终端页命名，也是人工
+	// hc attach 时用的名字。
+	Label string
+	// Integration 标记这一项是集成分支专属 agent，不是某个任务的 worker。
+	Integration bool
 	// Attention 是进入 needs attention 的原因，供状态视图显示。
 	Attention string
 	// Accepted 是最近一次被接受的提交 SHA。
@@ -85,6 +91,9 @@ type Scheduler struct {
 	// 评论的间隔；测试注入 0/短间隔。
 	claimWait    time.Duration
 	claimRecheck time.Duration
+	// runtime 保存图之外的运行数据（终端地址、注意原因、已接受提交），
+	// 由自己的锁保护，供 Status 与 GUI 快照使用。
+	runtime runtimeStore
 }
 
 // New 组装调度器；所有依赖由 app 层注入，便于测试替换。
@@ -209,17 +218,22 @@ func (s *Scheduler) drain(ctx context.Context, running map[graph.Key]bool, resul
 	return err
 }
 
-// record 把一次结局写进图并记录日志。
+// record 把一次结局写进图与运行数据并记录日志。
 func (s *Scheduler) record(res taskResult) {
 	switch {
 	case res.integrated:
 		s.g.SetState(res.key, graph.Integrated)
+		s.runtime.setAccepted(res.key, res.commit)
+		s.runtime.setAttention(res.key, "")
 		s.log.Info("task integrated", "key", res.key, "commit", res.commit)
 	case res.closed:
 		s.g.SetClosed(res.key, true)
+		s.runtime.clearAddr(res.key)
+		s.runtime.setAttention(res.key, "")
 		s.log.Info("issue already closed; skipped", "key", res.key)
 	default:
 		s.g.SetState(res.key, graph.NeedsAttention)
+		s.runtime.setAttention(res.key, res.attention)
 		s.log.Warn("task needs attention", "key", res.key, "reason", res.attention)
 	}
 }
@@ -377,6 +391,10 @@ func (s *Scheduler) resolveBaseConflict(ctx context.Context, files []string) err
 		if err != nil {
 			return fmt.Errorf("start integration worker: %w", err)
 		}
+		// 集成 agent 用 spec 的 key 与独立标签：任务的 key 是子任务，
+		// 不会与它冲突。地址在 boot 之前就公开：启动阶段最可能卡在
+		// 权限询问上，正是要人看的时候。
+		s.runtime.setAddr(s.g.Spec(), addr, termName, true)
 		if _, err := s.sessions.AwaitBoot(ctx, addr); err != nil {
 			return fmt.Errorf("await integration worker boot: %w", err)
 		}
@@ -410,7 +428,8 @@ func (s *Scheduler) resolveBaseConflict(ctx context.Context, files []string) err
 }
 
 // stopIntegrationAgent 在 Run 结束时回收集成专属终端；
-// base 冲突未解决时保留终端供 hc attach 排查。
+// base 冲突未解决时保留终端供 hc attach 排查——此时地址也留着，
+// GUI 仍能连上去看。
 func (s *Scheduler) stopIntegrationAgent() {
 	if s.intAddr == "" {
 		return
@@ -422,7 +441,9 @@ func (s *Scheduler) stopIntegrationAgent() {
 	}
 	if err := s.sessions.Stop(context.Background(), s.intAddr, s.specIID, s.intTermName()); err != nil {
 		s.log.Warn("stop integration worker failed", "addr", s.intAddr, "err", err)
+		return
 	}
+	s.runtime.clearAddr(s.g.Spec())
 }
 
 // 任务收尾策略：是否需要停终端、是否保留两把锁。
@@ -466,6 +487,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 
 	if !config.ValidInstanceID(s.cfg.InstanceID) {
 		res.attention = "instance_id is missing or unsafe; refusing to run without cross-machine identity"
+		s.runtime.setAttention(key, res.attention)
 		s.log.Error("task refused", "key", key, "reason", res.attention)
 		return
 	}
@@ -473,6 +495,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	lock, err := AcquireTaskLock(s.repo.Root, iid, lockContent(os.Getpid(), s.cfg.InstanceID, token))
 	if err != nil {
 		res.attention = err.Error()
+		s.runtime.setAttention(key, res.attention)
 		s.log.Warn("local task lock refused", "key", key, "err", err,
 			"hint", "confirm no worker for this issue is running, then delete the lock file")
 		return
@@ -489,6 +512,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 				finish = finishKeep
 			} else {
 				stopped = true
+				s.runtime.clearAddr(key)
 			}
 		}
 		switch finish {
@@ -634,6 +658,9 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		return
 	}
 	s.log.Info("worker running", "key", key, "terminal", termName, "addr", addr)
+	// 地址在 StartWorker 成功后、AwaitBoot 之前公开：GUI 要能连上一个
+	// 还在启动、等着人处理权限弹窗的终端。
+	s.runtime.setAddr(key, addr, termName, false)
 	monitor := s.watchClaim(taskCtx, key, token, cancel)
 	defer monitor.stop()
 	// stopAndRelease 在确认终端已停止后把收尾策略降级为"直接释放"。
@@ -644,6 +671,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		}
 		stopped = true
 		finish = finishNone
+		s.runtime.clearAddr(key)
 		return nil
 	}
 
@@ -785,15 +813,18 @@ func (s *Scheduler) taskFailed(ctx context.Context, key graph.Key, what string, 
 	case errors.Is(err, ErrClaimLost), errors.Is(cause, ErrClaimLost):
 		*finish = finishStop
 		res.attention = fmt.Sprintf("%s (task cancelled: %v)", reason, cause)
+		s.runtime.setAttention(key, res.attention)
 		s.log.Warn("task stopped; the claim is no longer ours", "key", key, "reason", res.attention, "terminal", termName)
 	case cause != nil:
 		*finish = finishStop
 		res.attention = fmt.Sprintf("%s (task cancelled: %v)", reason, cause)
+		s.runtime.setAttention(key, res.attention)
 		s.log.Warn("task stopped; parent context cancelled", "key", key, "reason", res.attention, "terminal", termName)
 	default:
 		s.log.Warn("task needs attention", "key", key, "err", err, "inspect", "hc attach "+termName)
 		fail(fmt.Errorf("%s\n排查终端: hc attach %s", err.Error(), termName))
 		res.attention = reason
+		s.runtime.setAttention(key, res.attention)
 	}
 }
 
@@ -805,6 +836,7 @@ func (s *Scheduler) noteFailure(ctx context.Context, key graph.Key, reason strin
 	if err := s.forge.Note(nctx, key.ProjectID, key.IID, "fastimpl: "+reason); err != nil {
 		s.log.Warn("issue note failed", "key", key, "err", err)
 	}
+	s.runtime.setAttention(key, reason)
 	return reason
 }
 
@@ -895,7 +927,43 @@ func (s *Scheduler) confirmClaim(ctx, parent context.Context, key graph.Key, tok
 }
 
 // Status 返回任务运行状态快照，供 CLI 状态行与 GUI 共用。
-// TODO: 汇总 graph.Snapshot + 每个 TaskRuntime。
+// 它由图快照与运行数据合成：每个节点一条，外加集成分支专属 agent
+// 的一条（Integration 为真，Key 是 spec）。排序按 key，结果稳定。
+// 状态与 close/in-flight 一律取 graph.Snapshot，运行里没有这些字段
+// 的第二份真相；这里只补图上没有的终端地址、终端名、注意原因与
+// 已接受提交。
 func (s *Scheduler) Status() []TaskRuntime {
-	return nil
+	live := s.runtime.snapshot()
+	byKey := make(map[graph.Key]TaskRuntime, len(live))
+	for _, r := range live {
+		byKey[r.Key] = r
+	}
+	var out []TaskRuntime
+	for _, n := range s.g.Snapshot() {
+		r := byKey[n.Key]
+		r.Key = n.Key
+		out = append(out, r)
+		delete(byKey, n.Key)
+	}
+	// 图里没有的条目（集成分支 agent 用 spec 的 key；已从图移除的
+	// 节点也走这里）照原样补上，保证快照不漏。
+	for _, r := range byKey {
+		out = append(out, r)
+	}
+	slices.SortFunc(out, func(a, b TaskRuntime) int {
+		if a.Key.ProjectID != b.Key.ProjectID {
+			return a.Key.ProjectID - b.Key.ProjectID
+		}
+		if a.Key.IID != b.Key.IID {
+			return a.Key.IID - b.Key.IID
+		}
+		switch {
+		case a.Integration == b.Integration:
+			return 0
+		case a.Integration:
+			return -1
+		}
+		return 1
+	})
+	return out
 }

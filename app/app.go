@@ -60,6 +60,18 @@ type Options struct {
 // 集成分支 worktree → SyncBase + push + EnsureMR → worker.Dial（hcgo）
 // → scheduler.Run（就绪即派、完成即放）。
 func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
+	return run(ctx, opts, stdout, stderr, Observer{})
+}
+
+// RunObserved 是 Run 的共享实现入口，另带观察者：CLI 传零值
+// Observer，GUI 用它跟随构图进度与调度状态。回调在运行自己的
+// goroutine 上同步调用，界面实现需要自己转投到 UI 队列。
+func RunObserved(ctx context.Context, opts Options, stdout, stderr io.Writer, observer Observer) error {
+	return run(ctx, opts, stdout, stderr, observer)
+}
+
+// run 是 Run 与 RunObserved 共用的运行管线。
+func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer Observer) error {
 	workDir, err := resolveWorkDir(opts.WorkDir)
 	if err != nil {
 		return err
@@ -85,18 +97,25 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	cfg.SpecIID = opts.SpecIID
 	repoDir, err := resolveRepoDir(ctx, opts.RepoDir, cfg.RepoDir, workDir)
 	if err != nil {
-		return err
+		return repoError(opts.RepoDir, err)
+	}
+	if observer.observing() {
+		// GUI 给的目录必须自己就是仓库顶层：git 在子目录里也能跑，
+		// 会把父仓库的 origin 认成本项目的。CLI 保持既有行为。
+		if err := verifyRepoRoot(ctx, repoDir); err != nil {
+			return err
+		}
 	}
 	log.Info("repository", "dir", repoDir, "work_dir", workDir)
 	repo := worktree.NewRepo(repoDir, "")
 	host, projectPath, err := repo.OriginCoordinate(ctx)
 	if err != nil {
-		return err
+		return repoError(repoDir, err)
 	}
 	forge := resolveForge(ctx, cfg.Forge, host, repoDir)
 	log.Info("building dependency graph", "forge", forge, "origin", host+"/"+projectPath, "spec", opts.SpecIID)
 	buildStart := time.Now()
-	fc, g, err := buildGraph(ctx, forge, repoDir, host, projectPath, opts.SpecIID, log)
+	fc, g, err := buildGraph(ctx, forge, repoDir, host, projectPath, opts.SpecIID, log, observer.Progress)
 	if err != nil {
 		return err
 	}
@@ -110,6 +129,9 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	}
 	log.Info("graph built", "nodes", len(g.Snapshot()), "open", open, "closed", closed,
 		"elapsed", time.Since(buildStart).Round(time.Millisecond))
+	if observer.GraphReady != nil {
+		observer.GraphReady(g)
+	}
 	if opts.JSONPath != "" {
 		if err := writeGraphJSON(g, opts.JSONPath); err != nil {
 			return err
@@ -162,7 +184,28 @@ func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	log.Info("integration ready", "branch", branch, "mr", mrURL)
 	log.Info("scheduler started", "parallelism", cfg.Parallelism, "agent", agentArgv)
 	sched := scheduler.New(cfg, repo, fc, forge, g, runner, tmpl, workDir, intDir, branch, baseName, agentArgv, log)
+	if observer.SchedulerReady != nil {
+		// 调度尚未启动：GUI 此时才能拿到 scheduler，并且在第一个 worker
+		// 起来之前就装上自己的刷新循环与终端连接方式。
+		observer.SchedulerReady(sched, viewerAttach(cfg.HcBinary, cfg.HcSocket))
+	}
 	return sched.Run(ctx)
+}
+
+// viewerAttach 返回用与调度同源的 hc 配置打开观看流的方式。每次
+// attach 自己开一条连接，与调度器的 Runner 生命周期无关：关掉界面上的
+// 终端不会影响 worker，后台连接关闭也不会连坐。连接由流自己持有，
+// 关闭流时一并释放。
+func viewerAttach(hcBinary, hcSocket string) AttachTerminal {
+	return func(ctx context.Context, addr string, cols, rows int) (io.ReadWriteCloser, error) {
+		return worker.OpenViewer(ctx, worker.ViewerOptions{
+			Binary: hcBinary,
+			Socket: hcSocket,
+			Addr:   addr,
+			Cols:   cols,
+			Rows:   rows,
+		})
+	}
 }
 
 // initFiles 把配置与模板文件生成到 work-dir：优先复制 exe 目录
@@ -281,22 +324,23 @@ func resolveTreeDir(ctx context.Context, flagDir, cfgDir, repoDir string) (strin
 }
 
 // buildGraph 按 forge 建 client 并构建完整依赖图；返回的 client
-// 同时是调度器的 Forge 端口（Claim/Close/Note）。
-func buildGraph(ctx context.Context, kind, dir, host, projectPath string, specIID int, log *slog.Logger) (forge.Forge, *graph.Graph, error) {
+// 同时是调度器的 Forge 端口（Claim/Close/Note）。progress 非 nil 时
+// 在建图过程中按阶段上报。
+func buildGraph(ctx context.Context, kind, dir, host, projectPath string, specIID int, log *slog.Logger, progress func(graph.BuildProgress)) (forge.Forge, *graph.Graph, error) {
 	switch kind {
 	case config.ForgeGitLab:
 		client, err := gitlab.NewClient(ctx, gitlab.ExecRunner{}, dir, host, projectPath)
 		if err != nil {
 			return nil, nil, err
 		}
-		g, err := graph.Build(ctx, glabSource{c: client, log: log}, specIID)
+		g, err := graph.BuildWithProgress(ctx, glabSource{c: client, log: log}, specIID, progress)
 		return client, g, err
 	case config.ForgeGitHub:
 		client, err := github.NewClient(ctx, github.ExecRunner{}, dir, host, projectPath)
 		if err != nil {
 			return nil, nil, err
 		}
-		g, err := graph.Build(ctx, ghSource{c: client, log: log}, specIID)
+		g, err := graph.BuildWithProgress(ctx, ghSource{c: client, log: log}, specIID, progress)
 		return client, g, err
 	default:
 		return nil, nil, fmt.Errorf("unknown forge %q", kind)

@@ -106,6 +106,8 @@ type Graph struct {
 	spec Key
 	// specTitle 是父 issue 标题。
 	specTitle string
+	// specOpen 是父 issue 在建图时是否开放（只展示，不参与调度）。
+	specOpen bool
 	// specDeps 是 spec 自身 blocked-by 的目标（只展示，不 gate 子任务）。
 	specDeps []Key
 	// nodes 是全部节点（子任务 + 传递闭包的外部 blocker）。
@@ -128,6 +130,13 @@ func (g *Graph) SpecTitle() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.specTitle
+}
+
+// SpecOpen 报告父 issue 在建图时是否开放（绘图用；调度不以它 gate）。
+func (g *Graph) SpecOpen() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.specOpen
 }
 
 // SpecDeps 返回 spec 自身 blocked-by 的目标（展示用）。

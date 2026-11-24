@@ -115,3 +115,87 @@ func TestWriteJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildWithProgress(t *testing.T) {
+	var events []BuildProgress
+	g, err := BuildWithProgress(context.Background(), testSource(), 8, func(p BuildProgress) {
+		events = append(events, p)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Snapshot()) != 4 {
+		t.Fatalf("got %d nodes, want 4", len(g.Snapshot()))
+	}
+	if len(events) < 3 {
+		t.Fatalf("got %d progress events, want at least the phase changes: %+v", len(events), events)
+	}
+	if events[0].Phase != PhaseSpec {
+		t.Errorf("first phase = %q, want %q", events[0].Phase, PhaseSpec)
+	}
+	last := events[len(events)-1]
+	if last.Phase != PhaseDone {
+		t.Errorf("last phase = %q, want %q (the done event comes after the cycle check)", last.Phase, PhaseDone)
+	}
+	if last.Discovered != 4 || last.Read != 4 {
+		t.Errorf("final progress = %+v, want 4 discovered and 4 read", last)
+	}
+	// #20 已关闭、#9/#10/#21 开放。
+	if last.Open != 3 || last.Closed != 1 {
+		t.Errorf("final progress = %+v, want 3 open and 1 closed", last)
+	}
+	// 目标的动态扩展：发现数先于读取数增长，且总数不是一开始就固定的。
+	var grew bool
+	prev := 0
+	for _, e := range events {
+		if e.Discovered > prev {
+			prev = e.Discovered
+			if e.Read < e.Discovered {
+				grew = true
+			}
+		}
+		if e.Read > e.Discovered {
+			t.Fatalf("progress %+v read more than discovered", e)
+		}
+	}
+	if !grew {
+		t.Errorf("discovery never ran ahead of reads: %+v", events)
+	}
+}
+
+func TestBuildWithProgressNilReport(t *testing.T) {
+	g, err := BuildWithProgress(context.Background(), testSource(), 8, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Snapshot()) != 4 {
+		t.Fatalf("got %d nodes, want 4", len(g.Snapshot()))
+	}
+}
+
+func TestBuildWithProgressCycleHasNoDone(t *testing.T) {
+	src := testSource()
+	src.blockers[Key{1, 9}] = []Key{{1, 10}}
+	src.blockers[Key{1, 10}] = []Key{{1, 9}}
+	var phases []Phase
+	if _, err := BuildWithProgress(context.Background(), src, 8, func(p BuildProgress) {
+		phases = append(phases, p.Phase)
+	}); err == nil {
+		t.Fatal("expected cycle error")
+	}
+	if len(phases) == 0 || phases[len(phases)-1] == PhaseDone {
+		t.Fatalf("phases = %v, want no done phase for a cycle", phases)
+	}
+}
+
+func TestBuildSpecClosedFlag(t *testing.T) {
+	src := testSource()
+	src.spec.Open = false
+	g, err := Build(context.Background(), src, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.SpecOpen() {
+		t.Error("SpecOpen() = true, want the spec's closed state kept for drawing")
+	}
+}

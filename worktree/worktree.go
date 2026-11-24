@@ -277,6 +277,21 @@ func (r *Repo) commonDir(ctx context.Context, dir string) (string, error) {
 	return resolvePath(dir, strings.TrimSpace(out)), nil
 }
 
+// TopLevel 返回 dir 所属 git 仓库的顶层目录。它用来确认用户给的
+// 目录本身是不是主 checkout：git 在子目录里也能跑，remote 会一路
+// 查到父仓库，光看 origin 无法区分。
+func (r *Repo) TopLevel(ctx context.Context, dir string) (string, error) {
+	out, err := r.run(ctx, dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", err
+	}
+	top := strings.TrimSpace(out)
+	if top == "" {
+		return "", fmt.Errorf("%s is not inside a git repository", dir)
+	}
+	return resolvePath(dir, top), nil
+}
+
 // verifyWorktree 确认 dir 是 r.Root 仓库中停在 refs/heads/<branch> 的
 // worktree。普通仓库、别的仓库、detached 或停在其它分支都报错，且不做
 // 任何修改。

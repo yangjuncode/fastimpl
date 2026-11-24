@@ -259,6 +259,37 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
 | `-tree-dir <dir>` | worktree 父目录；缺省自动推断（见下） |
 | `-work-dir <dir>` | fastimpl 工作目录；默认当前目录 |
 
+### 图形界面 fastimpl-gui
+
+`cmd/fastimpl-gui` 是同一套运行管线的桌面前端（NSGo）。它复用 app 层的
+构图与调度，只把进度、依赖图与调度状态作为事件接出来：
+
+```
+usage: fastimpl-gui [-j N] [-config path] [-template path]
+        [-repo-dir dir] [-tree-dir dir] [-work-dir dir] [spec-issue-iid]
+```
+
+- 不传 issue：主窗口以空状态打开，在界面里录入后开始。
+- 传 issue：窗口出现后在后台自动构图并调度。
+- `-repo-dir` 与界面里的"仓库目录"只对本次运行有效，不写回配置。
+  显式目录必须**本身就是仓库顶层**，避免在子目录里误认父仓库的 origin。
+- 仓库无法解析或 origin 不可用时弹出设置对话框（文本输入 + 系统目录
+  选择），用它重试即可；其余配置/forge/API 错误只在状态栏提示。
+- 依赖图用 `ui/flow` 绘制：箭头从**前置**指向**被阻塞**的 issue，卡片
+  区分已关闭 / 等待前置 / 运行中 / 集成中 / 已集成 / 需要处理 / 远端
+  进行中；画布可平移缩放（右上角工具有放大/缩小/适应窗口）。
+- 每个有终端的任务一个 tab，按 `graph.Key` 去重；终端是真正的双向
+  PTY（NSGo `base/terminal` + hc 观看连接），可滚动、可缩放；断开或
+  结束时错误可见并有"重连"按钮。关闭 tab 只释放观看连接，不 kill 任务。
+- 停止按钮、关闭窗口与 Ctrl+C/SIGTERM 都会取消运行并给调度器收尾时间
+  （最多 8 秒）；取消后的状态显示"已停止"，不会显示成完成。
+- 界面线程只读本地快照（约 400ms 合并刷新，结果到达时强制刷新），
+  绝不轮询 forge，也不在 UI 线程上做 hc/网络/git 调用。
+
+Linux 需要 GTK 4.14+ 与 Pango/Cairo；NSGo 的 libghostty-vt 已嵌入二进制，
+首次运行解到 `~/.cache/nsgo`。`./build.sh` 默认同时构建两个命令，也可用
+`./build.sh fastimpl` 或 `./build.sh fastimpl-gui` 只构建其一。
+
 ### 配置文件 fastimpl.toml
 
 配置文件**分层覆盖**：命令行 flag > `<work-dir>/fastimpl.toml` >
@@ -419,8 +450,8 @@ worker；不同机器之间用 **issue 评论里的认领标记**做尽力仲裁
 
 ```
 cmd/fastimpl        命令行入口：flag 解析、signal.NotifyContext
-cmd/fastimpl-gui    GUI 版占位（规划：每个 hc 会话一个 nsgo tab）
-app                 运行管线编排（CLI/GUI 共用）
+cmd/fastimpl-gui    NSGo 桌面前端：空状态录入、依赖图、进度、终端 tab
+app                 运行管线编排（CLI/GUI 共用）；Observer 事件与仓库错误
 config              fastimpl.toml 分层加载、校验、agent_cmd 拆分、env 清理
 files               文件查找约定：work-dir > exe 目录（config/prompt 共用）
 worktree            git 操作：FindRoot/ResolveTreeDir/分支与 worktree CRUD/
