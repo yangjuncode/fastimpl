@@ -21,7 +21,7 @@ const DefaultFile = "fastimpl.prompt.md"
 // DefaultTemplate 是模板文件都不存在时播种到 exe 目录的默认内容。
 // 报告协议行（FASTIMPL-READY <token>）是 fastimpl 与 worker 的契约，
 // 定制时不要破坏这一行的格式；提交以 worktree HEAD 为准。
-const DefaultTemplate = `使用 implement 技能完成子任务 #{{.IssueNo}}。你的工作目录（cwd）是 fastimpl 的运行目录 {{.WorkDir}}，其中包含主仓库 checkout（{{.RepoDir}}）以及可能的其他目录，可自由查阅参考。本任务的代码产出目录是 git worktree {{.Worktree}}：所有新代码、修改、提交都在其中进行（可用 git -C {{.Worktree}}）；由 fastimpl 管理集成分支、推送、关闭 issue 和清理 worktree。读取任务正文和评论，先说明任务标题。只在 {{.Worktree}} 中修改和提交。完成实现与仓库要求的验证后，先由 leader 审核，再使用 fusion-3rd-reviewer-swe2max 独立审核。修复发现的问题，重新验证及审核后提交。只有实现、验证和两轮审核全部通过，且无未解决事项时，才在最终回复末尾按以下协议报告：单独一行由 FASTIMPL-READY、一个空格和令牌 {{.Token}} 拼接；随后最多六行，分别说明实现、验证结果、leader 审核、独立审核及阻塞情况。报告正文只包含上述结论，不复制代码、命令日志、凭据或 issue 原文。未达到条件则说明阻塞及剩余工作，不输出报告标记。
+const DefaultTemplate = `使用 implement 技能完成子任务 #{{.IssueNo}}。{{if eq .WorkDir .RepoDir}}你的工作目录（cwd）{{.WorkDir}} 就是主仓库 checkout——可自由查阅代码，但不要在此修改或提交。{{else}}你的工作目录（cwd）是 fastimpl 的运行目录 {{.WorkDir}}，其中包含主仓库 checkout（{{.RepoDir}}）以及可能的其他目录，可自由查阅参考，但不要在 checkout 中修改。{{end}}本任务的代码产出目录是 git worktree {{.Worktree}}：所有新代码、修改、提交都在其中进行（可用 git -C {{.Worktree}}）；由 fastimpl 管理集成分支、推送、关闭 issue 和清理 worktree。读取任务正文和评论，先说明任务标题。只在 {{.Worktree}} 中修改和提交。完成实现与仓库要求的验证后，先由 leader 审核，再使用 fusion-3rd-reviewer-swe2max 独立审核。修复发现的问题，重新验证及审核后提交。只有实现、验证和两轮审核全部通过，且无未解决事项时，才在最终回复末尾按以下协议报告：单独一行由 FASTIMPL-READY、一个空格和令牌 {{.Token}} 拼接；随后最多六行，分别说明实现、验证结果、leader 审核、独立审核及阻塞情况。报告正文只包含上述结论，不复制代码、命令日志、凭据或 issue 原文。未达到条件则说明阻塞及剩余工作，不输出报告标记。
 `
 
 // Load 读取模板文件并返回文本。
