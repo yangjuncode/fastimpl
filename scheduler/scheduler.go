@@ -450,12 +450,13 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	}
 	token := worker.NewToken()
 	text, err := prompt.Render(s.template, prompt.Vars{
-		IssueNo:  iid,
-		Token:    token,
-		SpecNo:   s.specIID,
-		Worktree: dir,
-		WorkDir:  s.workDir,
-		RepoDir:  s.repo.Root,
+		IssueNo:   iid,
+		Token:     token,
+		SpecNo:    s.specIID,
+		Worktree:  dir,
+		WorkDir:   s.workDir,
+		RepoDir:   s.repo.Root,
+		IntBranch: s.branch,
 	})
 	if err != nil {
 		fail(fmt.Errorf("render prompt: %w", err))

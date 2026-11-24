@@ -267,10 +267,12 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
 - `{{.RepoDir}}` — 目标仓库主 checkout 的绝对路径（供参考，不修改）
 - `{{.Worktree}}` — fastimpl 为本任务创建的 git worktree 绝对路径，
   agent 的代码产出目录（修改与提交只在这里进行）
+- `{{.IntBranch}}` — 集成分支名：fastimpl 把各任务分支合并于此，
+  冲突时 agent 需知道跟谁比较
 
 早期 `{issue-no}`、`{token}`、`{spec-no}`、`{worktree}`、`{work-dir}`、
-`{repo-dir}` 写法仍被识别（渲染前统一改写为 `{{.Field}}`），
-已定制的旧模板无需改动。
+`{repo-dir}`、`{int-branch}` 写法仍被识别（渲染前统一改写为
+`{{.Field}}`），已定制的旧模板无需改动。
 
 模板与 fastimpl 的**唯一契约是报告协议**：任务全部完成（含仓库要求的
 验证）后在回复末尾单独一行输出 `FASTIMPL-READY <token>`，随后最多六行
