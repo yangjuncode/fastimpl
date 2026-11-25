@@ -3,12 +3,14 @@ package app
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/yangjuncode/fastimpl/config"
 	"github.com/yangjuncode/fastimpl/graph"
 )
 
@@ -127,5 +129,27 @@ func TestObserverObserving(t *testing.T) {
 	}
 	if !(Observer{Progress: func(graph.BuildProgress) {}}).observing() {
 		t.Error("an Observer with Progress does not report observing")
+	}
+	if !(Observer{ConfigLoaded: func(config.Config) {}}).observing() {
+		t.Error("an Observer with ConfigLoaded does not report observing")
+	}
+}
+
+// ConfigLoaded 必须在仓库解析前送达，GUI 才能从第一条仓库/构图日志
+// 开始持久化；即使仓库稍后不可用，回调里的 WorkDir/log_file 也已可用。
+func TestRunObservedReportsLoadedConfigBeforeRepoResolution(t *testing.T) {
+	work := t.TempDir()
+	if err := os.WriteFile(filepath.Join(work, "fastimpl.toml"), []byte("log_file = 'run.log'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var got config.Config
+	err := RunObserved(context.Background(), Options{WorkDir: work, SpecIID: 8}, io.Discard, io.Discard, Observer{
+		ConfigLoaded: func(cfg config.Config) { got = cfg },
+	})
+	if err == nil {
+		t.Fatal("RunObserved succeeded outside a repository; test setup is wrong")
+	}
+	if got.WorkDir != work || got.LogFile != "run.log" || got.SpecIID != 8 {
+		t.Fatalf("ConfigLoaded = %+v, want the effective workdir/log_file/spec", got)
 	}
 }

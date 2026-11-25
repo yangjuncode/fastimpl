@@ -85,6 +85,13 @@ func TestStatusPublishesAddrBeforeBootAndClearsAfterStop(t *testing.T) {
 	if r.Label == "" {
 		t.Error("status has no terminal label for the running task")
 	}
+	if r.StartedAt.IsZero() {
+		t.Error("status has no terminal start time for the running task")
+	}
+	if !r.FinishedAt.IsZero() {
+		t.Errorf("status finished at = %v for a running task, want zero", r.FinishedAt)
+	}
+	startedAt := r.StartedAt
 	sessions.mu.Lock()
 	started := len(sessions.started)
 	sessions.mu.Unlock()
@@ -116,6 +123,14 @@ func TestStatusPublishesAddrBeforeBootAndClearsAfterStop(t *testing.T) {
 	if r.Accepted == "" {
 		t.Error("status has no accepted commit for the integrated task")
 	}
+	if r.StartedAt != startedAt {
+		t.Errorf("status start time changed from %v to %v across the task lifecycle", startedAt, r.StartedAt)
+	}
+	if r.FinishedAt.IsZero() {
+		t.Error("status has no finish time for the integrated task")
+	} else if r.FinishedAt.Before(startedAt) {
+		t.Errorf("status finish time %v is before start time %v", r.FinishedAt, startedAt)
+	}
 	if r.Attention != "" {
 		t.Errorf("status attention = %q for an integrated task, want empty", r.Attention)
 	}
@@ -145,6 +160,9 @@ func TestStatusKeepsAddrWhenStopCannotBeConfirmed(t *testing.T) {
 	r, ok := statusOf(s, graph.Key{ProjectID: 1, IID: 9})
 	if !ok || r.Addr == "" {
 		t.Fatalf("status = %+v, want the address kept while the terminal is unconfirmed", r)
+	}
+	if r.StartedAt.IsZero() || r.FinishedAt.IsZero() || r.FinishedAt.Before(r.StartedAt) {
+		t.Errorf("status times = %v .. %v, want a valid finished work interval", r.StartedAt, r.FinishedAt)
 	}
 }
 

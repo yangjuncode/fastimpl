@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestLoadExplicitOverlay 验证 -config 显式文件作为覆盖层：
@@ -82,16 +83,18 @@ func TestAgentArgv(t *testing.T) {
 func TestSaveWorkDirCopy(t *testing.T) {
 	work := t.TempDir()
 	cfg := Config{
-		Parallelism:   4,
-		Retries:       2,
-		Forge:         ForgeGitHub,
-		RepoDir:       work,
-		TreeDir:       filepath.Join(work, ".worktrees"),
-		AgentCmd:      `codex --model "o4 mini"`,
-		Integration:   "spec-integration",
-		RequireReview: true,
-		HcSocket:      filepath.Join(work, "hc.sock"),
-		InstanceID:    "machine-1",
+		Parallelism:       4,
+		Retries:           2,
+		Forge:             ForgeGitHub,
+		RepoDir:           work,
+		TreeDir:           filepath.Join(work, ".worktrees"),
+		AgentCmd:          `codex --model "o4 mini"`,
+		Integration:       "spec-integration",
+		RequireReview:     true,
+		HcSocket:          filepath.Join(work, "hc.sock"),
+		TerminalRetention: "15m",
+		LogFile:           "fastimpl-run.log",
+		InstanceID:        "machine-1",
 	}
 	path, err := SaveWorkDirCopy(work, cfg)
 	if err != nil {
@@ -107,7 +110,7 @@ func TestSaveWorkDirCopy(t *testing.T) {
 	text := string(data)
 	for _, want := range []string{
 		"parallelism = 4", "retries = 2", `forge = 'github'`, "repo_dir", "tree_dir",
-		"agent_cmd", "integration", "require_review = true", "hc_socket", "hc_binary",
+		"agent_cmd", "integration", "require_review = true", "hc_socket", "hc_binary", "terminal_retention", "log_file",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("saved config does not contain %q:\n%s", want, text)
@@ -123,7 +126,8 @@ func TestSaveWorkDirCopy(t *testing.T) {
 	if loaded.Parallelism != cfg.Parallelism || loaded.Retries != cfg.Retries || loaded.Forge != cfg.Forge ||
 		loaded.RepoDir != cfg.RepoDir || loaded.TreeDir != cfg.TreeDir || loaded.AgentCmd != cfg.AgentCmd ||
 		loaded.Integration != cfg.Integration || loaded.RequireReview != cfg.RequireReview ||
-		loaded.HcSocket != cfg.HcSocket || loaded.HcBinary != cfg.HcBinary {
+		loaded.HcSocket != cfg.HcSocket || loaded.HcBinary != cfg.HcBinary || loaded.TerminalRetention != cfg.TerminalRetention ||
+		loaded.LogFile != cfg.LogFile {
 		t.Fatalf("loaded config = %+v, want the saved effective values %+v", loaded, cfg)
 	}
 }
@@ -137,5 +141,26 @@ func TestSaveWorkDirCopyRejectsInvalid(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(work, DefaultFile)); !os.IsNotExist(statErr) {
 		t.Fatalf("invalid config was written anyway: stat err = %v", statErr)
+	}
+}
+
+// TestParseTerminalRetention 验证单字段三种策略及非法输入。
+func TestParseTerminalRetention(t *testing.T) {
+	if d, never, err := ParseTerminalRetention(""); err != nil || never || d != 0 {
+		t.Fatalf("empty = %v,%v,%v; want immediate", d, never, err)
+	}
+	if d, never, err := ParseTerminalRetention("0s"); err != nil || never || d != 0 {
+		t.Fatalf("0s = %v,%v,%v; want immediate", d, never, err)
+	}
+	if d, never, err := ParseTerminalRetention("10m"); err != nil || never || d != 10*time.Minute {
+		t.Fatalf("10m = %v,%v,%v; want 10m delayed", d, never, err)
+	}
+	if _, never, err := ParseTerminalRetention("Never"); err != nil || !never {
+		t.Fatalf("Never = never=%v err=%v; want never", never, err)
+	}
+	for _, bad := range []string{"-1s", "abc", "forever"} {
+		if err := (Config{Parallelism: 1, TerminalRetention: bad}).Validate(); err == nil {
+			t.Errorf("terminal_retention %q must be rejected", bad)
+		}
 	}
 }

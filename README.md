@@ -49,7 +49,7 @@
 │ 就绪即派：issue 状态预检 → claim(@me) → 建任务 worktree        │
 │ → 启动 hc 终端 → 发提示词 → 轮询轮次 → 检测完成标记            │
 │ → 串行集成（sync base → merge → push）→ close issue           │
-│ → 停终端 → 删 worktree/分支 → 立即释放后继任务                │
+│ → 按 terminal_retention 处理终端 → 删 worktree/分支 → 释放后继  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -100,7 +100,7 @@
 |---|---|---|---|
 | 集成分支 | `issue-<spec>-integration`（可被 `integration` 配置覆盖）；未配置时复用时也接受 `issue-<spec>`、`issue-<spec>-<描述>` | `<tree-dir>/<分支名>` | 运行开始时确保存在：优先复用协作者已推送的远程集成分支，其次复用本地 worktree/分支，都没有才从 base 新建（详见下节） |
 | 任务分支 | `issue-<iid>`（新建）；复用时接受 `issue-<iid>-<描述>` | `<tree-dir>/<分支名>` | 从集成分支创建；集成成功后与 worktree 一起删除 |
-| hc 终端 | `<repo名>-<分支名>`，如 `bf9100-issue-9`、集成终端 `bf9100-issue-8-integration` | — | repo 名取 origin 项目路径最后一段，多项目并行不撞名 |
+| hc 终端 | `<repo名>-<分支名>`，如 `bf9100-issue-9`、集成终端 `bf9100-issue-8-integration` | — | repo 名取 origin 项目路径最后一段，多项目并行不撞名；成功任务结束后按 `terminal_retention` 立即/延迟/永不自动销毁 |
 
 所有 git 操作都在 worktree 中进行，**主 checkout 不被触碰**——你可以
 照常使用自己的仓库目录。
@@ -193,8 +193,11 @@ SyncBase(origin/<base>)  →  merge --no-ff <任务分支>  →  push <集成分
 
 ### 状态刷新与失败处理
 
-- 任务集成成功 → `Integrated`：close issue → 停 hc 终端 → 删 worktree
-  和任务分支 → 释放后继。
+- 任务集成成功 → `Integrated`：close issue → 按 `terminal_retention`
+  处理 hc 终端（默认 `0s` 立即停止；`10m`/`1h` 等延迟后台停止；`never`
+  不自动停止）→ 删 worktree 和任务分支 → 释放后继。无论终端是否保留，
+  本地锁与远端 claim 都会在任务完成后立即释放；保留的终端主要用于回看
+  输出/继续交互，不承诺保留任务 worktree。
 - 任务失败 → `NeedsAttention`：**保留 hc 终端和 worktree**，在 issue 上
   追加一条说明评论（`forge.Note`，含 `hc attach <终端名>` 提示），
   日志同样打印 attach 命令。人工修好（或发现只是误报）后可重新运行
@@ -287,9 +290,17 @@ usage: fastimpl-gui [-version] [-j N] [-config path] [-template path]
   区分已关闭 / 等待前置 / 可开始工作（ready）/ 运行中 / 集成中 /
   已集成 / 需要处理 / 远端进行中；画布可平移缩放（右上角工具有
   放大/缩小/适应窗口）。
-- 每个有终端的任务一个 tab，按 `graph.Key` 去重；终端是真正的双向
-  PTY（NSGo `base/terminal` + hc 观看连接），可滚动、可缩放；断开或
-  结束时错误可见并有"重连"按钮。关闭 tab 只释放观看连接，不 kill 任务。
+- 每个有终端的任务一个 tab，按 `graph.Key` 去重；标题是 issue 号加本轮
+  开始时间（如 `#9 · 17:20:03`，集成分支终端带“集成”前缀）。hover 或
+  键盘聚焦 tab 会显示 tooltip：issue 号、标题、开始/结束时间、已工作时间
+  （运行中每秒刷新，结束后固定）、hc 终端名、hc 地址与 `hc attach` 命令。
+  终端是真正的双向 PTY（NSGo `base/terminal` + hc 观看连接），可滚动、
+  可缩放；断开或结束时错误可见并有"重连"按钮。关闭 tab 只释放观看连接，
+  不 kill 任务。
+- “日志” tab 实时展示本次运行日志（任务派发、worker 启动、提示词发送、
+  集成、错误与结束等），界面保留最近 200 行；在底部时自动跟随新日志，
+  向上翻阅时暂停跟随。设置里的 `log_file` 非空时同时 append 到该文件，
+  并在下次运行时限量读回尾部。
 - 停止按钮、关闭窗口与 Ctrl+C/SIGTERM 都会取消运行并给调度器收尾时间
   （最多 8 秒）；取消后的状态显示"已停止"，不会显示成完成。
 - 界面线程只读本地快照（约 400ms 合并刷新，结果到达时强制刷新），
@@ -313,6 +324,8 @@ git 时把短提交哈希附在后面，形如 `0.1.0+abcdef0`，拿不到 hash 
 ```toml
 # parallelism = 8            # 同时运行的 worker 上限（默认 max(NumCPU-1, 8)）
 # retries = 8                # 单任务在首次尝试之外的续写重试次数
+# terminal_retention = "0s"  # 成功任务终端：0s 立即销毁；10m/1h 延迟；never 不自动销毁
+# log_file = "fastimpl.log"    # GUI 运行日志 append 保存文件；默认空不保存
 # forge = "gitlab"           # gitlab|github；缺省按 origin 主机名推断，
                              # 推断不出用 glab/gh 探测，最后按 gitlab
 # repo_dir = "/abs/path"     # 目标仓库主 checkout
@@ -331,6 +344,19 @@ git 时把短提交哈希附在后面，形如 `0.1.0+abcdef0`，拿不到 hash 
 - **`hc_binary` 与 `hc_socket` 互斥**：前者执行 `hc connect` 拉起/连接
   herdr-core，后者直连已有 Unix socket。
 - **`retries = 0` 是合法值**（只尝试一次，不续写）。
+- **`terminal_retention`** 是单个 Go duration 或 `never`。`0s` 保持旧行为：
+  任务成功整合后立即停止终端；`10m` 等正值会把终端保留到到期后由后台
+  尽力停止；`never` 不自动停止。延迟/永不停止时 fastimpl 会把终端地址、
+  名称、agent/cwd 指纹与清理时间写入本机 temp 下的 retained metadata；
+  重启后会接管这些终端：过期立即清，未到期继续计时，`never` 只重新接到
+  GUI。若同一 issue 再次运行且终端身份、agent 命令和 cwd 都没变，默认
+  直接复用原终端；若配置已变化导致无法安全复用，会提示人工处理而不是
+  误删或误用。运行中的本地 lock 也会记录 terminal addr/name 供排障，但
+  retained metadata 不长期复用 lock 文件——lock 存在仍只表示任务互斥。
+- **`log_file`** 只被 GUI 使用。默认空表示不持久化；非空时按 append 方式
+  写入运行日志，相对路径按 `work-dir` 解析，也可用绝对路径；该设置在
+  下一次启动运行时生效。GUI 启动一次运行时只读回文件尾部（最多 64KiB，并且界面最终只保留最近 200 行），
+  避免长期累积的大日志拖慢打开速度；新日志仍会完整追加到文件。
 - **`instance_id`** 是本机的稳定标识（形如 `机器名-随机哈希`，只允许
   `[A-Za-z0-9._-]`，≤128 字符）。它**只从 `<exe 同目录>/fastimpl.toml`
   读取**，`<work-dir>/fastimpl.toml` 与 `-config` 都不能覆盖。缺失时
@@ -408,7 +434,9 @@ forge      配置 forge > origin 主机名推断 > glab/gh 探测 > gitlab
 - **重跑**：命令是幂等的——已关闭/已集成的不会重做；已存在的
   `issue-*` 分支与 worktree 会复用；集成分支存在则在其上继续。把上次
   needs-attention 的 issue 处理好（或确认它本就该被关闭）后直接再次
-  `fastimpl <spec>` 即可续跑。
+  `fastimpl <spec>` 即可续跑。若上一轮按 `terminal_retention` 保留了同一
+  issue 的终端，重启后会先接管它；身份匹配时默认复用，过期 delayed
+  终端会先清理，无法安全复用时则提示人工处理。
 
 ### 跨机器认领与 stale 锁
 
@@ -416,7 +444,8 @@ forge      配置 forge > origin 主机名推断 > glab/gh 探测 > gitlab
 worker；不同机器之间用 **issue 评论里的认领标记**做尽力仲裁。
 
 - **本地锁**：`<系统 temp 目录>/fastimpl-<规范化仓库绝对路径 SHA256>-<issue-no>.lock`，
-  用 `O_EXCL` 创建，内容含 PID、`instance_id` 与本次 claim token。
+  用 `O_EXCL` 创建，内容含 PID、`instance_id`、本次 claim token；worker
+  终端启动/复用后还会补充 terminal addr/name，便于人工排障。
   并发时只有一个成功，其余告警并把这些任务转为 needs attention（不同
   issue 互不影响）。仓库路径先取绝对/清理再 `EvalSymlinks`，经符号
   链接别名进来也是同一把锁。释放前用文件身份（`SameFile`）确认没被
@@ -463,7 +492,7 @@ worker；不同机器之间用 **issue 评论里的认领标记**做尽力仲裁
 
 ```
 cmd/fastimpl        命令行入口：flag 解析、signal.NotifyContext
-cmd/fastimpl-gui    NSGo 桌面前端：空状态录入、依赖图、进度、终端 tab
+cmd/fastimpl-gui    NSGo 桌面前端：空状态录入、依赖图、进度、日志/终端 tab
 app                 运行管线编排（CLI/GUI 共用）；Observer 事件与仓库错误
 config              fastimpl.toml 分层加载、校验、agent_cmd 拆分、env 清理
 files               文件查找约定：work-dir > exe 目录（config/prompt 共用）

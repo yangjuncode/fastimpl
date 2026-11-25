@@ -3,6 +3,7 @@ package scheduler
 import (
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/yangjuncode/fastimpl/graph"
 )
@@ -45,6 +46,43 @@ func (s *runtimeStore) clearAddr(k graph.Key) {
 	s.update(k, func(r *TaskRuntime) {
 		r.Addr = ""
 	})
+}
+
+// start 记录本轮工作开始使用终端的时刻，并清掉上一轮的结束时间。
+// retained terminal 被新任务复用时也调用它：工作时长属于本轮任务，
+// 不把已完成轮次与闲置保留时间算进去。
+func (s *runtimeStore) start(k graph.Key, at time.Time) {
+	s.update(k, func(r *TaskRuntime) {
+		r.StartedAt = at
+		r.FinishedAt = time.Time{}
+	})
+}
+
+// finish 记录工作结局确定的时刻。只有启动过的终端才有结束时间；
+// 重复调用保留第一次结局，避免后续状态合并把时间往后推。
+func (s *runtimeStore) finish(k graph.Key, at time.Time) {
+	s.update(k, func(r *TaskRuntime) {
+		if !r.StartedAt.IsZero() && r.FinishedAt.IsZero() {
+			r.FinishedAt = at
+		}
+	})
+}
+
+// setTimes 直接恢复一段已经发生的终端工作时间；只用于重启后接管
+// retained terminal，不参与 active worker 的计时重置语义。
+func (s *runtimeStore) setTimes(k graph.Key, started, finished time.Time) {
+	s.update(k, func(r *TaskRuntime) {
+		r.StartedAt = started
+		r.FinishedAt = finished
+	})
+}
+
+// times 读取当前工作时间，供 retained metadata 持久化。
+func (s *runtimeStore) times(k graph.Key) (time.Time, time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.tasks[k]
+	return r.StartedAt, r.FinishedAt
 }
 
 // setAttention 记录进入 needs attention 的原因；空串表示清除。

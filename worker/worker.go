@@ -61,6 +61,9 @@ type Record struct {
 	Reported bool
 	// Live 表示进程仍在运行。
 	Live bool
+	// Name 是终端名；Labels 是归属标签，供 retained terminal 安全接管/复用前校验。
+	Name   string
+	Labels map[string]string
 }
 
 // Settled 报告该记录是否表示一轮已经结束。
@@ -149,11 +152,17 @@ func (r *Runner) Snapshot(ctx context.Context, addr string) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
+	name := ""
+	if term.Name != nil {
+		name = *term.Name
+	}
 	return Record{
 		Turn:     term.Turn,
 		Status:   term.StatusWord(),
 		Reported: term.Reported,
 		Live:     term.Live(),
+		Name:     name,
+		Labels:   term.Labels,
 	}, nil
 }
 

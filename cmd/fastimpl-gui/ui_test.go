@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/nsgo-dev/nsgo/core"
 	"github.com/nsgo-dev/nsgo/nsgotest"
@@ -60,6 +61,7 @@ func loadGraph(app *nsgotest.App, m *model, snap snapshot) {
 		m.structure = buildDiagram(snap)
 		m.flowReady = true
 		m.mu.Unlock()
+		m.terms.sync(snap.Status)
 		m.rev.Update(func(n int) int { return n + 1 })
 	})
 	app.Settle()
@@ -128,6 +130,89 @@ func TestGraphPageRendersNodes(t *testing.T) {
 	app.Find("id:graph")
 }
 
+// 日志 tab 是独立的运行日志页：从图页切过去后能看到快照里的实时日志。
+func TestLogTabRendersRunLog(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	snap.Log = []string{
+		"time=2026-01-01T00:00:00Z level=INFO msg=\"worker started\" key=1!9",
+		"time=2026-01-01T00:03:00Z level=INFO msg=\"task integrated\" key=1!9",
+	}
+	loadGraph(gui, m, snap)
+	gui.Find("id:tab-log")
+	gui.Press("id:tab-log")
+	gui.Find("id:log-page")
+	gui.Find("id:log-scroll")
+	gui.Find("text:worker started")
+	gui.Find("text:task integrated")
+}
+
+// 终端 tab 用 issue 号与开始时间命名；tooltip 展示 issue、标题、
+// 工作时长与 hc 连接信息，并随界面时钟每秒更新。
+func TestTerminalTabShowsStartTimeAndTooltip(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	started := gui.Clock.WallTime()
+	snap.Status[0].StartedAt = started
+	loadGraph(gui, m, snap)
+	wantTitle := "#9 · " + started.Format("15:04:05")
+	gui.Find("text:" + wantTitle)
+
+	gui.Hover("id:terminal-tab-1!9")
+	gui.Advance(600 * time.Millisecond)
+	for _, want := range []string{
+		"Issue：#9", "标题：task A", "开始时间：", "已工作时间：0秒",
+		"hc 终端：proj-issue-9", "hc 地址：t1", "hc attach proj-issue-9",
+	} {
+		gui.Find("text:" + want)
+	}
+	// 启动本身会消耗几十毫秒模拟帧时间，因此等到第三次秒 tick 后
+	// 截断显示的时长才稳定落在 2 秒。
+	gui.Advance(3 * time.Second)
+	gui.Find("text:已工作时间：2秒")
+}
+
+// 已完成的任务不再随界面时钟增长：tooltip 里的时长固定为完成时刻减开始时刻。
+func TestTerminalTabFinishedElapsedIsFixed(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	started := gui.Clock.WallTime()
+	snap.Status[0].StartedAt = started
+	snap.Status[0].FinishedAt = started.Add(3*time.Minute + 2*time.Second)
+	loadGraph(gui, m, snap)
+	gui.Hover("id:terminal-tab-1!9")
+	gui.Advance(600 * time.Millisecond)
+	gui.Find("text:已工作时间：3分2秒")
+	gui.Advance(3 * time.Second)
+	gui.Find("text:已工作时间：3分2秒")
+	if gui.Exists(`text:已工作时间：3分3秒`) {
+		t.Fatal("the elapsed time kept ticking after the task finished")
+	}
+}
+
+// 集成分支终端也用 spec issue 的开始时间命名，但带“集成”前缀；
+// tooltip 明确它不是普通任务 worker。
+func TestIntegrationTerminalTabUsesIntegrationPrefix(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	started := gui.Clock.WallTime()
+	snap.Status = append(snap.Status, scheduler.TaskRuntime{
+		Key:         snap.Spec.Key,
+		Addr:        "integration-addr",
+		Label:       "proj-issue-8-integration",
+		Integration: true,
+		StartedAt:   started,
+	})
+	loadGraph(gui, m, snap)
+	wantTitle := "集成 #8 · " + started.Format("15:04:05")
+	gui.Find("text:" + wantTitle)
+	gui.Hover("id:terminal-tab-integration-1!8")
+	gui.Advance(600 * time.Millisecond)
+	for _, want := range []string{"类型：集成分支 agent", "Issue：#8", "标题：spec title", "hc 终端：proj-issue-8-integration"} {
+		gui.Find("text:" + want)
+	}
+}
+
 // 传了 issue 时窗口打开后自动开始：这里只验证录入值被带到选项里，
 // 真正的运行由 session 的测试覆盖。
 func TestIssueFromFlagsPrefills(t *testing.T) {
@@ -146,6 +231,7 @@ func TestSettingsDialogRendersConfigAndPromptTabs(t *testing.T) {
 	gui.Find("id:settings")
 	gui.Find("id:settings-parallelism")
 	gui.Find("id:settings-retries")
+	gui.Find("id:settings-log-file")
 	gui.Find("id:settings-forge")
 	gui.Find("id:settings-repo-dir")
 	gui.Find("id:settings-tree-dir")

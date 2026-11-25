@@ -63,6 +63,11 @@ type TaskRuntime struct {
 	Attention string
 	// Accepted 是最近一次被接受的提交 SHA。
 	Accepted string
+	// StartedAt 是本轮 fastimpl 开始使用这个终端的时间；未启动为零值。
+	StartedAt time.Time
+	// FinishedAt 是 fastimpl 对这个终端的工作结局确定的时间；仍在运行
+	// 或尚未启动为零值。终端因保留策略继续存在时，它仍固定在工作结束时刻。
+	FinishedAt time.Time
 }
 
 // Scheduler 是分批并行调度的核心。
@@ -94,6 +99,11 @@ type Scheduler struct {
 	// runtime 保存图之外的运行数据（终端地址、注意原因、已接受提交），
 	// 由自己的锁保护，供 Status 与 GUI 快照使用。
 	runtime runtimeStore
+	// retained/retentionMu 跟踪 delayed terminal 的后台清理定时器；
+	// retentionChanged 用于 WaitRetention 等待最后一批定时器结束。
+	retained         map[terminalID]*retainedTerminal
+	retentionMu      sync.Mutex
+	retentionChanged chan struct{}
 }
 
 // New 组装调度器；所有依赖由 app 层注入，便于测试替换。
@@ -104,23 +114,25 @@ func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, forgeName string
 		log = slog.Default()
 	}
 	return &Scheduler{
-		cfg:          cfg,
-		repo:         repo,
-		forge:        f,
-		forgeName:    forgeName,
-		g:            g,
-		sessions:     sessions,
-		template:     template,
-		workDir:      workDir,
-		intDir:       intDir,
-		log:          log,
-		specIID:      g.Spec().IID,
-		branch:       intBranch,
-		baseName:     baseName,
-		agentArgv:    agentArgv,
-		warned:       make(map[graph.Key]bool),
-		claimWait:    DefaultClaimWait,
-		claimRecheck: DefaultClaimRecheck,
+		cfg:              cfg,
+		repo:             repo,
+		forge:            f,
+		forgeName:        forgeName,
+		g:                g,
+		sessions:         sessions,
+		template:         template,
+		workDir:          workDir,
+		intDir:           intDir,
+		log:              log,
+		specIID:          g.Spec().IID,
+		branch:           intBranch,
+		baseName:         baseName,
+		agentArgv:        agentArgv,
+		warned:           make(map[graph.Key]bool),
+		claimWait:        DefaultClaimWait,
+		claimRecheck:     DefaultClaimRecheck,
+		retained:         make(map[terminalID]*retainedTerminal),
+		retentionChanged: make(chan struct{}),
 	}
 }
 
@@ -148,6 +160,7 @@ type taskResult struct {
 // Run 是调度主循环：就绪即派、完成即放，直到全部同项目工作项
 // Closed/Integrated/Failed；无就绪且无在跑但图未完成时报停滞错误。
 func (s *Scheduler) Run(ctx context.Context) error {
+	s.reconcileRetained(ctx)
 	defer s.stopIntegrationAgent()
 	running := make(map[graph.Key]bool)
 	results := make(chan taskResult, s.cfg.Parallelism)
@@ -220,6 +233,9 @@ func (s *Scheduler) drain(ctx context.Context, running map[graph.Key]bool, resul
 
 // record 把一次结局写进图与运行数据并记录日志。
 func (s *Scheduler) record(res taskResult) {
+	// 结局到达主循环时，本轮工作任务已经结束；只有真正启动过终端的
+	// 任务才会因此得到 FinishedAt（预检失败的条目保持零值）。
+	s.runtime.finish(res.key, time.Now())
 	switch {
 	case res.integrated:
 		s.g.SetState(res.key, graph.Integrated)
@@ -381,20 +397,27 @@ func (s *Scheduler) tryMerge(ctx context.Context, branch string) error {
 func (s *Scheduler) resolveBaseConflict(ctx context.Context, files []string) error {
 	if s.intAddr == "" {
 		termName := s.intTermName()
-		addr, err := s.sessions.StartWorker(ctx, worker.Params{
-			SpecIID:  s.specIID,
-			IssueIID: s.specIID,
-			Name:     termName,
-			Worktree: s.intDir,
-			Argv:     s.agentArgv,
-		})
+		addr, reused, err := s.claimRetainedTerminal(ctx, s.g.Spec(), s.specIID, true, termName, s.intDir)
 		if err != nil {
-			return fmt.Errorf("start integration worker: %w", err)
+			return err
+		}
+		if !reused {
+			addr, err = s.sessions.StartWorker(ctx, worker.Params{
+				SpecIID:  s.specIID,
+				IssueIID: s.specIID,
+				Name:     termName,
+				Worktree: s.intDir,
+				Argv:     s.agentArgv,
+			})
+			if err != nil {
+				return fmt.Errorf("start integration worker: %w", err)
+			}
 		}
 		// 集成 agent 用 spec 的 key 与独立标签：任务的 key 是子任务，
 		// 不会与它冲突。地址在 boot 之前就公开：启动阶段最可能卡在
 		// 权限询问上，正是要人看的时候。
 		s.runtime.setAddr(s.g.Spec(), addr, termName, true)
+		s.runtime.start(s.g.Spec(), time.Now())
 		if _, err := s.sessions.AwaitBoot(ctx, addr); err != nil {
 			return fmt.Errorf("await integration worker boot: %w", err)
 		}
@@ -434,9 +457,17 @@ func (s *Scheduler) stopIntegrationAgent() {
 	if s.intAddr == "" {
 		return
 	}
+	// 不管终端最后是停止、保留还是留给人工排查，fastimpl 本轮使用它的
+	// 工作都已在 Run 收尾时结束。
+	s.runtime.finish(s.g.Spec(), time.Now())
 	if s.baseStuck {
 		s.log.Warn("integration worker left running for inspection",
 			"inspect", "hc attach "+s.intTermName())
+		return
+	}
+	delay, never := s.retentionPolicy()
+	if delay != 0 || never {
+		s.retainTerminal(s.g.Spec(), s.specIID, true, s.intAddr, s.intTermName(), s.intDir, s.branch, "")
 		return
 	}
 	if err := s.sessions.Stop(context.Background(), s.intAddr, s.specIID, s.intTermName()); err != nil {
@@ -640,38 +671,60 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	defer cancel(nil)
 	// 从这里开始，任何失败都可能留下一个存活的终端。
 	finish = finishKeep
-	addr, err = s.sessions.StartWorker(taskCtx, worker.Params{
-		SpecIID:  s.specIID,
-		IssueIID: iid,
-		Name:     termName,
-		Worktree: dir,
-		// agent 在外层工作区（work-dir）工作：其中可能还有它需要
-		// 参考的主 checkout 与其他目录；worktree 只作产出目录，
-		// 通过提示词告知。
-		Cwd:  s.workDir,
-		Argv: s.agentArgv,
-	})
+	var reused bool
+	addr, reused, err = s.claimRetainedTerminal(taskCtx, key, iid, false, termName, s.workDir)
 	if err != nil {
-		// 启动结果不明确：可能已有终端，保留两把锁让人工确认。
-		fail(fmt.Errorf("start worker: %w", err))
-		s.log.Warn("start worker failed; keeping the local lock and the claim marker", "key", key, "terminal", termName, "err", err)
+		fail(err)
 		return
+	}
+	if !reused {
+		addr, err = s.sessions.StartWorker(taskCtx, worker.Params{
+			SpecIID:  s.specIID,
+			IssueIID: iid,
+			Name:     termName,
+			Worktree: dir,
+			// agent 在外层工作区（work-dir）工作：其中可能还有它需要
+			// 参考的主 checkout 与其他目录；worktree 只作产出目录，
+			// 通过提示词告知。
+			Cwd:  s.workDir,
+			Argv: s.agentArgv,
+		})
+		if err != nil {
+			// 启动结果不明确：可能已有终端，保留两把锁让人工确认。
+			fail(fmt.Errorf("start worker: %w", err))
+			s.log.Warn("start worker failed; keeping the local lock and the claim marker", "key", key, "terminal", termName, "err", err)
+			return
+		}
 	}
 	s.log.Info("worker running", "key", key, "terminal", termName, "addr", addr)
 	// 地址在 StartWorker 成功后、AwaitBoot 之前公开：GUI 要能连上一个
 	// 还在启动、等着人处理权限弹窗的终端。
 	s.runtime.setAddr(key, addr, termName, false)
+	// 即使复用 retained terminal，也把这里视为本轮任务工作的开始；
+	// 原完成时长已经在上一轮保留期间展示过，不应并入本轮工作时长。
+	s.runtime.start(key, time.Now())
+	if err := lock.Update(lockContentWithTerminal(os.Getpid(), s.cfg.InstanceID, token, addr, termName)); err != nil {
+		s.log.Warn("update task lock terminal metadata failed", "key", key, "lock", lock.Path(), "err", err)
+	}
 	monitor := s.watchClaim(taskCtx, key, token, cancel)
 	defer monitor.stop()
-	// stopAndRelease 在确认终端已停止后把收尾策略降级为"直接释放"。
-	stopAndRelease := func() error {
+	// stopAndRelease 在任务成功整合后解除认领；terminal_retention 决定
+	// 终端是立即停止，还是保留一段时间后由后台/下次启动清理。
+	stopAndRelease := func(branch, commit string) error {
 		monitor.stop()
-		if err := s.stopWorker(addr, termName); err != nil {
-			return err
+		delay, never := s.retentionPolicy()
+		if delay == 0 && !never {
+			if err := s.stopWorker(addr, termName); err != nil {
+				return err
+			}
+			stopped = true
+			finish = finishNone
+			s.runtime.clearAddr(key)
+			return nil
 		}
 		stopped = true
 		finish = finishNone
-		s.runtime.clearAddr(key)
+		s.retainTerminal(key, iid, false, addr, termName, s.workDir, branch, commit)
 		return nil
 	}
 
@@ -749,9 +802,9 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 					s.taskFailed(taskCtx, key, "close issue", err, termName, &finish, &res, fail)
 					return
 				}
-				// 先退出 hc 进程再删 worktree：终端进程的 cwd 还在
-				// worktree 里，先停掉才不会引用已删除的目录。
-				if err := stopAndRelease(); err != nil {
+				// worktree 仍按原生命周期删除；retained terminal 主要用于回看
+				// 输出/交互，不承诺保留任务工作区。
+				if err := stopAndRelease(branch, commit); err != nil {
 					fail(fmt.Errorf("stop worker %s: %w", termName, err))
 					return
 				}

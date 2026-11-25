@@ -73,6 +73,24 @@ func AcquireTaskLock(repoDir string, iid int, content string) (*taskLock, error)
 
 func (l *taskLock) Path() string { return l.path }
 
+// Update 重写仍由本锁持有的元数据内容；只用于补充终端地址等排障信息，
+// 不改变锁语义。失败时调用方只告警，不影响任务。
+func (l *taskLock) Update(content string) error {
+	if l.file == nil {
+		return errors.New("task lock is already closed")
+	}
+	if _, err := l.file.Seek(0, 0); err != nil {
+		return err
+	}
+	if err := l.file.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := l.file.WriteString(content); err != nil {
+		return err
+	}
+	return l.file.Sync()
+}
+
 // Release 关闭自己持有的 fd 并删除锁文件，但只删自己创建的那个 inode：
 // 文件已被人工删除或换成新文件时不动别人的文件，并报错说明。
 func (l *taskLock) Release() error {
@@ -113,5 +131,11 @@ func (l *taskLock) Keep() {
 func lockContent(pid int, instanceID, token string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "pid=%d\ninstance_id=%s\nclaim=%s\n", pid, instanceID, token)
+	return b.String()
+}
+
+func lockContentWithTerminal(pid int, instanceID, token, addr, termName string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "pid=%d\ninstance_id=%s\nclaim=%s\nterminal_addr=%s\nterminal_name=%s\n", pid, instanceID, token, addr, termName)
 	return b.String()
 }

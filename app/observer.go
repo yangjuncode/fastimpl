@@ -7,6 +7,7 @@ import (
 	"io"
 	"path/filepath"
 
+	"github.com/yangjuncode/fastimpl/config"
 	"github.com/yangjuncode/fastimpl/graph"
 	"github.com/yangjuncode/fastimpl/scheduler"
 	"github.com/yangjuncode/fastimpl/worktree"
@@ -22,6 +23,9 @@ type AttachTerminal func(ctx context.Context, addr string, cols, rows int) (io.R
 // 也绝不在界面线程上做 IO；实现方应当快速返回，需要 UI 更新就转投
 // 到自己的调度队列。
 type Observer struct {
+	// ConfigLoaded 在配置分层读取与命令行覆盖完成后、任何仓库/forge
+	// 工作开始前调用。GUI 用它决定是否启用运行日志文件。
+	ConfigLoaded func(config.Config)
 	// Progress 接收建图的阶段与计数，目标数随闭包展开动态增长。
 	Progress func(graph.BuildProgress)
 	// GraphReady 在依赖图建好、任何写入或调度启动之前调用。
@@ -67,7 +71,7 @@ func IsRepositoryError(err error) bool {
 // observing 报告观察者是否想跟随这次运行。只读的 -print 用零值
 // Observer，因此不需要任何额外行为。
 func (o Observer) observing() bool {
-	return o.Progress != nil || o.GraphReady != nil || o.BeforeSchedule != nil || o.SchedulerReady != nil
+	return o.ConfigLoaded != nil || o.Progress != nil || o.GraphReady != nil || o.BeforeSchedule != nil || o.SchedulerReady != nil
 }
 
 // verifyRepoRoot 确认 dir 本身就是 git 仓库顶层。git 命令在子目录里

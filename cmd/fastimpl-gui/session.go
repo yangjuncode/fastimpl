@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/yangjuncode/fastimpl/app"
+	"github.com/yangjuncode/fastimpl/config"
 	"github.com/yangjuncode/fastimpl/graph"
 	"github.com/yangjuncode/fastimpl/scheduler"
 )
@@ -21,6 +24,10 @@ const refreshInterval = 400 * time.Millisecond
 
 // logLines 是界面保留的运行日志行数。
 const logLines = 200
+
+// logFileReadBytes 是从持久日志文件读回展示内容的上限。它保护 GUI
+// 不被长期累积的大文件拖慢；最终仍只保留最近 logLines 行。
+const logFileReadBytes = 64 * 1024
 
 // phase 是一次运行在界面上的阶段。
 type phase int
@@ -263,6 +270,12 @@ func (s *session) Start(opts app.Options) error {
 	s.running = true
 	s.cancel = cancel
 	s.opts = opts
+	if s.writer != nil {
+		// 上一次运行的 cleanup 日志在两次运行之间仍可能写入旧文件；开始
+		// 新运行时关闭旧句柄，避免每次运行泄漏一个文件描述符。旧 writer
+		// 之后的写入会降级为只更新内存快照，不再进入新文件。
+		s.writer.closeFile()
+	}
 	s.writer = &lineWriter{}
 	s.phase = phaseStarting
 	s.message = "正在加载配置、解析仓库"
@@ -370,7 +383,11 @@ func (s *session) run(ctx context.Context, opts app.Options) {
 	// 个子 ctx 的话 pump 会一直 tick 下去。
 	pumpCtx, stopPump := context.WithCancel(ctx)
 	defer stopPump()
+	// 从运行一开始就刷新：配置、仓库解析与建图阶段的日志也属于本次
+	// 运行，不能等 scheduler ready 后才突然补进界面。
+	go s.pump(pumpCtx)
 	observer := app.Observer{
+		ConfigLoaded: s.configureLogFile,
 		Progress: func(p graph.BuildProgress) {
 			s.mu.Lock()
 			s.phase = phaseBuilding
@@ -411,7 +428,6 @@ func (s *session) run(ctx context.Context, opts app.Options) {
 			if onChange != nil {
 				onChange()
 			}
-			go s.pump(pumpCtx)
 		},
 	}
 	err := s.runPipeline(ctx, opts, writer, observer)
@@ -471,7 +487,7 @@ func (s *session) runPipeline(ctx context.Context, opts app.Options, writer io.W
 	return app.RunObserved(ctx, opts, io.Discard, writer, observer)
 }
 
-// pump 是本地合并刷新循环：把 scheduler 快照与图状态同步进界面状态。
+// pump 是本地合并刷新循环：把运行日志、scheduler 快照与图状态同步进界面状态。
 // 它只读内存，不发任何网络请求，也不在持锁时做 IO。
 func (s *session) pump(ctx context.Context) {
 	ticker := time.NewTicker(refreshInterval)
@@ -500,8 +516,12 @@ func (s *session) update() {
 // 到指针、放锁、再读，避免持着自己的锁去等别的锁。
 func (s *session) refresh() bool {
 	s.mu.Lock()
-	sched, g := s.sched, s.g
+	sched, g, writer := s.sched, s.g, s.writer
 	s.mu.Unlock()
+	var log []string
+	if writer != nil {
+		log = writer.lines()
+	}
 	var status []scheduler.TaskRuntime
 	if sched != nil {
 		status = sched.Status()
@@ -516,10 +536,11 @@ func (s *session) refresh() bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if sameStatus(s.status, status) && sameNodes(s.nodes, nodes) && sameSpec(s.spec, spec) && sameKeys(s.ready, ready) {
+	if sameStatus(s.status, status) && sameNodes(s.nodes, nodes) && sameSpec(s.spec, spec) && sameKeys(s.ready, ready) && sameStrings(s.log, log) {
 		return false
 	}
 	s.status, s.nodes, s.spec, s.ready = status, nodes, spec, ready
+	s.log = log
 	s.rev++
 	return true
 }
@@ -540,6 +561,19 @@ func readyKeys(g *graph.Graph) []graph.Key {
 
 // sameKeys 比较两份节点身份快照。
 func sameKeys(a, b []graph.Key) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameStrings 比较两份字符串快照。
+func sameStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -615,11 +649,14 @@ func progressMessage(p graph.BuildProgress) string {
 	return "正在建依赖图"
 }
 
-// lineWriter 收集运行日志：按行切分，只留最近 logLines 行。
+// lineWriter 收集运行日志：按行切分，只留最近 logLines 行；配置
+// log_file 后同时把完整行 append 到文件。文件写入失败只降级为内存日志，
+// 绝不让日志后端反过来打断任务运行。
 type lineWriter struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-	out []string
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	out  []string
+	file *os.File
 }
 
 // Write 实现 io.Writer。
@@ -635,18 +672,65 @@ func (w *lineWriter) Write(p []byte) (int, error) {
 			w.buf.WriteString(line)
 			return len(p), nil
 		}
-		w.add(strings.TrimRight(line, "\r\n"))
+		w.addLocked(strings.TrimRight(line, "\r\n"))
 	}
 }
 
-// add 追加一行并裁剪历史。
-func (w *lineWriter) add(line string) {
-	if strings.TrimSpace(line) == "" {
-		return
+// attachFile 把既有日志尾部放到内存历史前面，并启用后续 append。
+func (w *lineWriter) attachFile(file *os.File, tail []string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(tail) > 0 {
+		merged := make([]string, 0, len(tail)+len(w.out))
+		merged = append(merged, tail...)
+		merged = append(merged, w.out...)
+		if len(merged) > logLines {
+			merged = append([]string(nil), merged[len(merged)-logLines:]...)
+		}
+		w.out = merged
 	}
+	w.file = file
+}
+
+// warnLocked 追加一条 GUI 自己的警告；它不写入文件，避免在文件后端
+// 失败时递归触发第二次写失败。调用方必须持有 w.mu。
+func (w *lineWriter) warnLocked(msg string, err error) {
+	line := fmt.Sprintf("time=%s level=WARN msg=%q err=%q", time.Now().Format(time.RFC3339), msg, err.Error())
+	w.appendMemoryLocked(line)
+}
+
+// appendMemoryLocked 追加一行并裁剪历史。调用方必须持有 w.mu。
+func (w *lineWriter) appendMemoryLocked(line string) {
 	w.out = append(w.out, line)
 	if len(w.out) > logLines {
 		w.out = append([]string(nil), w.out[len(w.out)-logLines:]...)
+	}
+}
+
+// addLocked 追加一行并裁剪历史；文件 append 与内存行保持同样内容。
+// 调用方必须持有 w.mu。
+func (w *lineWriter) addLocked(line string) {
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+	w.appendMemoryLocked(line)
+	if w.file == nil {
+		return
+	}
+	if _, err := fmt.Fprintln(w.file, line); err != nil {
+		_ = w.file.Close()
+		w.file = nil
+		w.warnLocked("log file write failed; continuing with in-memory logs", err)
+	}
+}
+
+// closeFile 关闭持久日志后端；之后的写仍保留在内存里。
+func (w *lineWriter) closeFile() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file != nil {
+		_ = w.file.Close()
+		w.file = nil
 	}
 }
 
@@ -655,4 +739,95 @@ func (w *lineWriter) lines() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return append([]string(nil), w.out...)
+}
+
+// readLogTail 只读文件尾部 maxBytes 字节，再从其中取最后 maxLines 个
+// 非空行。第一行若在窗口中间被截断则丢弃，避免把半行当完整日志展示。
+func readLogTail(path string, maxLines int, maxBytes int64) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := info.Size()
+	if size == 0 {
+		return nil, nil
+	}
+	start := int64(0)
+	if size > maxBytes {
+		start = size - maxBytes
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	text := string(data)
+	if start > 0 {
+		if i := strings.IndexByte(text, '\n'); i >= 0 {
+			text = text[i+1:]
+		} else {
+			return nil, nil
+		}
+	}
+	rawLines := strings.Split(text, "\n")
+	lines := make([]string, 0, min(len(rawLines), maxLines))
+	for _, line := range rawLines {
+		line = strings.TrimRight(line, "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) > maxLines {
+		lines = append([]string(nil), lines[len(lines)-maxLines:]...)
+	}
+	return lines, nil
+}
+
+// configureLogFile 在配置加载后启用持久运行日志。相对路径按本次运行
+// 的 WorkDir 解析；文件不存在按空历史处理，读写失败只在日志里降级提示。
+func (s *session) configureLogFile(cfg config.Config) {
+	name := strings.TrimSpace(cfg.LogFile)
+	if name == "" {
+		return
+	}
+	path := filepath.Clean(name)
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(cfg.WorkDir, path)
+	}
+	tail, readErr := readLogTail(path, logLines, logFileReadBytes)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		tail = nil
+	}
+	file, openErr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	s.mu.Lock()
+	writer := s.writer
+	s.mu.Unlock()
+	if writer == nil {
+		if file != nil {
+			_ = file.Close()
+		}
+		return
+	}
+	if openErr != nil {
+		writer.mu.Lock()
+		writer.warnLocked("unable to open log file; continuing with in-memory logs", openErr)
+		writer.mu.Unlock()
+		s.update()
+		return
+	}
+	writer.attachFile(file, tail)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		writer.mu.Lock()
+		writer.warnLocked("unable to read the existing log tail", readErr)
+		writer.mu.Unlock()
+	}
+	s.update()
 }

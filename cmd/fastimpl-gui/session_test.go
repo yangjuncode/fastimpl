@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -229,6 +232,172 @@ func TestSessionRunCancelIsNotSuccess(t *testing.T) {
 	}
 	if snap.Message == "" || snap.Message == "全部任务已集成" {
 		t.Fatalf("message = %q, want it to say the run was stopped", snap.Message)
+	}
+}
+
+// 日志必须在运行期间进入快照，而不是等 run 返回后才一次性出现。
+func TestSessionLogStreamsWhileRunIsActive(t *testing.T) {
+	s := newSession()
+	changes := make(chan struct{}, 32)
+	s.SetOnChange(func() {
+		select {
+		case changes <- struct{}{}:
+		default:
+		}
+	})
+	release := make(chan struct{})
+	s.runFn = func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		g := testGraph()
+		if obs.SchedulerReady != nil {
+			obs.SchedulerReady(testScheduler(g), nil)
+		}
+		_, _ = io.WriteString(w, "time=2026-11-25T17:20:03+08:00 level=INFO msg=\"worker started\" key=1!9\n")
+		<-release
+		return nil
+	}
+	if err := s.Start(app.Options{SpecIID: 8}); err != nil {
+		t.Fatal(err)
+	}
+	snap := waitCondition(t, s, "the live log line", func(snap snapshot) bool {
+		for _, line := range snap.Log {
+			if strings.Contains(line, "worker started") {
+				return true
+			}
+		}
+		return false
+	})
+	if !snap.Running {
+		t.Fatal("the log line appeared only after the run ended")
+	}
+	close(release)
+	waitDone(t, s, changes)
+}
+
+// pump 不能只服务 scheduler：配置/仓库/建图阶段的早期日志也必须实时可见。
+func TestSessionLogStreamsBeforeSchedulerIsReady(t *testing.T) {
+	s := newSession()
+	releaseGraph := make(chan struct{})
+	releaseRun := make(chan struct{})
+	s.runFn = func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		_, _ = io.WriteString(w, "time=2026-11-25T17:20:03+08:00 level=INFO msg=\"building graph\"\n")
+		<-releaseGraph
+		g := testGraph()
+		if obs.SchedulerReady != nil {
+			obs.SchedulerReady(testScheduler(g), nil)
+		}
+		<-releaseRun
+		return nil
+	}
+	if err := s.Start(app.Options{SpecIID: 8}); err != nil {
+		t.Fatal(err)
+	}
+	snap := waitCondition(t, s, "the early graph-building log line", func(snap snapshot) bool {
+		for _, line := range snap.Log {
+			if strings.Contains(line, "building graph") {
+				return true
+			}
+		}
+		return false
+	})
+	if !snap.Running {
+		t.Fatal("the early log appeared only after the run ended")
+	}
+	close(releaseGraph)
+	close(releaseRun)
+}
+
+// 配置 log_file 后：先限量读入既有文件尾部，再把本次运行日志 append 到同一文件。
+func TestSessionLogFileTailIsLoadedAndAppended(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "run.log")
+	var existing strings.Builder
+	for i := range 230 {
+		fmt.Fprintf(&existing, "old-%03d\n", i)
+	}
+	if err := os.WriteFile(path, []byte(existing.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newSession()
+	changes := make(chan struct{}, 32)
+	s.SetOnChange(func() {
+		select {
+		case changes <- struct{}{}:
+		default:
+		}
+	})
+	release := make(chan struct{})
+	s.runFn = func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		if obs.ConfigLoaded == nil {
+			return errors.New("the GUI observer lost ConfigLoaded")
+		}
+		obs.ConfigLoaded(config.Config{WorkDir: dir, LogFile: "run.log"})
+		g := testGraph()
+		if obs.SchedulerReady != nil {
+			obs.SchedulerReady(testScheduler(g), nil)
+		}
+		_, _ = io.WriteString(w, "time=2026-11-25T17:20:04+08:00 level=INFO msg=\"new line\"\n")
+		<-release
+		return nil
+	}
+	if err := s.Start(app.Options{SpecIID: 8}); err != nil {
+		t.Fatal(err)
+	}
+	snap := waitCondition(t, s, "the appended log line", func(snap snapshot) bool {
+		for _, line := range snap.Log {
+			if strings.Contains(line, "new line") {
+				return true
+			}
+		}
+		return false
+	})
+	joined := strings.Join(snap.Log, "\n")
+	if strings.Contains(joined, "old-000") {
+		t.Fatalf("the snapshot read too much of the existing log; first lines = %.200s", joined)
+	}
+	if !strings.Contains(joined, "old-229") {
+		t.Fatalf("the snapshot lost the tail of the existing log; lines = %v", snap.Log)
+	}
+	close(release)
+	waitDone(t, s, changes)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.HasPrefix(text, "old-000\n") {
+		t.Fatal("the existing log file was rewritten instead of appended")
+	}
+	if !strings.HasSuffix(text, "new line\"\n") {
+		t.Fatalf("the live line was not appended to the log file; tail = %q", text[max(0, len(text)-160):])
+	}
+	if got := len(strings.Split(strings.TrimSuffix(text, "\n"), "\n")); got != 231 {
+		t.Fatalf("log file lines = %d, want 230 existing + 1 appended", got)
+	}
+}
+
+// 大文件只按字节窗口读尾部；窗口第一行若是半行必须丢弃，避免把截断内容当完整日志。
+func TestReadLogTailUsesByteWindowAndDropsPartialLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.log")
+	line := strings.Repeat("x", 100)
+	var content strings.Builder
+	for range 800 {
+		content.WriteString(line)
+		content.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, []byte(content.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lines, err := readLogTail(path, logLines, logFileReadBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != logLines {
+		t.Fatalf("tail lines = %d, want the capped %d", len(lines), logLines)
+	}
+	for i, got := range lines {
+		if got != line {
+			t.Fatalf("line %d is incomplete: len=%d, want %d", i, len(got), len(line))
+		}
 	}
 }
 

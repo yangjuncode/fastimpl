@@ -97,6 +97,9 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 		cfg.Parallelism = opts.Parallelism
 	}
 	cfg.SpecIID = opts.SpecIID
+	if observer.ConfigLoaded != nil {
+		observer.ConfigLoaded(cfg)
+	}
 	repoDir, err := resolveRepoDir(ctx, opts.RepoDir, cfg.RepoDir, workDir)
 	if err != nil {
 		return repoError(opts.RepoDir, err)
@@ -187,7 +190,12 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	if err != nil {
 		return err
 	}
-	defer runner.Close()
+	closeRunner := true
+	defer func() {
+		if closeRunner {
+			_ = runner.Close()
+		}
+	}()
 	log.Info("integration ready", "branch", branch, "mr", mrURL)
 	log.Info("scheduler started", "parallelism", cfg.Parallelism, "agent", agentArgv)
 	sched := scheduler.New(cfg, repo, fc, forge, g, runner, tmpl, workDir, intDir, branch, baseName, agentArgv, log)
@@ -196,7 +204,17 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 		// 起来之前就装上自己的刷新循环与终端连接方式。
 		observer.SchedulerReady(sched, viewerAttach(cfg.HcBinary, cfg.HcSocket))
 	}
-	return sched.Run(ctx)
+	runErr := sched.Run(ctx)
+	if sched.RetentionPending() {
+		// delayed terminal 的清理定时器还要使用这条 hc 控制连接；Run 返回后
+		// 由后台 goroutine 等最后一次清理结束再关闭，不阻塞 GUI/CLI 退出。
+		closeRunner = false
+		go func() {
+			sched.WaitRetention()
+			_ = runner.Close()
+		}()
+	}
+	return runErr
 }
 
 // viewerAttach 返回用与调度同源的 hc 配置打开观看流的方式。每次

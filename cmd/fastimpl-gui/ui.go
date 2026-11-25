@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nsgo-dev/nsgo/base/camera"
 	"github.com/nsgo-dev/nsgo/base/terminal"
@@ -49,8 +50,15 @@ type model struct {
 	// settingsOpen 控制设置对话框；settings 持有配置与提示词编辑状态。
 	settingsOpen *core.Signal[bool]
 	settings     *settingsModel
-	// tab 是当前选中的页面：pageGraph 或某个终端页的 ID。
+	// tab 是当前选中的页面：pageGraph、pageLog 或某个终端页的 ID。
 	tab *core.Signal[string]
+	// now 是界面时钟：tooltip 里的工作时长每秒随它刷新。
+	now *core.Signal[time.Time]
+	// logScroll/logFollowing/logLastY 让日志页在用户位于底部时跟随
+	// 新日志，在用户向上翻阅时不把它拽回底部。
+	logScroll    *core.Ref
+	logFollowing *core.Signal[bool]
+	logLastY     core.Points
 	// selected 是图上选中的节点 ID。
 	selected *core.Signal[string]
 
@@ -68,8 +76,11 @@ type model struct {
 	posted  bool
 }
 
-// pageGraph 是依赖图页的标识，也是 tab 的第一项。
-const pageGraph = "graph"
+// pageGraph 是依赖图页的标识，也是 tab 的第一项；pageLog 是运行日志页。
+const (
+	pageGraph = "graph"
+	pageLog   = "log"
+)
 
 // newModel 组装界面模型：它接管会话的事件，并在界面线程上合并刷新。
 func newModel(cx *core.Scope, s *session, opts app.Options) *model {
@@ -85,8 +96,19 @@ func newModel(cx *core.Scope, s *session, opts app.Options) *model {
 		selected:     core.NewSignal(cx, ""),
 		cam:          &camera.State{},
 		flowState:    &uiflow.State{},
+		now:          core.NewSignal(cx, cx.WallTime()),
+		logScroll:    &core.Ref{},
+		logFollowing: core.NewSignal(cx, true),
 	}
 	m.post = cx.Post
+	// 轻量界面时钟只更新一个信号；tooltip 通过它重算工作时长。root scope
+	// 销毁时 AfterFunc 链随之停止，测试里的 manual clock 也能控制它。
+	var tick func()
+	tick = func() {
+		m.now.Set(cx.WallTime())
+		cx.AfterFunc(time.Second, tick)
+	}
+	cx.AfterFunc(time.Second, tick)
 	m.settings = newSettingsModel(cx)
 	m.terms = newTerminals(s, m.notify)
 	if opts.SpecIID > 0 {
@@ -435,13 +457,17 @@ func (m *model) tabs() core.Node {
 	colors := ui.ColorsOf(m.cx)
 	options := func() []ui.Option[string] {
 		m.snapshot()
-		opts := []ui.Option[string]{{Value: pageGraph, Label: "依赖图", Icon: lucide.Workflow}}
+		opts := []ui.Option[string]{
+			{Value: pageGraph, Label: "依赖图", Icon: lucide.Workflow, TestID: "tab-graph"},
+			{Value: pageLog, Label: "日志", Icon: lucide.ScrollText, TestID: "tab-log"},
+		}
 		for _, tab := range m.terms.tabs {
-			label := tab.Label
-			if label == "" {
-				label = tab.ID()
-			}
-			opts = append(opts, ui.Option[string]{Value: tab.ID(), Label: label, Icon: lucide.SquareTerminal})
+			opts = append(opts, ui.Option[string]{
+				Value:     tab.ID(),
+				LabelFunc: func() string { return m.terminalTabTitle(tab) },
+				Content:   m.terminalTabContent(tab),
+				TestID:    "terminal-tab-" + tab.ID(),
+			})
 		}
 		return opts
 	}
@@ -459,8 +485,209 @@ func (m *model) body() core.Node {
 		Children: []core.Node{core.Show{
 			When: func() bool { return m.tab.Get() == pageGraph },
 			Then: func(cx *core.Scope) core.Node { return m.graphPage() },
-			Else: func(cx *core.Scope) core.Node { return m.terminalPage() },
+			Else: func(cx *core.Scope) core.Node {
+				return core.Show{
+					When: func() bool { return m.tab.Get() == pageLog },
+					Then: func(cx *core.Scope) core.Node { return m.logPage() },
+					Else: func(cx *core.Scope) core.Node { return m.terminalPage() },
+				}
+			},
 		}}}
+}
+
+// terminalRuntime 读取一个终端页对应的运行数据；读取 rev，因此调用它的
+// 标签/tooltip 会随 scheduler 状态刷新。
+func (m *model) terminalRuntime(key graph.Key) (scheduler.TaskRuntime, bool) {
+	m.rev.Get()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rt, ok := m.runtime[key]
+	return rt, ok
+}
+
+// terminalTabTitle 是用户确认的终端页标题：issue 号 + 开始时分秒。
+// 集成分支 agent 没有任务 issue，因此保留“集成”前缀以区别于普通 worker。
+func (m *model) terminalTabTitle(tab *termTab) string {
+	base := fmt.Sprintf("#%d", tab.Key.IID)
+	if tab.Intg {
+		base = "集成 " + base
+	}
+	rt, ok := m.terminalRuntime(tab.Key)
+	if !ok || rt.StartedAt.IsZero() {
+		return base
+	}
+	return base + " · " + rt.StartedAt.Format("15:04:05")
+}
+
+// terminalTabContent 是终端 tab 的自定义内容：视觉上是图标与动态标题，
+// hover/键盘聚焦时显示动态详细信息 tooltip。
+func (m *model) terminalTabContent(tab *termTab) core.Node {
+	trigger := core.View{Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: 6},
+		Children: []core.Node{
+			ui.Icon(lucide.SquareTerminal, 14, ui.Inherited),
+			core.Text{ContentFunc: func() string { return m.terminalTabTitle(tab) }, MaxLines: 1},
+		}}
+	return ui.Tooltip{TextFunc: func() string { return m.terminalTooltip(tab) }, Trigger: trigger,
+		TestID: "terminal-tooltip-" + tab.ID()}
+}
+
+// terminalTooltip 组出一个终端的详细信息。所有字段都来自快照副本；
+// 运行中时长时间读取界面时钟信号，因此 tooltip 打开时也会每秒更新。
+func (m *model) terminalTooltip(tab *termTab) string {
+	now := m.now.Get()
+	m.rev.Get()
+	m.mu.Lock()
+	rt, rtOK := m.runtime[tab.Key]
+	node, nodeOK := m.nodes[tab.Key]
+	spec := m.snap.Spec
+	m.mu.Unlock()
+
+	title := ""
+	if nodeOK {
+		title = node.Title
+	}
+	if tab.Intg && tab.Key == spec.Key {
+		title = spec.Title
+	}
+	if title == "" {
+		title = "（无标题）"
+	}
+	if !rtOK {
+		rt = scheduler.TaskRuntime{Key: tab.Key, Addr: tab.Addr, Label: tab.Label, Integration: tab.Intg}
+	}
+	kind := "任务 worker"
+	if tab.Intg {
+		kind = "集成分支 agent"
+	}
+	lines := []string{
+		"类型：" + kind,
+		fmt.Sprintf("Issue：#%d", tab.Key.IID),
+		"标题：" + title,
+		"开始时间：" + formatLogTime(rt.StartedAt),
+		"已工作时间：" + terminalWorkTime(rt, now),
+	}
+	if !rt.FinishedAt.IsZero() {
+		lines = append(lines, "结束时间："+formatLogTime(rt.FinishedAt))
+	}
+	label := rt.Label
+	if label == "" {
+		label = tab.Label
+	}
+	addr := rt.Addr
+	if addr == "" {
+		addr = tab.Addr
+	}
+	if label != "" {
+		lines = append(lines, "hc 终端："+label)
+	}
+	if addr != "" {
+		lines = append(lines, "hc 地址："+addr)
+	}
+	if label != "" {
+		lines = append(lines, "连接：hc attach "+label)
+	}
+	if rt.Accepted != "" {
+		commit := rt.Accepted
+		if len(commit) > 12 {
+			commit = commit[:12]
+		}
+		lines = append(lines, "已接受提交："+commit)
+	}
+	if rt.Attention != "" {
+		lines = append(lines, "需要注意："+attentionSummary(rt.Attention))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// formatLogTime 是 tooltip 里完整时间的稳定格式。
+func formatLogTime(t time.Time) string {
+	if t.IsZero() {
+		return "未开始"
+	}
+	return t.Format("2006-01-02 15:04:05")
+}
+
+// terminalWorkTime 计算工作时长：运行中算到界面时钟，结束后固定到
+// FinishedAt。时钟万一倒退则按 0 秒显示，不出负数。
+func terminalWorkTime(rt scheduler.TaskRuntime, now time.Time) string {
+	if rt.StartedAt.IsZero() {
+		return "未开始"
+	}
+	end := now
+	if !rt.FinishedAt.IsZero() {
+		end = rt.FinishedAt
+	}
+	if end.Before(rt.StartedAt) {
+		end = rt.StartedAt
+	}
+	return formatWorkDuration(end.Sub(rt.StartedAt))
+}
+
+// formatWorkDuration 用中文短格式展示秒级时长。
+func formatWorkDuration(d time.Duration) string {
+	seconds := max(int(d/time.Second), 0)
+	hours := seconds / 3600
+	minutes := seconds % 3600 / 60
+	seconds %= 60
+	switch {
+	case hours > 0:
+		return fmt.Sprintf("%d小时%d分%d秒", hours, minutes, seconds)
+	case minutes > 0:
+		return fmt.Sprintf("%d分%d秒", minutes, seconds)
+	default:
+		return fmt.Sprintf("%d秒", seconds)
+	}
+}
+
+// logScrolled 跟踪用户是否留在日志底部：向上翻阅暂停跟随，回到底部恢复。
+func (m *model) logScrolled(e core.ScrollEvent) {
+	end := e.Offset.Y+e.Size.Height >= e.ContentSize.Height-2
+	switch {
+	case end:
+		m.logFollowing.Set(true)
+	case e.Offset.Y < m.logLastY-1:
+		m.logFollowing.Set(false)
+	}
+	m.logLastY = e.Offset.Y
+}
+
+// logGrown 在日志内容高度变化后保持底部跟随。
+func (m *model) logGrown(core.Bounds) {
+	if m.logFollowing.GetUntracked() {
+		m.logScroll.ScrollToEnd(false)
+	}
+}
+
+// logPage 是运行日志页。日志正文用等宽字体整块展示；快照最多保留最近
+// logLines 行，持久文件是否启用由设置里的 log_file 决定。
+func (m *model) logPage() core.Node {
+	colors := ui.ColorsOf(m.cx)
+	return core.View{TestID: "log-page", Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0), Direction: core.Column, Overflow: core.Hidden},
+		Children: []core.Node{
+			core.View{StyleFunc: func() core.Style {
+				return core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: 8, Padding: core.Symmetric(7, 12),
+					Borders: core.Edges{Bottom: 1}, BorderColor: colors.Border(), Background: colors.Surface()}
+			}, Children: []core.Node{
+				ui.Text("运行日志", 12, ui.Medium, colors.Text),
+				core.Text{ContentFunc: func() string { return fmt.Sprintf("最近 %d 行", len(m.snapshot().Log)) },
+					MaxLines: 1, Style: ui.TypeCaption, StyleFunc: ui.Colored(colors.Muted), TestID: "log-count"},
+				ui.Spacer{},
+				core.Text{Content: "在底部时自动跟随新日志；向上翻阅会暂停跟随", MaxLines: 1,
+					Style: ui.TypeCaption, StyleFunc: ui.Colored(colors.Muted)},
+			}},
+			core.Scroll{Ref: m.logScroll, OnScroll: m.logScrolled, TestID: "log-scroll",
+				Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0)},
+				Children: []core.Node{core.View{OnLayout: m.logGrown,
+					Style: core.Style{Padding: core.All(12), MinWidth: core.Pct(100)},
+					Children: []core.Node{core.Text{ContentFunc: func() string {
+						lines := m.snapshot().Log
+						if len(lines) == 0 {
+							return "暂无运行日志"
+						}
+						return strings.Join(lines, "\n")
+					}, Style: ui.TypeCode.Merge(core.Style{MinWidth: core.Pct(100)}), StyleFunc: ui.Colored(colors.Text), TestID: "log-lines"}}},
+				}},
+		}}
 }
 
 // graphPage 是依赖图页：可平移缩放的画布、缩放工具条与图例。

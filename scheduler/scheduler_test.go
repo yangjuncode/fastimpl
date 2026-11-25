@@ -216,6 +216,7 @@ type fakeSessions struct {
 	startErr error
 	stopErr  error
 	stops    []string
+	records  map[string]worker.Record
 }
 
 func (f *fakeSessions) StartWorker(ctx context.Context, p worker.Params) (string, error) {
@@ -225,12 +226,28 @@ func (f *fakeSessions) StartWorker(ctx context.Context, p worker.Params) (string
 		return "", f.startErr
 	}
 	f.nextID++
+	addr := fmt.Sprintf("t%d", f.nextID)
 	f.started = append(f.started, p)
-	return fmt.Sprintf("t%d", f.nextID), nil
+	name := p.Name
+	if name == "" {
+		name = fmt.Sprintf("fastimpl-%d-%d", p.SpecIID, p.IssueIID)
+	}
+	if f.records == nil {
+		f.records = map[string]worker.Record{}
+	}
+	f.records[addr] = worker.Record{Live: true, Status: "idle", Reported: true, Name: name, Labels: map[string]string{
+		"fastimpl": fmt.Sprintf("%d", p.SpecIID), "task": name,
+	}}
+	return addr, nil
 }
 
 func (f *fakeSessions) Snapshot(ctx context.Context, addr string) (worker.Record, error) {
-	return worker.Record{Live: true, Status: "idle", Reported: true}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r, ok := f.records[addr]; ok {
+		return r, nil
+	}
+	return worker.Record{}, fmt.Errorf("terminal %s not found", addr)
 }
 
 func (f *fakeSessions) ReadScreen(ctx context.Context, addr string, lines int) (string, bool, error) {
@@ -247,6 +264,10 @@ func (f *fakeSessions) Stop(ctx context.Context, addr string, specIID int, taskN
 		return f.stopErr
 	}
 	f.stops = append(f.stops, addr)
+	if r, ok := f.records[addr]; ok {
+		r.Live = false
+		f.records[addr] = r
+	}
 	return nil
 }
 

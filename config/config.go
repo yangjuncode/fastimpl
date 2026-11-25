@@ -29,6 +29,10 @@ const DefaultConfig = `# fastimpl 配置（TOML）
 
 # parallelism = 8                  # 同时运行的 worker 上限（默认 max(NumCPU-1, 8)）
 # retries = 8                      # 单个任务首次尝试之外的续写重试次数
+# terminal_retention = "0s"        # 成功任务终端保留时长：0s 立即销毁；
+#                                # "10m"/"1h" 延迟销毁；"never" 不自动销毁
+# log_file = "fastimpl.log"       # GUI 运行日志追加保存文件；默认空不保存。
+#                                # 相对路径按 work-dir 解析，GUI 只限量读回尾部
 # forge = "gitlab"                 # 上游 forge：gitlab|github；默认按 origin
 #                                # 主机名推断，推断不出用 glab 探测，最后按 gitlab
 # repo_dir = "/abs/path/to/repo"   # 目标仓库主 checkout（也可 -repo-dir；
@@ -108,21 +112,29 @@ type Config struct {
 	SpecIID int
 	// ResumeBudget 是暂停后等待用户推进的时限。
 	ResumeBudget time.Duration
+	// TerminalRetention 是成功任务终端的保留策略："0s" 立即销毁，
+	// Go duration（如 "10m"）延迟销毁，"never" 不自动销毁。
+	TerminalRetention string
+	// LogFile 是 GUI 运行日志追加保存文件。空表示不保存；相对路径按
+	// WorkDir 解析。GUI 只读回尾部用于展示，避免大文件拖慢启动。
+	LogFile string
 }
 
 // rawConfig 区分"未配置"与显式零值，使 retries = 0 不被默认值覆盖。
 type rawConfig struct {
-	Parallelism   *int    `toml:"parallelism"`
-	Retries       *int    `toml:"retries"`
-	RepoDir       *string `toml:"repo_dir"`
-	TreeDir       *string `toml:"tree_dir"`
-	AgentCmd      *string `toml:"agent_cmd"`
-	Integration   *string `toml:"integration"`
-	RequireReview *bool   `toml:"require_review"`
-	HcBinary      *string `toml:"hc_binary"`
-	HcSocket      *string `toml:"hc_socket"`
-	Forge         *string `toml:"forge"`
-	InstanceID    *string `toml:"instance_id"`
+	Parallelism       *int    `toml:"parallelism"`
+	Retries           *int    `toml:"retries"`
+	RepoDir           *string `toml:"repo_dir"`
+	TreeDir           *string `toml:"tree_dir"`
+	AgentCmd          *string `toml:"agent_cmd"`
+	Integration       *string `toml:"integration"`
+	RequireReview     *bool   `toml:"require_review"`
+	HcBinary          *string `toml:"hc_binary"`
+	HcSocket          *string `toml:"hc_socket"`
+	Forge             *string `toml:"forge"`
+	InstanceID        *string `toml:"instance_id"`
+	TerminalRetention *string `toml:"terminal_retention"`
+	LogFile           *string `toml:"log_file"`
 }
 
 // defaultParallelism 是未配置 parallelism 时的并发上限。
@@ -201,16 +213,18 @@ func splitCmd(s string) ([]string, error) {
 // workDirCopy 是写入工作目录 fastimpl.toml 的完整生效副本。InstanceID
 // 有意不在其中：机器标识只从 exe 同目录的全局层读取，项目目录不能覆盖。
 type workDirCopy struct {
-	Parallelism   int    `toml:"parallelism"`
-	Retries       int    `toml:"retries"`
-	Forge         string `toml:"forge"`
-	RepoDir       string `toml:"repo_dir"`
-	TreeDir       string `toml:"tree_dir"`
-	AgentCmd      string `toml:"agent_cmd"`
-	Integration   string `toml:"integration"`
-	RequireReview bool   `toml:"require_review"`
-	HcSocket      string `toml:"hc_socket"`
-	HcBinary      string `toml:"hc_binary"`
+	Parallelism       int    `toml:"parallelism"`
+	Retries           int    `toml:"retries"`
+	Forge             string `toml:"forge"`
+	RepoDir           string `toml:"repo_dir"`
+	TreeDir           string `toml:"tree_dir"`
+	AgentCmd          string `toml:"agent_cmd"`
+	Integration       string `toml:"integration"`
+	RequireReview     bool   `toml:"require_review"`
+	HcSocket          string `toml:"hc_socket"`
+	HcBinary          string `toml:"hc_binary"`
+	TerminalRetention string `toml:"terminal_retention"`
+	LogFile           string `toml:"log_file"`
 }
 
 // workDirCopyHeader 说明这份文件由 GUI 保存，避免用户误以为它只是注释模板。
@@ -227,16 +241,18 @@ func MarshalWorkDirCopy(cfg Config) ([]byte, error) {
 		return nil, err
 	}
 	copy := workDirCopy{
-		Parallelism:   cfg.Parallelism,
-		Retries:       cfg.Retries,
-		Forge:         cfg.Forge,
-		RepoDir:       cfg.RepoDir,
-		TreeDir:       cfg.TreeDir,
-		AgentCmd:      cfg.AgentCmd,
-		Integration:   cfg.Integration,
-		RequireReview: cfg.RequireReview,
-		HcSocket:      cfg.HcSocket,
-		HcBinary:      cfg.HcBinary,
+		Parallelism:       cfg.Parallelism,
+		Retries:           cfg.Retries,
+		Forge:             cfg.Forge,
+		RepoDir:           cfg.RepoDir,
+		TreeDir:           cfg.TreeDir,
+		AgentCmd:          cfg.AgentCmd,
+		Integration:       cfg.Integration,
+		RequireReview:     cfg.RequireReview,
+		HcSocket:          cfg.HcSocket,
+		HcBinary:          cfg.HcBinary,
+		TerminalRetention: cfg.TerminalRetention,
+		LogFile:           cfg.LogFile,
 	}
 	data, err := toml.Marshal(copy)
 	if err != nil {
@@ -295,11 +311,12 @@ func Load(workDir, path string) (Config, error) {
 		}
 	}
 	cfg := Config{
-		Parallelism:   defaultParallelism(),
-		Retries:       DefaultRetries,
-		WorkDir:       workDir,
-		RequireReview: false,
-		ResumeBudget:  DefaultResumeBudget,
+		Parallelism:       defaultParallelism(),
+		Retries:           DefaultRetries,
+		WorkDir:           workDir,
+		RequireReview:     false,
+		ResumeBudget:      DefaultResumeBudget,
+		TerminalRetention: "0s",
 	}
 	applyRaw(&cfg, base)
 	applyRaw(&cfg, over)
@@ -368,6 +385,12 @@ func applyRaw(cfg *Config, raw rawConfig) {
 	if raw.Forge != nil {
 		cfg.Forge = *raw.Forge
 	}
+	if raw.TerminalRetention != nil {
+		cfg.TerminalRetention = *raw.TerminalRetention
+	}
+	if raw.LogFile != nil {
+		cfg.LogFile = *raw.LogFile
+	}
 }
 
 // scrubSecretEnv 把 LLM 密钥变量从本进程环境中移除，使 fastimpl
@@ -392,6 +415,26 @@ func ScrubbedEnv() []string {
 	return keep
 }
 
+// ParseTerminalRetention 解析终端保留策略。空串等同 "0s"（保持手工
+// 构造 Config 零值时的旧行为）；never 时不返回时长。
+func ParseTerminalRetention(text string) (delay time.Duration, never bool, err error) {
+	v := strings.ToLower(strings.TrimSpace(text))
+	if v == "" {
+		return 0, false, nil
+	}
+	if v == "never" {
+		return 0, true, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, false, fmt.Errorf("terminal_retention must be a non-negative Go duration or never, got %q", text)
+	}
+	if d < 0 {
+		return 0, false, fmt.Errorf("terminal_retention must not be negative, got %q", text)
+	}
+	return d, false, nil
+}
+
 // Validate 拒绝自相矛盾或无法运行的设置。
 func (c Config) Validate() error {
 	if c.Parallelism < 1 {
@@ -413,6 +456,9 @@ func (c Config) Validate() error {
 	case "", ForgeGitLab, ForgeGitHub:
 	default:
 		return fmt.Errorf("forge must be %q or %q, got %q", ForgeGitLab, ForgeGitHub, c.Forge)
+	}
+	if _, _, err := ParseTerminalRetention(c.TerminalRetention); err != nil {
+		return err
 	}
 	if c.InstanceID != "" && !validInstanceID(c.InstanceID) {
 		return fmt.Errorf("instance_id %q must contain only [A-Za-z0-9._-] and be at most %d chars",

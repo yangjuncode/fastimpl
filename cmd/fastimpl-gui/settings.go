@@ -28,17 +28,19 @@ type settingsModel struct {
 	status *core.Signal[string]
 	err    *core.Signal[string]
 
-	parallelism   *core.Signal[string]
-	retries       *core.Signal[string]
-	forge         *core.Signal[string]
-	repoDir       *core.Signal[string]
-	treeDir       *core.Signal[string]
-	agentCmd      *core.Signal[string]
-	integration   *core.Signal[string]
-	requireReview *core.Signal[bool]
-	hcBinary      *core.Signal[string]
-	hcSocket      *core.Signal[string]
-	instanceID    *core.Signal[string]
+	parallelism       *core.Signal[string]
+	retries           *core.Signal[string]
+	terminalRetention *core.Signal[string]
+	logFile           *core.Signal[string]
+	forge             *core.Signal[string]
+	repoDir           *core.Signal[string]
+	treeDir           *core.Signal[string]
+	agentCmd          *core.Signal[string]
+	integration       *core.Signal[string]
+	requireReview     *core.Signal[bool]
+	hcBinary          *core.Signal[string]
+	hcSocket          *core.Signal[string]
+	instanceID        *core.Signal[string]
 
 	promptText *core.Signal[string]
 	loaded     config.Config
@@ -47,22 +49,24 @@ type settingsModel struct {
 // newSettingsModel 创建设置编辑状态。
 func newSettingsModel(cx *core.Scope) *settingsModel {
 	return &settingsModel{
-		tab:           core.NewSignal(cx, settingsTabConfig),
-		dirty:         core.NewSignal(cx, false),
-		status:        core.NewSignal(cx, ""),
-		err:           core.NewSignal(cx, ""),
-		parallelism:   core.NewSignal(cx, ""),
-		retries:       core.NewSignal(cx, ""),
-		forge:         core.NewSignal(cx, ""),
-		repoDir:       core.NewSignal(cx, ""),
-		treeDir:       core.NewSignal(cx, ""),
-		agentCmd:      core.NewSignal(cx, ""),
-		integration:   core.NewSignal(cx, ""),
-		requireReview: core.NewSignal(cx, false),
-		hcBinary:      core.NewSignal(cx, ""),
-		hcSocket:      core.NewSignal(cx, ""),
-		instanceID:    core.NewSignal(cx, ""),
-		promptText:    core.NewSignal(cx, ""),
+		tab:               core.NewSignal(cx, settingsTabConfig),
+		dirty:             core.NewSignal(cx, false),
+		status:            core.NewSignal(cx, ""),
+		err:               core.NewSignal(cx, ""),
+		parallelism:       core.NewSignal(cx, ""),
+		retries:           core.NewSignal(cx, ""),
+		terminalRetention: core.NewSignal(cx, ""),
+		logFile:           core.NewSignal(cx, ""),
+		forge:             core.NewSignal(cx, ""),
+		repoDir:           core.NewSignal(cx, ""),
+		treeDir:           core.NewSignal(cx, ""),
+		agentCmd:          core.NewSignal(cx, ""),
+		integration:       core.NewSignal(cx, ""),
+		requireReview:     core.NewSignal(cx, false),
+		hcBinary:          core.NewSignal(cx, ""),
+		hcSocket:          core.NewSignal(cx, ""),
+		instanceID:        core.NewSignal(cx, ""),
+		promptText:        core.NewSignal(cx, ""),
 	}
 }
 
@@ -112,6 +116,8 @@ func (m *model) loadSettings() {
 		st.loaded = cfg
 		st.parallelism.Set(strconv.Itoa(cfg.Parallelism))
 		st.retries.Set(strconv.Itoa(cfg.Retries))
+		st.terminalRetention.Set(cfg.TerminalRetention)
+		st.logFile.Set(cfg.LogFile)
 		st.forge.Set(cfg.Forge)
 		st.repoDir.Set(cfg.RepoDir)
 		st.treeDir.Set(cfg.TreeDir)
@@ -201,6 +207,8 @@ func (m *model) configFromForm() (config.Config, error) {
 	}
 	cfg.Parallelism = parallelism
 	cfg.Retries = retries
+	cfg.TerminalRetention = strings.TrimSpace(st.terminalRetention.GetUntracked())
+	cfg.LogFile = strings.TrimSpace(st.logFile.GetUntracked())
 	cfg.Forge = strings.TrimSpace(st.forge.GetUntracked())
 	cfg.RepoDir = strings.TrimSpace(st.repoDir.GetUntracked())
 	cfg.TreeDir = strings.TrimSpace(st.treeDir.GetUntracked())
@@ -378,6 +386,8 @@ func (m *model) configSettingsTab() core.Node {
 	rows := []core.Node{
 		m.settingsInputRow("parallelism", "同时运行的 worker 上限", st.parallelism, "settings-parallelism"),
 		m.settingsInputRow("retries", "首次尝试之外的续写重试次数", st.retries, "settings-retries"),
+		m.settingsInputRow("retention", "终端保留：0s 立即，10m 延迟，never 不销毁", st.terminalRetention, "settings-terminal-retention"),
+		m.settingsInputRow("log_file", "运行日志文件；空不保存，保存后下一次运行生效", st.logFile, "settings-log-file"),
 		settingsSelectRow(m, "forge", "上游 forge", st.forge, "settings-forge"),
 		m.settingsInputRow("repo_dir", "目标仓库主 checkout 绝对路径", st.repoDir, "settings-repo-dir"),
 		m.settingsInputRow("tree_dir", "worktree 父目录绝对路径", st.treeDir, "settings-tree-dir"),
