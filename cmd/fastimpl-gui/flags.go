@@ -16,14 +16,16 @@ import (
 )
 
 // usageLine 是命令行用法说明。
-const usageLine = "usage: fastimpl-gui [-j N] [-config path] [-template path] [-repo-dir dir] [-tree-dir dir] [-work-dir dir] [spec-issue-iid]"
+const usageLine = "usage: fastimpl-gui [-version] [-j N] [-config path] [-template path] [-repo-dir dir] [-tree-dir dir] [-work-dir dir] [spec-issue-iid]"
 
 // parseArguments 解析命令行；位置参数是可选的 spec issue IID。
 // 不给 IID 时主窗口以空状态打开，用户在界面里录入。
-func parseArguments(args []string, stderr io.Writer) (app.Options, error) {
+func parseArguments(args []string, stderr io.Writer) (app.Options, bool, error) {
 	flags := flag.NewFlagSet("fastimpl-gui", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var opts app.Options
+	var showVersion bool
+	flags.BoolVar(&showVersion, "version", false, "print the fastimpl-gui version and exit")
 	flags.IntVar(&opts.Parallelism, "j", 0, "maximum concurrent workers (0: use config or default)")
 	flags.StringVar(&opts.ConfigPath, "config", "", "path to fastimpl.toml (default: <work-dir>/fastimpl.toml, fallback: <exe-dir>/fastimpl.toml)")
 	flags.StringVar(&opts.TemplatePath, "template", "", "worker prompt template (default: <work-dir>/fastimpl.prompt.md, fallback: <exe-dir>/fastimpl.prompt.md)")
@@ -37,24 +39,27 @@ func parseArguments(args []string, stderr io.Writer) (app.Options, error) {
 	// -h 走 flag 自己的 ContinueOnError：它打印用法并返回
 	// flag.ErrHelp，调用方据此以 0 退出，而不是当成错误。
 	if err := flags.Parse(args); err != nil {
-		return app.Options{}, err
+		return app.Options{}, false, err
+	}
+	if showVersion {
+		return opts, true, nil
 	}
 	if opts.Parallelism < 0 {
-		return app.Options{}, fmt.Errorf("-j must not be negative, got %d", opts.Parallelism)
+		return app.Options{}, false, fmt.Errorf("-j must not be negative, got %d", opts.Parallelism)
 	}
 	switch flags.NArg() {
 	case 0:
-		return opts, nil
+		return opts, false, nil
 	case 1:
 		raw := strings.TrimSpace(flags.Arg(0))
 		iid, err := strconv.Atoi(raw)
 		if err != nil || iid <= 0 {
-			return app.Options{}, fmt.Errorf("spec issue IID must be a positive integer, got %q", flags.Arg(0))
+			return app.Options{}, false, fmt.Errorf("spec issue IID must be a positive integer, got %q", flags.Arg(0))
 		}
 		opts.SpecIID = iid
-		return opts, nil
+		return opts, false, nil
 	default:
 		flags.Usage()
-		return app.Options{}, errors.New("expected at most one spec issue IID")
+		return app.Options{}, false, errors.New("expected at most one spec issue IID")
 	}
 }

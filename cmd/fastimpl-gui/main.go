@@ -13,10 +13,11 @@ import (
 	"github.com/nsgo-dev/nsgo/core"
 	"github.com/nsgo-dev/nsgo/desktop"
 	"github.com/yangjuncode/fastimpl/app"
+	"github.com/yangjuncode/fastimpl/version"
 )
 
 func main() {
-	opts, err := parseArguments(os.Args[1:], os.Stderr)
+	opts, showVersion, err := parseArguments(os.Args[1:], os.Stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			// -h：用法已经打印，按约定以 0 退出。
@@ -24,6 +25,10 @@ func main() {
 		}
 		fmt.Fprintln(os.Stderr, "fastimpl-gui:", err)
 		os.Exit(2)
+	}
+	if showVersion {
+		fmt.Printf("fastimpl-gui version %s\n", version.String())
+		return
 	}
 	os.Exit(runGUI(opts))
 }

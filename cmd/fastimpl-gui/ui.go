@@ -15,6 +15,7 @@ import (
 	"github.com/yangjuncode/fastimpl/app"
 	"github.com/yangjuncode/fastimpl/graph"
 	"github.com/yangjuncode/fastimpl/scheduler"
+	"github.com/yangjuncode/fastimpl/version"
 )
 
 // model 是界面的全部状态。所有字段只在界面线程上读写，除了 snap 与
@@ -289,6 +290,8 @@ func (m *model) header() core.Node {
 			Borders: core.Edges{Bottom: 1}, BorderColor: colors.Border(), Background: colors.Surface()}
 	}, Children: []core.Node{
 		ui.Text("fastimpl", 14, ui.Semibold, colors.Text),
+		core.Text{Content: version.String(), MaxLines: 1, TestID: "version",
+			Style: ui.TypeCaption, StyleFunc: ui.Colored(colors.Muted)},
 		core.View{Style: core.Style{Width: core.Pt(110)}, Children: []core.Node{
 			ui.Input{Value: m.issueText.Get, OnChange: m.issueText.Set, Placeholder: "spec issue", TestID: "issue-input"}}},
 		ui.Button{Text: "设置", Variant: ui.ButtonOutline, Icon: lucide.Settings, OnPress: m.openSettings, TestID: "open-settings"},

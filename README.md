@@ -242,13 +242,14 @@ fastimpl 42                 # 正式运行
 ### 命令行参数
 
 ```
-usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
+usage: fastimpl [-version] [-init] [-print] [-json file] [-j N] [-config path]
         [-template path] [-repo-dir dir] [-tree-dir dir]
         [-work-dir dir] <spec-issue-iid>
 ```
 
 | 参数 | 说明 |
 |---|---|
+| `-version` | 打印 fastimpl 版本后退出；正常启动时版本也会先打印到 stderr（不污染 stdout 的 `-print`/`-json` 输出） |
 | `-init` | 把 fastimpl.toml / fastimpl.prompt.md 生成到 work-dir 后退出（不接 spec IID，已有文件不覆盖） |
 | `-print` | 只打印依赖图（按拓扑分层）后退出，不做任何写操作 |
 | `-json <file>` | 把完整依赖图（含 open/closed）写到 JSON 文件；可与 `-print` 同用 |
@@ -265,10 +266,12 @@ usage: fastimpl [-init] [-print] [-json file] [-j N] [-config path]
 构图与调度，只把进度、依赖图与调度状态作为事件接出来：
 
 ```
-usage: fastimpl-gui [-j N] [-config path] [-template path]
+usage: fastimpl-gui [-version] [-j N] [-config path] [-template path]
         [-repo-dir dir] [-tree-dir dir] [-work-dir dir] [spec-issue-iid]
 ```
 
+- 窗口顶部在 `fastimpl` 标题旁显示当前构建版本；`fastimpl-gui -version`
+  打印版本后退出，不打开窗口。
 - 不传 issue：主窗口以空状态打开，在界面里录入后先构建依赖图。
 - 传 issue：窗口出现后在后台自动构图；图就绪后停在"ready"，必须点击
   **开始调度**才会准备集成分支、连接 hcgo 并启动 worker。
@@ -294,7 +297,10 @@ usage: fastimpl-gui [-j N] [-config path] [-template path]
 
 Linux 需要 GTK 4.14+ 与 Pango/Cairo；NSGo 的 libghostty-vt 已嵌入二进制，
 首次运行解到 `~/.cache/nsgo`。`./build.sh` 默认同时构建两个命令，也可用
-`./build.sh fastimpl` 或 `./build.sh fastimpl-gui` 只构建其一。
+`./build.sh fastimpl` 或 `./build.sh fastimpl-gui` 只构建其一。构建脚本把
+`git describe --tags --always --dirty` 的结果注入为版本（可用
+`FASTIMPL_VERSION=vX.Y.Z` 覆盖）；不用脚本直接 `go build` 时版本显示为
+`dev`。
 
 ### 配置文件 fastimpl.toml
 

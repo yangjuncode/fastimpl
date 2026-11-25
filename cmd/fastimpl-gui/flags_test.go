@@ -19,7 +19,7 @@ func TestParseArgumentsIssue(t *testing.T) {
 		{[]string{" 7 "}, 7},
 		{[]string{"-j", "3", "9"}, 9},
 	} {
-		opts, err := parseArguments(tc.args, new(bytes.Buffer))
+		opts, _, err := parseArguments(tc.args, new(bytes.Buffer))
 		if err != nil {
 			t.Errorf("parseArguments(%v) = %v, want no error", tc.args, err)
 			continue
@@ -31,7 +31,7 @@ func TestParseArgumentsIssue(t *testing.T) {
 }
 
 func TestParseArgumentsEmptyIssue(t *testing.T) {
-	opts, err := parseArguments(nil, new(bytes.Buffer))
+	opts, _, err := parseArguments(nil, new(bytes.Buffer))
 	if err != nil {
 		t.Fatalf("parseArguments(nil) = %v, want no error: the GUI opens its empty state", err)
 	}
@@ -42,20 +42,20 @@ func TestParseArgumentsEmptyIssue(t *testing.T) {
 
 func TestParseArgumentsRejectsBadIssue(t *testing.T) {
 	for _, arg := range []string{"0", "-3", "abc", "1.5", "", "#12"} {
-		if _, err := parseArguments([]string{arg}, new(bytes.Buffer)); err == nil {
+		if _, _, err := parseArguments([]string{arg}, new(bytes.Buffer)); err == nil {
 			t.Errorf("parseArguments(%q) accepted a bad issue", arg)
 		}
 	}
-	if _, err := parseArguments([]string{"1", "2"}, new(bytes.Buffer)); err == nil {
+	if _, _, err := parseArguments([]string{"1", "2"}, new(bytes.Buffer)); err == nil {
 		t.Error("parseArguments accepted two issue numbers")
 	}
-	if _, err := parseArguments([]string{"-j", "-2", "5"}, new(bytes.Buffer)); err == nil {
+	if _, _, err := parseArguments([]string{"-j", "-2", "5"}, new(bytes.Buffer)); err == nil {
 		t.Error("parseArguments accepted a negative -j")
 	}
 }
 
 func TestParseArgumentsFlags(t *testing.T) {
-	opts, err := parseArguments([]string{
+	opts, _, err := parseArguments([]string{
 		"-config", "/tmp/c.toml", "-repo-dir", "/tmp/repo", "-tree-dir", "/tmp/tree",
 		"-work-dir", "/tmp/work", "-template", "/tmp/t.md", "-j", "4", "11",
 	}, new(bytes.Buffer))
@@ -69,11 +69,22 @@ func TestParseArgumentsFlags(t *testing.T) {
 	}
 }
 
+// -version 是查询参数：解析器报告它，调用方打印版本后直接退出。
+func TestParseArgumentsVersionFlag(t *testing.T) {
+	_, show, err := parseArguments([]string{"-version"}, new(bytes.Buffer))
+	if err != nil {
+		t.Fatalf("parseArguments(-version) = %v, want no error", err)
+	}
+	if !show {
+		t.Fatal("parseArguments(-version) did not report the version request")
+	}
+}
+
 // -h 必须让调用方以 0 退出：它返回 flag.ErrHelp，而不是一般错误。
 func TestParseArgumentsHelp(t *testing.T) {
 	for _, arg := range []string{"-h", "-help", "--help"} {
 		out := new(bytes.Buffer)
-		_, err := parseArguments([]string{arg}, out)
+		_, _, err := parseArguments([]string{arg}, out)
 		if !errors.Is(err, flag.ErrHelp) {
 			t.Errorf("parseArguments(%q) = %v, want flag.ErrHelp", arg, err)
 			continue

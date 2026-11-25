@@ -70,6 +70,7 @@ func loadGraph(app *nsgotest.App, m *model, snap snapshot) {
 func TestEmptyStateRenders(t *testing.T) {
 	app, m, _ := headless(t, app.Options{})
 	waitPaths(t, app, m)
+	app.Find("id:version")
 	app.Find("id:empty")
 	app.Find("id:empty-panel")
 	app.Find("id:form-issue")
