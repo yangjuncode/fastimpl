@@ -6,15 +6,23 @@ set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p "$HOME/bin"
 
-# 版本注入：默认用 git describe（有 tag 时是 tag+距离+提交，无 tag 时是提交哈希），
-# 可用 FASTIMPL_VERSION=vX.Y.Z 显式覆盖；直接 go build 不经过本脚本时版本为 dev。
-version="${FASTIMPL_VERSION:-}"
-if [ -z "$version" ]; then
-	version="$(git describe --tags --always --dirty 2>/dev/null || printf dev)"
-fi
-if [[ "$version" =~ [[:space:]] ]]; then
-	echo "version must not contain whitespace: $version" >&2
+# 版本注入：version.txt 是用户定义的基础版本（例如 0.1.0）；
+# 能拿到 git 时追加短提交哈希，显示为 0.1.0+abcdef0。拿不到 hash 时
+# 只使用基础版本——build.sh 永远不回退到 dev。直接 go build 不经过
+# 本脚本时，二进制内的默认值仍是 dev。
+if [ ! -f version.txt ]; then
+	echo "version.txt is missing" >&2
 	exit 2
+fi
+base_version="$(head -n 1 version.txt | tr -d '[:space:]')"
+if [ -z "$base_version" ]; then
+	echo "version.txt must contain a version on its first line" >&2
+	exit 2
+fi
+version="$base_version"
+short_hash="$(git rev-parse --short HEAD 2>/dev/null || true)"
+if [ -n "$short_hash" ]; then
+	version="$base_version+$short_hash"
 fi
 ldflags="-X github.com/yangjuncode/fastimpl/version.Value=$version"
 echo "version: $version"

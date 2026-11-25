@@ -297,10 +297,11 @@ usage: fastimpl-gui [-version] [-j N] [-config path] [-template path]
 
 Linux 需要 GTK 4.14+ 与 Pango/Cairo；NSGo 的 libghostty-vt 已嵌入二进制，
 首次运行解到 `~/.cache/nsgo`。`./build.sh` 默认同时构建两个命令，也可用
-`./build.sh fastimpl` 或 `./build.sh fastimpl-gui` 只构建其一。构建脚本把
-`git describe --tags --always --dirty` 的结果注入为版本（可用
-`FASTIMPL_VERSION=vX.Y.Z` 覆盖）；不用脚本直接 `go build` 时版本显示为
-`dev`。
+`./build.sh fastimpl` 或 `./build.sh fastimpl-gui` 只构建其一。仓库根目录
+的 `version.txt` 是用户定义的基础版本（当前 `0.1.0`）；构建脚本能拿到
+git 时把短提交哈希附在后面，形如 `0.1.0+abcdef0`，拿不到 hash 时只使用
+`0.1.0`，不会回退成 `dev`。不用脚本直接 `go build` 时，二进制内未注入
+的默认版本仍是 `dev`。
 
 ### 配置文件 fastimpl.toml
 
