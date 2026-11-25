@@ -371,3 +371,111 @@ func TestAutoStartWaitsForPaths(t *testing.T) {
 		t.Fatalf("issue = %q, want the passed issue preserved", m.issueText.GetUntracked())
 	}
 }
+
+// waitCondition 轮询会话快照直到条件满足；只用于短小的本地异步测试。
+func waitCondition(t *testing.T, s *session, what string, cond func(snapshot) bool) snapshot {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := s.Snapshot()
+		if cond(snap) {
+			return snap
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s; last snapshot = %+v", what, s.Snapshot())
+	return snapshot{}
+}
+
+// 调度门禁：依赖图建好后运行必须停在 ready，BeforeSchedule 不得自行放行；
+// 只有用户点击开始后 SchedulerReady 才会到来，hcgo/worker 也因此不会提前启动。
+func TestSessionWaitsAtScheduleGateUntilConfirmed(t *testing.T) {
+	s := newSession()
+	changes := make(chan struct{}, 32)
+	s.SetOnChange(func() {
+		select {
+		case changes <- struct{}{}:
+		default:
+		}
+	})
+	released := make(chan struct{})
+	s.runFn = func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		g := testGraph()
+		if obs.GraphReady != nil {
+			obs.GraphReady(g)
+		}
+		if obs.BeforeSchedule == nil {
+			return errors.New("the GUI observer lost BeforeSchedule")
+		}
+		if err := obs.BeforeSchedule(ctx); err != nil {
+			return err
+		}
+		close(released)
+		if obs.SchedulerReady != nil {
+			obs.SchedulerReady(testScheduler(g), nil)
+		}
+		return nil
+	}
+	if err := s.Start(app.Options{SpecIID: 8}); err != nil {
+		t.Fatal(err)
+	}
+	snap := waitCondition(t, s, "the schedule gate", func(snap snapshot) bool { return snap.WaitingStart })
+	if snap.Phase != phaseReady {
+		t.Fatalf("phase = %v, want ready while waiting at the gate", snap.Phase)
+	}
+	if !snap.GraphReady {
+		t.Error("GraphReady = false at the gate; the graph must already be renderable")
+	}
+	wantReady := graph.Key{ProjectID: 1, IID: 9}
+	if len(snap.Ready) != 1 || snap.Ready[0] != wantReady {
+		t.Fatalf("Ready = %+v, want only %+v", snap.Ready, wantReady)
+	}
+	select {
+	case <-released:
+		t.Fatal("BeforeSchedule released before the user pressed start")
+	default:
+	}
+
+	s.StartScheduling()
+	waitDone(t, s, changes)
+	select {
+	case <-released:
+	default:
+		t.Fatal("BeforeSchedule did not release after StartScheduling")
+	}
+	snap = s.Snapshot()
+	if snap.Phase != phaseDone {
+		t.Fatalf("phase = %v, want done after the fake run finishes", snap.Phase)
+	}
+	if snap.WaitingStart {
+		t.Error("WaitingStart survived the end of the run")
+	}
+}
+
+// 在门禁前停止：等待中的 BeforeSchedule 必须随 ctx 退出，最终状态是 stopped，
+// 不能让运行 goroutine 永远卡在 ready。
+func TestSessionStopReleasesScheduleGate(t *testing.T) {
+	s := newSession()
+	changes := make(chan struct{}, 16)
+	s.SetOnChange(func() {
+		select {
+		case changes <- struct{}{}:
+		default:
+		}
+	})
+	s.runFn = func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		if obs.GraphReady != nil {
+			obs.GraphReady(testGraph())
+		}
+		return obs.BeforeSchedule(ctx)
+	}
+	if err := s.Start(app.Options{SpecIID: 8}); err != nil {
+		t.Fatal(err)
+	}
+	waitCondition(t, s, "the schedule gate", func(snap snapshot) bool { return snap.WaitingStart })
+	s.Stop()
+	waitDone(t, s, changes)
+	if snap := s.Snapshot(); snap.Phase != phaseStopped {
+		t.Fatalf("phase = %v, want stopped after canceling at the gate", snap.Phase)
+	}
+}

@@ -198,6 +198,74 @@ func splitCmd(s string) ([]string, error) {
 	return argv, nil
 }
 
+// workDirCopy 是写入工作目录 fastimpl.toml 的完整生效副本。InstanceID
+// 有意不在其中：机器标识只从 exe 同目录的全局层读取，项目目录不能覆盖。
+type workDirCopy struct {
+	Parallelism   int    `toml:"parallelism"`
+	Retries       int    `toml:"retries"`
+	Forge         string `toml:"forge"`
+	RepoDir       string `toml:"repo_dir"`
+	TreeDir       string `toml:"tree_dir"`
+	AgentCmd      string `toml:"agent_cmd"`
+	Integration   string `toml:"integration"`
+	RequireReview bool   `toml:"require_review"`
+	HcSocket      string `toml:"hc_socket"`
+	HcBinary      string `toml:"hc_binary"`
+}
+
+// workDirCopyHeader 说明这份文件由 GUI 保存，避免用户误以为它只是注释模板。
+const workDirCopyHeader = `# fastimpl 配置（TOML）
+# 本文件由 fastimpl-gui 设置页保存，是当前生效配置的完整副本。
+# 工作目录中的本文件优先于程序同目录的全局 fastimpl.toml。
+# instance_id 是本机全局标识，只从程序同目录的 fastimpl.toml 读取，因此不写入本文件。
+
+`
+
+// MarshalWorkDirCopy 把生效配置编码成工作目录 fastimpl.toml 的内容。
+func MarshalWorkDirCopy(cfg Config) ([]byte, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	copy := workDirCopy{
+		Parallelism:   cfg.Parallelism,
+		Retries:       cfg.Retries,
+		Forge:         cfg.Forge,
+		RepoDir:       cfg.RepoDir,
+		TreeDir:       cfg.TreeDir,
+		AgentCmd:      cfg.AgentCmd,
+		Integration:   cfg.Integration,
+		RequireReview: cfg.RequireReview,
+		HcSocket:      cfg.HcSocket,
+		HcBinary:      cfg.HcBinary,
+	}
+	data, err := toml.Marshal(copy)
+	if err != nil {
+		return nil, fmt.Errorf("encode config copy: %w", err)
+	}
+	return append([]byte(workDirCopyHeader), data...), nil
+}
+
+// SaveWorkDirCopy 把当前生效配置完整保存到 <work-dir>/fastimpl.toml，
+// 之后该目录运行时优先使用这份项目级配置。返回实际写入的路径。
+func SaveWorkDirCopy(workDir string, cfg Config) (string, error) {
+	if workDir == "" {
+		return "", errors.New("work directory is empty")
+	}
+	abs, err := filepath.Abs(workDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve work-dir %s: %w", workDir, err)
+	}
+	data, err := MarshalWorkDirCopy(cfg)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(abs, DefaultFile)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", fmt.Errorf("write config %s: %w", path, err)
+	}
+	return path, nil
+}
+
 // Load 读取配置：内置默认值 → exe 目录 fastimpl.toml（全局默认层）
 // → 覆盖层（-config 显式文件，否则 <work-dir>/fastimpl.toml）→ 环境变量。
 // 覆盖层只写要改动的项即可，未写的项继承全局默认层。

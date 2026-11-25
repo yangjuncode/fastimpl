@@ -52,7 +52,11 @@ func loadGraph(app *nsgotest.App, m *model, snap snapshot) {
 			runtime[rt.Key] = rt
 		}
 		m.mu.Lock()
-		m.snap, m.nodes, m.runtime = snap, nodes, runtime
+		ready := make(map[graph.Key]bool, len(snap.Ready))
+		for _, key := range snap.Ready {
+			ready[key] = true
+		}
+		m.snap, m.nodes, m.runtime, m.ready = snap, nodes, runtime, ready
 		m.structure = buildDiagram(snap)
 		m.flowReady = true
 		m.mu.Unlock()
@@ -118,6 +122,7 @@ func TestGraphPageRendersNodes(t *testing.T) {
 	for _, want := range []string{"spec title", "task A", "task B", "cross repo blocker"} {
 		app.Find("text:" + want)
 	}
+	app.Find("text:可开始工作")
 	app.Find("id:legend")
 	app.Find("id:graph")
 }
@@ -130,4 +135,25 @@ func TestIssueFromFlagsPrefills(t *testing.T) {
 		t.Fatalf("issue field = %q, want the flag's issue", got)
 	}
 	_ = app
+}
+
+// 设置对话框：配置 Tab 展示 TOML 参数，提示词 Tab 可切换并展示模板编辑器。
+func TestSettingsDialogRendersConfigAndPromptTabs(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	waitPaths(t, gui, m)
+	gui.Press("id:open-settings")
+	gui.Find("id:settings")
+	gui.Find("id:settings-parallelism")
+	gui.Find("id:settings-retries")
+	gui.Find("id:settings-forge")
+	gui.Find("id:settings-repo-dir")
+	gui.Find("id:settings-tree-dir")
+	gui.Find("id:settings-agent-cmd")
+	gui.Find("id:settings-integration")
+	gui.Find("id:settings-require-review")
+	gui.Find("id:settings-hc-binary")
+	gui.Find("id:settings-hc-socket")
+	gui.Find("id:settings-instance-id")
+	gui.Press("id:settings-tab-prompt")
+	gui.Find("id:settings-prompt")
 }

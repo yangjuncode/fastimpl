@@ -32,6 +32,8 @@ const (
 	phaseStarting
 	// phaseBuilding 是建依赖图。
 	phaseBuilding
+	// phaseReady 是依赖图已建好，正在等用户点击开始调度。
+	phaseReady
 	// phasePreparing 是准备集成分支、MR 与 hc 连接。
 	phasePreparing
 	// phaseScheduling 是调度器在跑。
@@ -51,6 +53,8 @@ func (p phase) String() string {
 		return "starting"
 	case phaseBuilding:
 		return "building"
+	case phaseReady:
+		return "ready"
 	case phasePreparing:
 		return "preparing"
 	case phaseScheduling:
@@ -90,6 +94,10 @@ type snapshot struct {
 	Log       []string
 	// GraphReady 表示依赖图已经建好、可以画了。
 	GraphReady bool
+	// Ready 是当前可调度、可开始工作的节点。
+	Ready []graph.Key
+	// WaitingStart 表示管线停在调度门禁前，等待用户点击开始。
+	WaitingStart bool
 	// Running 表示这次运行还在进行，停止按钮因此有意义。
 	Running bool
 	// Paths 是三个目录的预览结果：能解析的都填好，失败的那一项在
@@ -117,6 +125,7 @@ type session struct {
 	repoErr  *app.RepositoryError
 	spec     specView
 	nodes    []graph.Node
+	ready    []graph.Key
 	status   []scheduler.TaskRuntime
 	log      []string
 	writer   *lineWriter
@@ -126,6 +135,10 @@ type session struct {
 	cancel   context.CancelFunc
 	rev      int
 	onChange func()
+	// startCh 与 waitingStart 是调度门禁：依赖图建好后运行 goroutine
+	// 在 startCh 上等用户确认；确认前不准备集成、不连接 hcgo。
+	startCh      chan struct{}
+	waitingStart bool
 	// runFn 是这次运行的主体，测试用它替换 app.RunObserved；nil 表示
 	// 用 app.RunObserved。
 	runFn func(context.Context, app.Options, io.Writer, app.Observer) error
@@ -167,25 +180,27 @@ func (s *session) Snapshot() snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return snapshot{
-		Revision:    s.rev,
-		Phase:       s.phase,
-		Issue:       s.opts.SpecIID,
-		Progress:    s.prog,
-		Message:     s.message,
-		Err:         s.err,
-		RepoError:   s.repoErr,
-		Spec:        s.spec,
-		Nodes:       append([]graph.Node(nil), s.nodes...),
-		Status:      append([]scheduler.TaskRuntime(nil), s.status...),
-		Log:         append([]string(nil), s.log...),
-		GraphReady:  s.g != nil,
-		Running:     s.running,
-		Paths:       s.paths,
-		PathsReady:  s.pathsReady,
-		PathErr:     s.pathErr,
-		RepoPathErr: s.repoPathErr,
-		TreePathErr: s.treePathErr,
-		AutoStarted: s.autoStarted,
+		Revision:     s.rev,
+		Phase:        s.phase,
+		Issue:        s.opts.SpecIID,
+		Progress:     s.prog,
+		Message:      s.message,
+		Err:          s.err,
+		RepoError:    s.repoErr,
+		Spec:         s.spec,
+		Nodes:        append([]graph.Node(nil), s.nodes...),
+		Status:       append([]scheduler.TaskRuntime(nil), s.status...),
+		Log:          append([]string(nil), s.log...),
+		GraphReady:   s.g != nil,
+		Ready:        append([]graph.Key(nil), s.ready...),
+		WaitingStart: s.waitingStart,
+		Running:      s.running,
+		Paths:        s.paths,
+		PathsReady:   s.pathsReady,
+		PathErr:      s.pathErr,
+		RepoPathErr:  s.repoPathErr,
+		TreePathErr:  s.treePathErr,
+		AutoStarted:  s.autoStarted,
 	}
 }
 
@@ -259,8 +274,11 @@ func (s *session) Start(opts app.Options) error {
 	s.attach = nil
 	s.spec = specView{}
 	s.nodes = nil
+	s.ready = nil
 	s.status = nil
 	s.log = nil
+	s.startCh = make(chan struct{})
+	s.waitingStart = false
 	s.rev++
 	onChange := s.onChange
 	s.mu.Unlock()
@@ -279,6 +297,54 @@ func (s *session) Stop() {
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+}
+
+// StartScheduling 打开调度门禁。只有依赖图已经建好且管线正等在门禁前
+// 时它才生效；重复点击或运行尚未到门禁时直接忽略。
+func (s *session) StartScheduling() {
+	s.mu.Lock()
+	if !s.waitingStart || s.startCh == nil {
+		s.mu.Unlock()
+		return
+	}
+	ch := s.startCh
+	s.startCh = nil
+	s.waitingStart = false
+	s.phase = phasePreparing
+	s.message = "正在准备集成分支与合并请求"
+	s.rev++
+	onChange := s.onChange
+	s.mu.Unlock()
+	close(ch)
+	if onChange != nil {
+		onChange()
+	}
+}
+
+// waitForStart 是运行管线里的调度门禁：依赖图已经可见，但准备集成分支、
+// 连接 hcgo 与启动 worker 都必须等用户点击开始。停止/关闭窗口会取消 ctx，
+// 门禁随之退出，不会遗留下等待中的 goroutine。
+func (s *session) waitForStart(ctx context.Context) error {
+	s.mu.Lock()
+	s.phase = phaseReady
+	s.message = "依赖图已建好；点击开始后才会准备集成并启动 hcgo"
+	s.waitingStart = true
+	ch := s.startCh
+	s.rev++
+	onChange := s.onChange
+	s.mu.Unlock()
+	if onChange != nil {
+		onChange()
+	}
+	select {
+	case <-ch:
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -320,10 +386,11 @@ func (s *session) run(ctx context.Context, opts app.Options) {
 		GraphReady: func(g *graph.Graph) {
 			s.mu.Lock()
 			s.g = g
-			s.phase = phasePreparing
-			s.message = "依赖图已建好，正在准备集成分支与合并请求"
+			s.phase = phaseReady
+			s.message = "依赖图已建好；等待开始调度"
 			s.spec = specView{Key: g.Spec(), Title: g.SpecTitle(), Open: g.SpecOpen(), Number: g.Spec().IID, Deps: g.SpecDeps()}
 			s.nodes = g.Snapshot()
+			s.ready = readyKeys(g)
 			onChange := s.onChange
 			s.rev++
 			s.mu.Unlock()
@@ -331,6 +398,7 @@ func (s *session) run(ctx context.Context, opts app.Options) {
 				onChange()
 			}
 		},
+		BeforeSchedule: s.waitForStart,
 		SchedulerReady: func(sched *scheduler.Scheduler, attach app.AttachTerminal) {
 			s.mu.Lock()
 			s.sched = sched
@@ -376,6 +444,8 @@ func (s *session) run(ctx context.Context, opts app.Options) {
 		s.message = "运行失败"
 	}
 	s.log = writer.lines()
+	s.waitingStart = false
+	s.startCh = nil
 	s.mu.Unlock()
 
 	// 锁外刷新最终快照：refresh 自己会拿 s.mu。
@@ -437,18 +507,47 @@ func (s *session) refresh() bool {
 		status = sched.Status()
 	}
 	var nodes []graph.Node
+	var ready []graph.Key
 	var spec specView
 	if g != nil {
 		nodes = g.Snapshot()
+		ready = readyKeys(g)
 		spec = specView{Key: g.Spec(), Title: g.SpecTitle(), Open: g.SpecOpen(), Number: g.Spec().IID, Deps: g.SpecDeps()}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if sameStatus(s.status, status) && sameNodes(s.nodes, nodes) && sameSpec(s.spec, spec) {
+	if sameStatus(s.status, status) && sameNodes(s.nodes, nodes) && sameSpec(s.spec, spec) && sameKeys(s.ready, ready) {
 		return false
 	}
-	s.status, s.nodes, s.spec = status, nodes, spec
+	s.status, s.nodes, s.spec, s.ready = status, nodes, spec, ready
 	s.rev++
+	return true
+}
+
+// readyKeys 返回当前可开始工作的节点身份；graph.Ready 已按项目与 IID
+// 排序，因此结果可直接比较。
+func readyKeys(g *graph.Graph) []graph.Key {
+	if g == nil {
+		return nil
+	}
+	nodes := g.Ready()
+	keys := make([]graph.Key, len(nodes))
+	for i, n := range nodes {
+		keys[i] = n.Key
+	}
+	return keys
+}
+
+// sameKeys 比较两份节点身份快照。
+func sameKeys(a, b []graph.Key) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
 	return true
 }
 

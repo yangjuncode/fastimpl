@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -73,5 +74,68 @@ func TestAgentArgv(t *testing.T) {
 	// 未闭合引号报错。
 	if _, err := (Config{AgentCmd: `devin "oops`}).AgentArgv(); err == nil {
 		t.Fatal("expected error for unterminated quote")
+	}
+}
+
+// TestSaveWorkDirCopy 验证 GUI 保存的是当前生效配置的完整项目级副本：
+// TOML 参数完整写入、instance_id 不进入工作目录层，重新加载后值保持一致。
+func TestSaveWorkDirCopy(t *testing.T) {
+	work := t.TempDir()
+	cfg := Config{
+		Parallelism:   4,
+		Retries:       2,
+		Forge:         ForgeGitHub,
+		RepoDir:       work,
+		TreeDir:       filepath.Join(work, ".worktrees"),
+		AgentCmd:      `codex --model "o4 mini"`,
+		Integration:   "spec-integration",
+		RequireReview: true,
+		HcSocket:      filepath.Join(work, "hc.sock"),
+		InstanceID:    "machine-1",
+	}
+	path, err := SaveWorkDirCopy(work, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != filepath.Join(work, DefaultFile) {
+		t.Fatalf("path = %q, want %q", path, filepath.Join(work, DefaultFile))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"parallelism = 4", "retries = 2", `forge = 'github'`, "repo_dir", "tree_dir",
+		"agent_cmd", "integration", "require_review = true", "hc_socket", "hc_binary",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("saved config does not contain %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "instance_id =") {
+		t.Errorf("saved config must not persist instance_id into the work-dir layer:\n%s", text)
+	}
+	loaded, err := Load(work, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Parallelism != cfg.Parallelism || loaded.Retries != cfg.Retries || loaded.Forge != cfg.Forge ||
+		loaded.RepoDir != cfg.RepoDir || loaded.TreeDir != cfg.TreeDir || loaded.AgentCmd != cfg.AgentCmd ||
+		loaded.Integration != cfg.Integration || loaded.RequireReview != cfg.RequireReview ||
+		loaded.HcSocket != cfg.HcSocket || loaded.HcBinary != cfg.HcBinary {
+		t.Fatalf("loaded config = %+v, want the saved effective values %+v", loaded, cfg)
+	}
+}
+
+// TestSaveWorkDirCopyRejectsInvalid 验证非法配置不会写入工作目录。
+func TestSaveWorkDirCopyRejectsInvalid(t *testing.T) {
+	work := t.TempDir()
+	_, err := SaveWorkDirCopy(work, Config{Parallelism: 1, HcBinary: "hc", HcSocket: "/tmp/hc.sock"})
+	if err == nil {
+		t.Fatal("expected mutually exclusive hc settings to be rejected")
+	}
+	if _, statErr := os.Stat(filepath.Join(work, DefaultFile)); !os.IsNotExist(statErr) {
+		t.Fatalf("invalid config was written anyway: stat err = %v", statErr)
 	}
 }

@@ -1,6 +1,8 @@
 // Package app 是 fastimpl 的编排层：命令行与 GUI 两个前端共用同一条
 // 运行管线。管线为：加载配置 → 用 glab/gh 建 issue 依赖图 → 准备集成
 // 分支 worktree → 调度器分批跑 worker → 全部完成后交付合并请求。
+// GUI 可在依赖图建好后插入确认门禁：确认前不准备集成分支、不连接
+// hcgo、不启动任何 worker。
 package app
 
 import (
@@ -139,6 +141,11 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	}
 	if opts.Print {
 		return g.WritePlan(stdout)
+	}
+	if observer.BeforeSchedule != nil {
+		if err := observer.BeforeSchedule(ctx); err != nil {
+			return err
+		}
 	}
 	tmpl, err := prompt.Load(workDir, opts.TemplatePath)
 	if err != nil {

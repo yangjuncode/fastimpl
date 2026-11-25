@@ -28,8 +28,8 @@ func main() {
 	os.Exit(runGUI(opts))
 }
 
-// runGUI 打开主窗口并等它结束。传入 issue 时窗口启动后自动开始构图与
-// 调度；没传时以空状态打开，由用户在界面里录入。
+// runGUI 打开主窗口并等它结束。传入 issue 时窗口启动后自动构图，
+// 但调度会停在确认门禁前；没传时以空状态打开，由用户在界面里录入。
 //
 // 窗口关闭、Ctrl+C 或 SIGTERM 都会取消运行，并给调度器时间收尾
 // （停终端、释放认领与本地锁）。
@@ -56,7 +56,7 @@ func runGUI(opts app.Options) int {
 		})
 		signals(cx, s)
 		if opts.SpecIID > 0 {
-			// 传入 issue：启动后在后台构图并调度，窗口先出来。
+			// 传入 issue：启动后在后台构图，窗口先出来；调度仍需用户确认。
 			cx.Post(func() { m.start() })
 		}
 		return m.build()

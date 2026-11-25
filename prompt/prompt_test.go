@@ -1,6 +1,8 @@
 package prompt
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -82,5 +84,25 @@ func TestDefaultTemplateReviewToggle(t *testing.T) {
 	}
 	if !strings.Contains(off, "验证后提交") || !strings.Contains(off, "验证全部通过") {
 		t.Fatalf("review-off render broken: %s", off[:200])
+	}
+}
+
+// TestSaveWorkDirCopy 验证提示词模板完整写入工作目录默认文件。
+func TestSaveWorkDirCopy(t *testing.T) {
+	work := t.TempDir()
+	text := "custom prompt {{.IssueNo}}\n"
+	path, err := SaveWorkDirCopy(work, text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != filepath.Join(work, DefaultFile) {
+		t.Fatalf("path = %q, want %q", path, filepath.Join(work, DefaultFile))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != text {
+		t.Fatalf("saved prompt = %q, want %q", string(data), text)
 	}
 }

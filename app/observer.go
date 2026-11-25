@@ -26,6 +26,10 @@ type Observer struct {
 	Progress func(graph.BuildProgress)
 	// GraphReady 在依赖图建好、任何写入或调度启动之前调用。
 	GraphReady func(*graph.Graph)
+	// BeforeSchedule 在依赖图建好后、准备集成分支与连接 hcgo 之前调用。
+	// 它返回前管线一直停在这里；GUI 用它等用户点击开始，CLI 传 nil
+	// 因此保持原来的连续运行。返回错误会终止本次运行。
+	BeforeSchedule func(context.Context) error
 	// SchedulerReady 在调度器组装完成、Run 启动之前调用；attach 用
 	// 与调度同源的 hc 配置另开观看连接。
 	SchedulerReady func(*scheduler.Scheduler, AttachTerminal)
@@ -63,7 +67,7 @@ func IsRepositoryError(err error) bool {
 // observing 报告观察者是否想跟随这次运行。只读的 -print 用零值
 // Observer，因此不需要任何额外行为。
 func (o Observer) observing() bool {
-	return o.Progress != nil || o.GraphReady != nil || o.SchedulerReady != nil
+	return o.Progress != nil || o.GraphReady != nil || o.BeforeSchedule != nil || o.SchedulerReady != nil
 }
 
 // verifyRepoRoot 确认 dir 本身就是 git 仓库顶层。git 命令在子目录里

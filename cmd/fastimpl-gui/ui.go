@@ -6,7 +6,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/nsgo-dev/nsgo/base"
 	"github.com/nsgo-dev/nsgo/base/camera"
 	"github.com/nsgo-dev/nsgo/base/terminal"
 	"github.com/nsgo-dev/nsgo/core"
@@ -29,9 +28,10 @@ type model struct {
 
 	mu   sync.Mutex
 	snap snapshot
-	// nodes 与 runtime 是渲染时用的索引，由 snap 派生。
+	// nodes、runtime 与 ready 是渲染时用的索引，由 snap 派生。
 	nodes   map[graph.Key]graph.Node
 	runtime map[graph.Key]scheduler.TaskRuntime
+	ready   map[graph.Key]bool
 	// structure 是上一次建好的图结构；只有结构变了才重建。
 	structure diagram
 	flowReady bool
@@ -45,8 +45,9 @@ type model struct {
 	// worktree 目录。自动解析成功的值会预填进来；用户改过的值只用于
 	// 本次运行，绝不写回配置。
 	workText, repoText, treeText *core.Signal[string]
-	// settingsOpen 控制运行期仓库错误时的设置对话框。
+	// settingsOpen 控制设置对话框；settings 持有配置与提示词编辑状态。
 	settingsOpen *core.Signal[bool]
+	settings     *settingsModel
 	// tab 是当前选中的页面：pageGraph 或某个终端页的 ID。
 	tab *core.Signal[string]
 	// selected 是图上选中的节点 ID。
@@ -85,6 +86,7 @@ func newModel(cx *core.Scope, s *session, opts app.Options) *model {
 		flowState:    &uiflow.State{},
 	}
 	m.post = cx.Post
+	m.settings = newSettingsModel(cx)
 	m.terms = newTerminals(s, m.notify)
 	if opts.SpecIID > 0 {
 		m.issueText.Set(strconv.Itoa(opts.SpecIID))
@@ -129,16 +131,20 @@ func (m *model) sync() {
 	snap := m.session.Snapshot()
 	nodes := make(map[graph.Key]graph.Node, len(snap.Nodes))
 	runtime := make(map[graph.Key]scheduler.TaskRuntime, len(snap.Status))
+	ready := make(map[graph.Key]bool, len(snap.Ready))
 	for _, n := range snap.Nodes {
 		nodes[n.Key] = n
 	}
 	for _, rt := range snap.Status {
 		runtime[rt.Key] = rt
 	}
+	for _, key := range snap.Ready {
+		ready[key] = true
+	}
 	next := buildDiagram(snap)
 	rebuild := !sameStructure(m.structure, next)
 	m.mu.Lock()
-	m.snap, m.nodes, m.runtime = snap, nodes, runtime
+	m.snap, m.nodes, m.runtime, m.ready = snap, nodes, runtime, ready
 	if rebuild {
 		m.structure = next
 	}
@@ -171,7 +177,7 @@ func (m *model) sync() {
 		if repo := snap.RepoError.Dir; repo != "" && m.repoText.GetUntracked() == "" {
 			m.repoText.Set(repo)
 		}
-		m.settingsOpen.Set(true)
+		m.openSettings()
 	}
 	// 带 issue 启动时，路径全部就绪后才自动开始，且只自动开始一次：
 	// 路径缺失时停在居中的启动表单，等用户补齐。
@@ -198,12 +204,12 @@ func (m *model) snapshot() snapshot {
 
 // look 返回卡片读运行状态的入口。
 func (m *model) look() *liveGraph {
-	return &liveGraph{Revision: m.rev, Lookup: func(k graph.Key) (graph.Node, scheduler.TaskRuntime, bool) {
+	return &liveGraph{Revision: m.rev, Lookup: func(k graph.Key) (graph.Node, scheduler.TaskRuntime, bool, bool) {
 		m.rev.Get()
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		n, ok := m.nodes[k]
-		return n, m.runtime[k], ok
+		return n, m.runtime[k], m.ready[k], ok
 	}}
 }
 
@@ -246,6 +252,12 @@ func (m *model) retry() {
 	m.start()
 }
 
+// startScheduling 打开调度门禁：只有图已建好且管线正在等待时才会生效。
+func (m *model) startScheduling() {
+	m.session.StartScheduling()
+	m.sync()
+}
+
 // stop 取消运行；调度器的收尾在后台完成，界面状态随之更新。
 func (m *model) stop() {
 	m.session.Stop()
@@ -279,14 +291,47 @@ func (m *model) header() core.Node {
 		ui.Text("fastimpl", 14, ui.Semibold, colors.Text),
 		core.View{Style: core.Style{Width: core.Pt(110)}, Children: []core.Node{
 			ui.Input{Value: m.issueText.Get, OnChange: m.issueText.Set, Placeholder: "spec issue", TestID: "issue-input"}}},
+		ui.Button{Text: "设置", Variant: ui.ButtonOutline, Icon: lucide.Settings, OnPress: m.openSettings, TestID: "open-settings"},
 		ui.Spacer{},
+		m.startButton(),
 		core.Show{When: func() bool { return snap().Running }, Then: func(*core.Scope) core.Node {
 			return ui.Button{Text: "停止", Variant: ui.ButtonDanger, Icon: lucide.Square, OnPress: m.stop, TestID: "stop"}
-		}, Else: func(*core.Scope) core.Node {
-			return ui.Button{Text: "开始", Variant: ui.ButtonPrimary, Icon: lucide.Play, OnPress: m.start, TestID: "start"}
 		}},
 		m.statusText(),
 	}}
+}
+
+// startButton 是主运行按钮。没在运行时它启动依赖图构建；图建好且管线
+// 停在门禁前时，它才变成“开始调度”，点击后才会准备集成、连接 hcgo
+// 并启动 worker。
+func (m *model) startButton() core.Node {
+	text := func() string {
+		s := m.snapshot()
+		switch {
+		case s.WaitingStart:
+			return "开始调度"
+		case s.Running && (s.Phase == phaseStarting || s.Phase == phaseBuilding || s.Phase == phaseReady):
+			return "构建中"
+		case s.Running:
+			return "调度中"
+		case s.GraphReady:
+			return "重新构建"
+		}
+		return "构建依赖图"
+	}
+	busy := func() bool {
+		s := m.snapshot()
+		return s.Running && !s.WaitingStart
+	}
+	return ui.Button{TextFunc: text, Variant: ui.ButtonPrimary, Icon: lucide.Play, Busy: busy, Disabled: busy,
+		OnPress: func() {
+			s := m.snapshot()
+			if s.WaitingStart {
+				m.startScheduling()
+			} else if !s.Running {
+				m.start()
+			}
+		}, TestID: "start"}
 }
 
 // pathsBar 是窗口底部的三个目录信息栏：全部解析完成时只读显示。
@@ -317,7 +362,7 @@ func (m *model) statusText() core.Node {
 		s := m.snapshot()
 		switch s.Phase {
 		case phaseIdle:
-			return "输入 issue 编号后开始，或用 fastimpl-gui <issue> 直接启动"
+			return "输入 issue 编号后构建依赖图；图就绪后再点开始调度"
 		case phaseFailed:
 			if s.Err != nil {
 				return s.Message + "：" + attentionSummary(s.Err.Error())
@@ -481,6 +526,7 @@ func (m *model) legend() core.Node {
 	}, Children: []core.Node{
 		ui.Text("箭头从「前置」指向「被阻塞」的 issue", 11, ui.Regular, colors.Muted),
 		item(lucide.CircleDashed, colors.Muted, "等待前置"),
+		item(lucide.CirclePlay, colors.Up, "可开始"),
 		item(lucide.LoaderCircle, colors.Accent, "运行中"),
 		item(lucide.GitMerge, colors.Accent, "集成中"),
 		item(lucide.CircleCheck, colors.Up, "已集成"),
@@ -506,7 +552,7 @@ func (m *model) emptyState() core.Node {
 		case s.TreePathErr != nil:
 			return "Work Tree 目录无法自动解析，请填写或选择"
 		case s.PathsReady:
-			return "目录已就绪：填写 issue 编号后点开始"
+			return "目录已就绪：填写 issue 编号后点构建依赖图；图出来后再点开始调度"
 		}
 		return "正在解析工作目录、仓库目录与 Work Tree 目录"
 	}
@@ -521,7 +567,7 @@ func (m *model) emptyState() core.Node {
 				}, Children: []core.Node{
 					core.View{Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: 10}, Children: []core.Node{
 						ui.Icon(lucide.Workflow, 26, colors.Muted),
-						core.Text{Content: "输入 spec issue 编号与三个目录，开始构建依赖图", MaxLines: 2,
+						core.Text{Content: "输入 spec issue 编号与三个目录，先构建依赖图", MaxLines: 2,
 							Style: ui.TypeTitle, StyleFunc: ui.Colored(colors.Text)},
 					}},
 					m.formRow("issue", "spec issue 编号", m.issueText.Get, m.issueText.Set, nil, nil, "form-issue"),
@@ -530,7 +576,7 @@ func (m *model) emptyState() core.Node {
 					m.formRow("Work Tree 目录", "worktree 父目录", m.treeText.Get, m.treeText.Set, m.pickTree, m.treePathErrText, "form-tree"),
 					core.View{Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: 10}, Children: []core.Node{
 						ui.Spacer{},
-						ui.Button{Text: "构建并开始", Variant: ui.ButtonPrimary, Icon: lucide.Play, OnPress: m.start, TestID: "empty-start"},
+						ui.Button{Text: "构建依赖图", Variant: ui.ButtonPrimary, Icon: lucide.Workflow, OnPress: m.start, TestID: "empty-start"},
 					}},
 					core.Text{ContentFunc: hint, MaxLines: 3, Style: ui.TypeCaption.Merge(core.Style{TextAlign: core.TextAlignCenter}),
 						StyleFunc: ui.Colored(colors.Muted), TestID: "form-hint"},
@@ -619,35 +665,4 @@ func (m *model) terminalPage() core.Node {
 				Children: []core.Node{terminal.View{Terminal: term, AutoFocus: true, Style: core.Style{FlexGrow: 1},
 					TestID: "terminal"}}},
 		}}
-}
-
-// settingsDialog 是仓库错误时的设置：说明原因、目录选择与重试。
-func (m *model) settingsDialog() core.Node {
-	reason := func() string {
-		s := m.snapshot()
-		if s.RepoError == nil {
-			return ""
-		}
-		return s.RepoError.Error()
-	}
-	return ui.Dialog{
-		Open:         m.settingsOpen.Get,
-		OnOpenChange: func(open bool, _ base.Reason) { m.settingsOpen.Set(open) },
-		Title:        "设置仓库目录",
-		DescriptionFunc: func() string {
-			return "无法从当前目录确定目标仓库。请选择仓库的顶层目录；这个覆盖只用于本次运行，不会写进配置。"
-		},
-		TestID: "settings",
-		Children: []core.Node{
-			core.Text{ContentFunc: reason, MaxLines: 4, Style: ui.TypeCaption, StyleFunc: ui.Colored(ui.ColorsOf(m.cx).Danger)},
-			ui.Input{Value: m.repoText.Get, OnChange: m.repoText.Set, Placeholder: "仓库顶层目录", TestID: "settings-repo"},
-			core.View{Style: core.Style{Direction: core.Row, Gap: 8, JustifyContent: core.JustifyEnd}, Children: []core.Node{
-				ui.Button{Text: "选择目录", Variant: ui.ButtonSecondary, Icon: lucide.FolderOpen, OnPress: m.pickRepo, TestID: "settings-pick"},
-			}},
-		},
-		Footer: []core.Node{
-			ui.Button{Text: "取消", Variant: ui.ButtonGhost, OnPress: func() { m.settingsOpen.Set(false) }, TestID: "settings-cancel"},
-			ui.Button{Text: "用这个目录重试", Variant: ui.ButtonPrimary, OnPress: m.retry, TestID: "settings-retry"},
-		},
-	}
 }

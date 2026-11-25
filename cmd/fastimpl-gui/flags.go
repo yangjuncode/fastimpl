@@ -1,7 +1,7 @@
 // Command fastimpl-gui 是 fastimpl 的桌面界面：选 issue、看依赖图、
 // 跟随构图进度与调度状态，并在每个 worker 的终端页里直接与 agent
 // 对话。它复用 cmd/fastimpl 的同一套运行管线（app.RunObserved），
-// 只把进度、图与调度器状态作为事件接出来。
+// 依赖图建好后先停在确认门禁前，用户点击开始调度后才连接 hcgo。
 package main
 
 import (

@@ -37,6 +37,8 @@ const (
 	viewFailed
 	// viewRemote 是他人或别的 agent 正在处理（看板进行中）。
 	viewRemote
+	// viewReady 是前置已全部完成，可以开始工作。
+	viewReady
 	// viewPending 是已入图，等前置完成。
 	viewPending
 )
@@ -58,6 +60,8 @@ func (v viewState) String() string {
 		return "failed"
 	case viewRemote:
 		return "in progress elsewhere"
+	case viewReady:
+		return "ready"
 	}
 	return "pending"
 }
@@ -134,6 +138,8 @@ func stateBadge(colors ui.Colors, v viewState) (func() core.Color, func() *core.
 		return colors.Danger, lucide.CircleX, "失败"
 	case viewRemote:
 		return colors.Info, lucide.CloudCog, "远端进行中"
+	case viewReady:
+		return colors.Up, lucide.CirclePlay, "可开始工作"
 	}
 	return colors.Muted, lucide.CircleDashed, "等待前置"
 }
@@ -243,8 +249,8 @@ func (d diagram) flowData(look *liveGraph) uiflow.Data {
 type liveGraph struct {
 	// Revision 递增即表示某处的运行状态变了。
 	Revision *core.Signal[int]
-	// Lookup 按 key 返回最新的节点与运行数据。
-	Lookup func(graph.Key) (graph.Node, scheduler.TaskRuntime, bool)
+	// Lookup 按 key 返回最新的节点、运行数据、是否 ready 与是否存在。
+	Lookup func(graph.Key) (graph.Node, scheduler.TaskRuntime, bool, bool)
 }
 
 // read 订阅刷新信号并返回当前值。
@@ -271,16 +277,21 @@ func (c nodeCard) Render(cx *core.Scope) core.Node {
 	colors := ui.ColorsOf(cx)
 	c.look.read(cx)
 	node, rt := c.node, scheduler.TaskRuntime{}
+	ready := false
 	if c.look != nil && c.look.Lookup != nil {
-		if live, r, ok := c.look.Lookup(c.key); ok {
+		if live, r, isReady, ok := c.look.Lookup(c.key); ok {
 			node = live
 			rt = r
+			ready = isReady
 		}
 	}
 	if c.specCard {
 		node.Title = c.title
 	}
 	state := nodeState(node)
+	if ready && state == viewPending {
+		state = viewReady
+	}
 	if c.specCard && !node.Closed {
 		// 父 issue 本身不进调度：它只表示"这是本次运行的根"。
 		state = viewPending
@@ -325,7 +336,7 @@ func (c nodeCard) Render(cx *core.Scope) core.Node {
 	}
 
 	card := uiflow.Card{Width: cardWidth, Header: header, Body: body, Footer: footer}
-	if state == viewRunning || state == viewFinalizing {
+	if state == viewRunning || state == viewFinalizing || state == viewReady {
 		card.Variant = uiflow.CardAccent
 	}
 	return card

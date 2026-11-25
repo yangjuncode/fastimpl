@@ -22,6 +22,7 @@ func specSnapshot() snapshot {
 				Deps: []graph.Key{{ProjectID: 1, IID: 9}}},
 			{Key: graph.Key{ProjectID: 2, IID: 3}, Title: "cross repo blocker", Kind: graph.KindExternal, Closed: true},
 		},
+		Ready: []graph.Key{{ProjectID: 1, IID: 9}},
 		Status: []scheduler.TaskRuntime{
 			{Key: graph.Key{ProjectID: 1, IID: 9}, Addr: "t1", Label: "proj-issue-9"},
 		},
@@ -165,5 +166,11 @@ func TestProgressMessageNamesPhases(t *testing.T) {
 		if got := progressMessage(tc.p); !strings.Contains(got, tc.want) {
 			t.Errorf("progressMessage(%+v) = %q, want it to mention %q", tc.p, got, tc.want)
 		}
+	}
+}
+
+func TestViewReadyName(t *testing.T) {
+	if got := viewReady.String(); got != "ready" {
+		t.Fatalf("viewReady.String() = %q, want ready", got)
 	}
 }

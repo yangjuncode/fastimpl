@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/template"
 
@@ -58,6 +59,24 @@ func Load(workDir, path string) (string, error) {
 		return "", fmt.Errorf("seed template %s: %w", resolved, werr)
 	}
 	return DefaultTemplate, nil
+}
+
+// SaveWorkDirCopy 把当前生效的提示词完整保存到
+// <work-dir>/fastimpl.prompt.md，之后该目录运行时优先使用这份项目级
+// 模板。返回实际写入的路径。
+func SaveWorkDirCopy(workDir, text string) (string, error) {
+	if workDir == "" {
+		return "", errors.New("work directory is empty")
+	}
+	abs, err := filepath.Abs(workDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve work-dir %s: %w", workDir, err)
+	}
+	path := filepath.Join(abs, DefaultFile)
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		return "", fmt.Errorf("write prompt template %s: %w", path, err)
+	}
+	return path, nil
 }
 
 // Vars 是模板渲染变量。
