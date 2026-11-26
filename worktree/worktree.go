@@ -292,6 +292,12 @@ func (r *Repo) TopLevel(ctx context.Context, dir string) (string, error) {
 	return resolvePath(dir, top), nil
 }
 
+// VerifyWorktree 校验 dir 是否仍是本仓库中 branch 的 linked worktree。
+// 崩溃恢复/跨重启复用必须用公开入口做这层身份核验，不能只信路径存在。
+func (r *Repo) VerifyWorktree(ctx context.Context, dir, branch string) error {
+	return r.verifyWorktree(ctx, dir, branch)
+}
+
 // verifyWorktree 确认 dir 是 r.Root 仓库中停在 refs/heads/<branch> 的
 // worktree。普通仓库、别的仓库、detached 或停在其它分支都报错，且不做
 // 任何修改。

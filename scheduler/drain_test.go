@@ -93,16 +93,8 @@ func TestRunDrainsBeforeReturning(t *testing.T) {
 	sessions.waitStarted(t)
 	cleanupSaw := make(chan struct{})
 	sessions.onStop = func() {
-		// Stop 时校验：本地锁与认领此时都还没清（清理发生在 Run 之后）。
-		if !lockExists(repoDir, 9) {
-			t.Errorf("local lock for 9 was removed before Run returned")
-		}
-		f.mu.Lock()
-		n := countClaims(f.comments[9])
-		f.mu.Unlock()
-		if n != 1 {
-			t.Errorf("claim marker for 9 already released before Run returned")
-		}
+		// 每个任务清完自己的锁/claim 后仍可能等另一个任务 drain；这里只
+		// 记录 Stop 已发生，真正的“清理必须先于 Run 返回”在下方统一断言。
 		select {
 		case <-cleanupSaw:
 		default:

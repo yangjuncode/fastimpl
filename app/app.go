@@ -112,6 +112,23 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 		}
 	}
 	log.Info("repository", "dir", repoDir, "work_dir", workDir)
+	if opts.SpecIID == 0 {
+		// CLI 未输入 spec 时先扫描本仓库 active metadata：死 supervisor 的
+		// 可接管现场直接恢复原 spec；活 supervisor 只报告 hc attach 信息，
+		// 绝不进入第二个 scheduler。
+		spec, handled, err := recoverSpecFromActive(repoDir, stderr, log)
+		if err != nil {
+			return err
+		}
+		if handled {
+			return nil
+		}
+		if spec == 0 {
+			return errors.New("spec issue IID is required; no recoverable active fastimpl run was found for this repository")
+		}
+		opts.SpecIID = spec
+		cfg.SpecIID = spec
+	}
 	repo := worktree.NewRepo(repoDir, "")
 	host, projectPath, err := repo.OriginCoordinate(ctx)
 	if err != nil {
@@ -145,10 +162,22 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	if opts.Print {
 		return g.WritePlan(stdout)
 	}
+	// -print/-json 与建图都是只读观察，不拦截；一旦要越过 GUI/CLI 的
+	// 调度门禁去准备集成分支、push/EnsureMR 或连接 hc，就必须先确认没有
+	// live supervisor。否则即使任务级最后拒绝偷锁，前面的写操作已经违规。
+	if err := checkActiveSpecBeforeWrites(repoDir, opts.SpecIID, time.Now()); err != nil {
+		return err
+	}
 	if observer.BeforeSchedule != nil {
 		if err := observer.BeforeSchedule(ctx); err != nil {
 			return err
 		}
+	}
+	// GUI 的确认门禁可能敞开很久；门禁前的 preflight 不能覆盖等待期间
+	// 另一个实例刚刚启动的情况。真正写集成分支/连接 hc 前再 authoritative
+	// 检查一次。
+	if err := checkActiveSpecBeforeWrites(repoDir, opts.SpecIID, time.Now()); err != nil {
+		return err
 	}
 	tmpl, err := prompt.Load(workDir, opts.TemplatePath)
 	if err != nil {
@@ -217,10 +246,14 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	return runErr
 }
 
-// viewerAttach 返回用与调度同源的 hc 配置打开观看流的方式。每次
-// attach 自己开一条连接，与调度器的 Runner 生命周期无关：关掉界面上的
-// 终端不会影响 worker，后台连接关闭也不会连坐。连接由流自己持有，
-// 关闭流时一并释放。
+// ViewerAttach 返回用给定 hc 配置打开观看流的方式。GUI 的正常运行与
+// active worker 只读观察共用这条路径；每次 attach 自己开一条连接，与
+// 调度器的 Runner 生命周期无关：关掉界面上的终端不会影响 worker，后台
+// 连接关闭也不会连坐。连接由流自己持有，关闭流时一并释放。
+func ViewerAttach(hcBinary, hcSocket string) AttachTerminal {
+	return viewerAttach(hcBinary, hcSocket)
+}
+
 func viewerAttach(hcBinary, hcSocket string) AttachTerminal {
 	return func(ctx context.Context, addr string, cols, rows int) (io.ReadWriteCloser, error) {
 		return worker.OpenViewer(ctx, worker.ViewerOptions{

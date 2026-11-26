@@ -6,6 +6,7 @@ require (
 	github.com/nsgo-dev/nsgo v0.3.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/yangjuncode/hcgo v0.1.0
+	golang.org/x/sys v0.50.0
 )
 
 require (
@@ -20,7 +21,6 @@ require (
 	go.yaml.in/yaml/v3 v3.0.6 // indirect
 	golang.org/x/image v0.48.0 // indirect
 	golang.org/x/net v0.62.0 // indirect
-	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/term v0.48.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect

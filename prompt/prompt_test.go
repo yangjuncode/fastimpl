@@ -66,12 +66,12 @@ func TestDefaultTemplateBranch(t *testing.T) {
 // TestDefaultTemplateReviewToggle require_review 开关第三方审核段：
 // true 时包含 reviewer 与"两轮审核"，false 时整段不出现。
 func TestDefaultTemplateReviewToggle(t *testing.T) {
-	v := Vars{IssueNo: 1, Token: "t", Worktree: "/wt", WorkDir: "/wd", RepoDir: "/r", RequireReview: true}
+	v := Vars{IssueNo: 1, Token: "t", Worktree: "/wt", WorkDir: "/wd", RepoDir: "/r", RequireReview: true, Reviewer: "swe-reviewer"}
 	on, err := Render(DefaultTemplate, v)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(on, "fusion-3rd-reviewer-swe2max") || !strings.Contains(on, "两轮审核") {
+	if !strings.Contains(on, "使用 swe-reviewer 独立审核") || !strings.Contains(on, "两轮审核") {
 		t.Fatalf("review-on render missing reviewer clause")
 	}
 	v.RequireReview = false
@@ -104,5 +104,20 @@ func TestSaveWorkDirCopy(t *testing.T) {
 	}
 	if string(data) != text {
 		t.Fatalf("saved prompt = %q, want %q", string(data), text)
+	}
+}
+
+// reviewer 不是硬编码：默认模板通过 {{.Reviewer}} 填入配置值，允许
+// gpt/gemini/swe 等不同审核后端共存。
+func TestDefaultTemplateRendersConfiguredReviewer(t *testing.T) {
+	out, err := Render(DefaultTemplate, Vars{RequireReview: true, Reviewer: "swe-reviewer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "使用 swe-reviewer 独立审核") {
+		t.Fatalf("configured reviewer missing from prompt: %s", out[:240])
+	}
+	if strings.Contains(out, "fusion-3rd-reviewer") {
+		t.Fatalf("prompt still hard-codes the old reviewer: %s", out[:240])
 	}
 }

@@ -5,9 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
 
 	"github.com/nsgo-dev/nsgo"
 	"github.com/nsgo-dev/nsgo/core"
@@ -36,30 +33,16 @@ func main() {
 // runGUI 打开主窗口并等它结束。传入 issue 时窗口启动后自动构图，
 // 但调度会停在确认门禁前；没传时以空状态打开，由用户在界面里录入。
 //
-// 窗口关闭、Ctrl+C 或 SIGTERM 都会取消运行，并给调度器时间收尾
-// （停终端、释放认领与本地锁）。
+// 窗口关闭采用 detach 语义：GUI 进程退出，但 hc 里的 worker 继续运行；
+// active metadata/heartbeat 留在本机，下一次启动据此观察或接管。只有界面
+// 上的“停止”按钮会取消调度并执行停终端、释放认领与本地锁的收尾。
+// 即使进程收到 Ctrl+C/SIGTERM 也不偷偷取消 worker：命令行 Ctrl+C 的显式
+// 中断语义只属于 CLI；GUI 的显式停止入口就是停止按钮。
 func runGUI(opts app.Options) int {
 	own := func(cx *core.Scope) core.Node {
 		desktop.SetShutdownMode(cx, desktop.ShutdownOnMainWindowClose)
 		s := newSession()
 		m := newModel(cx, s, opts)
-		// 关闭窗口先取消运行：退出请求在窗口真正消失之前处理，调度器
-		// 的收尾因此还有机会执行；收尾最多等 quitGrace。
-		desktop.OnQuitRequest(cx, func(q *desktop.QuitRequest) {
-			if !s.Running() {
-				return
-			}
-			s.Stop()
-			quit := q.Defer()
-			go func() {
-				deadline := time.Now().Add(quitGrace)
-				for s.Running() && time.Now().Before(deadline) {
-					time.Sleep(50 * time.Millisecond)
-				}
-				quit(true)
-			}()
-		})
-		signals(cx, s)
 		if opts.SpecIID > 0 {
 			// 传入 issue：启动后在后台构图，窗口先出来；调度仍需用户确认。
 			cx.Post(func() { m.start() })
@@ -68,23 +51,4 @@ func runGUI(opts app.Options) int {
 	}
 	nsgo.Run(own, nsgo.WindowSize(1180, 760))
 	return 0
-}
-
-// quitGrace 是关闭窗口时等待调度器收尾的上限。
-const quitGrace = 8 * time.Second
-
-// signals 把 Ctrl+C/SIGTERM 变成取消运行，再退出进程。
-func signals(cx *core.Scope, s *session) {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
-	cx.Cleanup(func() { signal.Stop(ch) })
-	go func() {
-		if _, ok := <-ch; !ok {
-			return
-		}
-		// 先取消，让调度器开始收尾，再请引擎退出；引擎退出前会等
-		// 退出请求的处理，收尾因此不会被一刀切掉。
-		s.Stop()
-		cx.Post(func() { cx.Quit() })
-	}()
 }

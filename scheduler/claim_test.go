@@ -491,6 +491,9 @@ func TestRunTaskStopsWorkerWhenEarlierClaimAppears(t *testing.T) {
 	if len(closed) != 0 {
 		t.Fatalf("closed %v, want none (lost claim must not close the issue)", closed)
 	}
+	if _, err := os.Stat(ActiveMetaPath(repoDir, 9)); !os.IsNotExist(err) {
+		t.Fatalf("active metadata remains after the explicit stop/claim-loss cleanup: %v", err)
+	}
 }
 
 // lateClaimSessions 在 worker 启动后插入一条更早的认领，模拟对手晚到

@@ -31,7 +31,7 @@ const DefaultTemplate = `使用 implement 技能完成 {{.Forge}} 子任务 #{{.
 本任务的代码产出目录是 git worktree {{.Worktree}}（当前分支 {{.Branch}}）：所有新代码、修改、提交都在其中进行（可用 git -C {{.Worktree}}）；fastimpl 管理集成分支 {{.IntBranch}}（合并、推送、关闭 issue、清理 worktree 都由它完成），你的提交若与 {{.IntBranch}} 冲突，在 {{.Worktree}} 中 git merge {{.IntBranch}} 解决。
 读取任务正文和评论，先说明任务标题。只在 {{.Worktree}} 中修改和提交。
 {{if .RequireReview}}
-完成实现与仓库要求的验证后，先由 leader 审核，再使用 fusion-3rd-reviewer-swe2max 独立审核。修复发现的问题，重新验证及审核后提交。
+完成实现与仓库要求的验证后，先由 leader 审核，再使用 {{.Reviewer}} 独立审核。修复发现的问题，重新验证及审核后提交。
 {{else}}
 完成实现与仓库要求的验证后提交。
 {{end}}
@@ -110,6 +110,9 @@ type Vars struct {
 	// RequireReview 是否把"leader + 第三方独立审核全部通过"写成
 	// 硬性要求，写作 {{.RequireReview}}（配置 require_review）。
 	RequireReview bool
+	// Reviewer 是第三方 reviewer 名称，写作 {{.Reviewer}}；由配置
+	// reviewer 提供，默认是 gpt-reviewer，也可换成 gemini-reviewer、swe-reviewer 等。
+	Reviewer string
 }
 
 // Render 用 text/template 渲染模板，{{.Field}} 与 if/range 等

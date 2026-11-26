@@ -115,7 +115,10 @@ func newModel(cx *core.Scope, s *session, opts app.Options) *model {
 		m.issueText.Set(strconv.Itoa(opts.SpecIID))
 	}
 	s.SetOnChange(m.notify)
-	cx.Cleanup(func() { m.terms.closeAll() })
+	cx.Cleanup(func() {
+		m.terms.closeAll()
+		s.StopObserving()
+	})
 	// 启动即预览三个目录：工作目录默认就是 GUI 的当前目录，仓库目录按
 	// 既有规则定位，worktree 目录按既有优先级推断。只读本地，不联网。
 	s.Discover(opts)
@@ -201,6 +204,54 @@ func (m *model) sync() {
 			m.repoText.Set(repo)
 		}
 		m.openSettings()
+	}
+	// 损坏或新版 active metadata 不能静默跳过：它可能代表当前二进制不懂的
+	// 运行中 worker。先变成可见的保守失败；用户检查/清理后才能继续。
+	if snap.ActiveScanErr != nil && !snap.Running && !snap.Observing && !snap.AutoStarted && snap.Phase == phaseIdle {
+		m.session.failLocal(fmt.Errorf("检测到无法安全理解的 active worker metadata：%w", snap.ActiveScanErr))
+		m.notify()
+		return
+	}
+	// 空 issue 启动时优先恢复本仓库 active worker：死 supervisor 的可接管
+	// 现场自动继续；活 supervisor 只读观察；心跳卡住/阶段不明则保守提示。
+	// 显式输入/传入 spec 时只看同一 spec 的 active run：无关 spec 仍在跑
+	// 不应劫持这次明确启动。
+	activeRuns := snap.ActiveRuns
+	if text := strings.TrimSpace(m.issueText.GetUntracked()); text != "" {
+		iid, err := strconv.Atoi(strings.TrimPrefix(text, "#"))
+		if err != nil || iid <= 0 {
+			activeRuns = nil
+		} else {
+			filtered := make([]scheduler.ActiveTaskMeta, 0, len(activeRuns))
+			for _, meta := range activeRuns {
+				if meta.SpecIID == iid {
+					filtered = append(filtered, meta)
+				}
+			}
+			activeRuns = filtered
+		}
+	}
+	// AutoStarted 只防止“带 issue 首次启动”重复触发，不能阻止 active
+	// recovery：显式启动可能已在 preflight 中转入 observer，原 supervisor
+	// 退出后仍必须自动评估接管。接管失败会进入 failed/stopped，不会循环。
+	if len(activeRuns) > 0 && !snap.Running && !snap.Observing && snap.Phase == phaseIdle {
+		choice := scheduler.ChooseActiveSpec(activeRuns, time.Now())
+		if choice.SpecIID > 0 && m.issueText.GetUntracked() == "" {
+			m.issueText.Set(strconv.Itoa(choice.SpecIID))
+		}
+		switch choice.State {
+		case scheduler.ActiveRecoveryAdoptable:
+			m.session.MarkAutoStarted()
+			m.start()
+			return
+		case scheduler.ActiveRecoveryObserve:
+			m.session.ObserveActive(choice.Tasks)
+			return
+		case scheduler.ActiveRecoveryBlocked:
+			m.session.failLocal(fmt.Errorf("检测到 issue #%d 的 active worker，但 heartbeat/阶段状态不安全；请先确认原 fastimpl 进程状态或清理 metadata", choice.SpecIID))
+			m.notify()
+			return
+		}
 	}
 	// 带 issue 启动时，路径全部就绪后才自动开始，且只自动开始一次：
 	// 路径缺失时停在居中的启动表单，等用户补齐。
@@ -335,6 +386,8 @@ func (m *model) startButton() core.Node {
 		switch {
 		case s.WaitingStart:
 			return "开始调度"
+		case s.Observing:
+			return "只读观察中"
 		case s.Running && (s.Phase == phaseStarting || s.Phase == phaseBuilding || s.Phase == phaseReady):
 			return "构建中"
 		case s.Running:
@@ -346,7 +399,7 @@ func (m *model) startButton() core.Node {
 	}
 	busy := func() bool {
 		s := m.snapshot()
-		return s.Running && !s.WaitingStart
+		return s.Observing || (s.Running && !s.WaitingStart)
 	}
 	return ui.Button{TextFunc: text, Variant: ui.ButtonPrimary, Icon: lucide.Play, Busy: busy, Disabled: busy,
 		OnPress: func() {
@@ -694,7 +747,13 @@ func (m *model) logPage() core.Node {
 func (m *model) graphPage() core.Node {
 	return core.View{TestID: "graph-page", Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0), Overflow: core.Hidden},
 		Children: []core.Node{
-			core.Show{When: func() bool { return m.snapshot().GraphReady }, Then: func(*core.Scope) core.Node {
+			core.Show{When: func() bool {
+				s := m.snapshot()
+				return s.GraphReady || s.Phase == phaseObserving
+			}, Then: func(*core.Scope) core.Node {
+				if m.snapshot().Phase == phaseObserving {
+					return m.observerPage()
+				}
 				look := m.look()
 				return core.View{Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0), Overflow: core.Hidden},
 					Children: []core.Node{
@@ -722,6 +781,9 @@ func (m *model) graphPage() core.Node {
 						m.legend(),
 					}}
 			}, Else: func(*core.Scope) core.Node {
+				if m.snapshot().Phase == phaseObserving {
+					return m.observerPage()
+				}
 				return m.emptyState()
 			}},
 		}}
@@ -764,6 +826,69 @@ func (m *model) legend() core.Node {
 		item(lucide.TriangleAlert, colors.Warn, "需要处理"),
 		item(lucide.CloudCog, colors.Info, "远端进行中"),
 	}}
+}
+
+// observerPage 是 active worker 只读观察页。依赖图属于原 supervisor 的
+// 内存状态，本进程不联网重建、不发 claim；可安全展示的是 metadata 里的
+// issue、worktree、hc 终端与 supervisor/heartbeat 信息，终端页在上方 tab 中。
+func (m *model) observerPage() core.Node {
+	colors := ui.ColorsOf(m.cx)
+	runView := func(meta scheduler.ActiveTaskMeta) core.Node {
+		current := func(render func(scheduler.ActiveTaskMeta) string) func() string {
+			return func() string {
+				for _, candidate := range m.snapshot().ActiveRuns {
+					if candidate.IssueIID == meta.IssueIID {
+						return render(candidate)
+					}
+				}
+				return render(meta)
+			}
+		}
+		heartbeatText := func(meta scheduler.ActiveTaskMeta) string {
+			heartbeat := "未知"
+			if !meta.Supervisor.HeartbeatAt.IsZero() {
+				heartbeat = meta.Supervisor.HeartbeatAt.Format("2006-01-02 15:04:05")
+			}
+			return fmt.Sprintf("supervisor pid: %d · instance: %s · heartbeat: %s", meta.Supervisor.PID, meta.Supervisor.InstanceID, heartbeat)
+		}
+		return core.View{TestID: fmt.Sprintf("observer-run-%d", meta.IssueIID),
+			Style: core.Style{Direction: core.Column, Gap: 3, Padding: core.All(8), BorderWidth: 1, CornerRadius: 8},
+			StyleFunc: func() core.Style {
+				return core.Style{BorderColor: colors.Border(), Background: colors.Background()}
+			}, Children: []core.Node{
+				core.Text{ContentFunc: current(func(meta scheduler.ActiveTaskMeta) string {
+					return fmt.Sprintf("issue #%d · stage %s · hc terminal: %s (%s)", meta.IssueIID, meta.Stage, meta.TerminalName, meta.TerminalAddr)
+				}), MaxLines: 2, Style: ui.TypeCaption, StyleFunc: ui.Colored(colors.Text)},
+				core.Text{ContentFunc: current(func(meta scheduler.ActiveTaskMeta) string { return "worktree: " + meta.Worktree }), MaxLines: 2,
+					Style: ui.TypeCaption, StyleFunc: ui.Colored(colors.Muted)},
+				core.Text{ContentFunc: current(heartbeatText), MaxLines: 2, Style: ui.TypeCaption, StyleFunc: ui.Colored(colors.Muted)},
+			}}
+	}
+	children := []core.Node{
+		core.View{Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: 10}, Children: []core.Node{
+			ui.Icon(lucide.Eye, 24, colors.Accent),
+			ui.Text("正在只读观察 active worker", 16, ui.Semibold, colors.Text),
+		}},
+		core.Text{ContentFunc: func() string { return m.snapshot().Message }, MaxLines: 3,
+			Style: ui.TypeBody, StyleFunc: ui.Colored(colors.Muted)},
+		core.Text{ContentFunc: func() string {
+			s := m.snapshot()
+			return fmt.Sprintf("已发现 %d 个可观察终端；打开上方终端 tab 查看，键盘输入已被禁用", len(s.Status))
+		}, MaxLines: 2, Style: ui.TypeCaption, StyleFunc: ui.Colored(colors.Muted), TestID: "observer-summary"},
+	}
+	for _, meta := range m.snapshot().ActiveRuns {
+		children = append(children, runView(meta))
+	}
+	children = append(children, core.Text{Content: "原 fastimpl 进程退出且现场安全后，本观察者会自动评估并接管；当前实例不会发送 prompt、claim、merge、close 或 kill。",
+		MaxLines: 4, Style: ui.TypeCaption, StyleFunc: ui.Colored(colors.Muted)})
+	return core.View{TestID: "observer-page", Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0), AlignItems: core.AlignCenter,
+		JustifyContent: core.JustifyCenter, Padding: core.All(28)},
+		Children: []core.Node{
+			core.View{Style: core.Style{Width: core.Pt(620), Padding: core.All(24), Gap: 12, BorderWidth: 1, CornerRadius: 14},
+				StyleFunc: func() core.Style {
+					return core.Style{Background: colors.Surface(), BorderColor: colors.Border()}
+				}, Children: children},
+		}}
 }
 
 // emptyState 是还没有图时的启动表单：issue 编号与三个目录，居中显示。

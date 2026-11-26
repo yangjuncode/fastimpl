@@ -92,7 +92,7 @@
   - 全部同项目工作项 `Integrated`/`Closed`/失败 且无在跑 → 正常返回；
   - 无就绪且无在跑但图未完成 → `scheduler stalled` 错误，列出
     needs-attention 项与被开放跨项目前置卡住的项；
-  - `ctx` 取消（Ctrl+C/SIGTERM）→ 走 defer 清理后返回。
+  - `ctx` 取消（CLI 确认停止或 GUI 停止按钮）→ 走 defer 清理后返回。
 
 ### 分支与 worktree 约定
 
@@ -191,6 +191,45 @@ SyncBase(origin/<base>)  →  merge --no-ff <任务分支>  →  push <集成分
   （GitLab MR / GitHub PR，目标为 base 分支）；之后每次集成成功再推送，
   MR 上的提交自然累积，可随时在页面上查看整体进度。
 
+### active metadata、heartbeat 与崩溃恢复
+
+每个任务运行期间除了本地锁，还会在系统 temp 目录维护一份原子 JSON
+sidecar：`fastimpl-<仓库 hash>-<issue>.active.json`。lock 仍只负责互斥；
+metadata 描述“锁背后的工作如何安全继续”，主要包括仓库/work-dir/tree-dir、
+任务 worktree 与分支、spec/issue、hc binary/socket、终端 addr/name/cwd/pid/
+argv、claim token、报告 token、任务阶段、prompt turn baseline、重试次数、
+集成阶段以及 supervisor 的 PID、进程启动 identity、instance、hostname 与
+heartbeat。
+
+- supervisor 每分钟刷新一次 heartbeat；heartbeat 3 分钟内视为新鲜。状态
+  迁移（prompt 已发送、进入 integrating、集成子步骤变化等）会立即落盘，
+  不等下一次 heartbeat。写入使用临时文件 + rename，读者不会看到半份 JSON。
+- heartbeat 新鲜且原 supervisor 进程仍活着（PID 与 Linux `/proc` 进程启动
+  identity 同时匹配）→ 新实例只读观察，绝不偷锁或重发 prompt。
+- 原 supervisor 已死亡 → 不必等满 3 分钟；只要 issue 指派、跨机器 claim、
+  worktree、hc 终端名/labels/cwd/agent argv、集成分支与报告 token 都核验
+  通过，新实例会偷回本机锁并接管原终端。同一 issue 的“判定 → 偷旧锁 →
+  写入新 supervisor metadata”由一个本机 flock 串行化；flock 随进程死亡
+  自动释放，避免两个新实例互相删除对方刚创建的锁。非 Unix 平台没有这个
+  保护时宁可禁用自动接管，也不降级冒险双控。`waiting_report` 直接按原 turn
+  baseline 继续等；`booting` 只覆盖“尚未进入发送动作”的窗口，因此可以
+  发送原 prompt；每次发送前先落 `prompting`，而 `prompting` 一律保守阻塞，
+  因为崩溃可能发生在 prompt 已送达但 `waiting_report` 尚未落盘的交界处，
+  自动接管绝不能重发。`integrating` 重新进入幂等的 sync/merge/push 恢复点。
+- base 冲突的集成 agent 也把 terminal addr/name/cwd/pid/argv、report token、
+  baseline、attempts 与 `prompt_sent` 写进 metadata。只有这些字段完整且终端
+  身份核验通过时才继续等待原 prompt；字段不完整或终端不匹配则保守转人工，
+  绝不启动第二个集成 agent。
+- 原 supervisor 活着但 heartbeat 已过期 → 保守阻塞。它可能只是 scheduler
+  卡住，fastimpl 宁可 needs attention 也不冒险双控。`needs_attention`、
+  schema/路径/身份不匹配、终端死亡、`prompting` 或 integrating 恢复点不完整
+  同样保守阻塞。
+- 普通窗口关闭、进程崩溃或 shell 断开不会取消 hc worker；显式停止/失锁
+  清理成功后才删除 active metadata。任务成功整合后也会删除它；保留终端
+  回看由 retained metadata 负责，两者语义不同。匹配 active pattern 但无法
+  解析、版本不符或仓库身份不符的文件不会静默跳过：CLI preflight 与 GUI
+  启动扫描都会保守提示/阻塞，要求人工检查后再接管。
+
 ### 状态刷新与失败处理
 
 - 任务集成成功 → `Integrated`：close issue → 按 `terminal_retention`
@@ -247,7 +286,7 @@ fastimpl 42                 # 正式运行
 ```
 usage: fastimpl [-version] [-init] [-print] [-json file] [-j N] [-config path]
         [-template path] [-repo-dir dir] [-tree-dir dir]
-        [-work-dir dir] <spec-issue-iid>
+        [-work-dir dir] [spec-issue-iid]
 ```
 
 | 参数 | 说明 |
@@ -263,6 +302,14 @@ usage: fastimpl [-version] [-init] [-print] [-json file] [-j N] [-config path]
 | `-tree-dir <dir>` | worktree 父目录；缺省自动推断（见下） |
 | `-work-dir <dir>` | fastimpl 工作目录；默认当前目录 |
 
+`spec-issue-iid` 现在可省略。省略时 fastimpl 会先扫描本仓库在本机留下的
+active metadata：若发现已死亡 supervisor 留下的可接管现场，就自动恢复原
+spec；若原 supervisor 仍活着且 heartbeat 新鲜，只打印各终端的 `hc attach`
+观察方式并退出，绝不启动第二个 scheduler；若没有可恢复现场则报错并要求
+显式输入 spec。显式输入 spec 时，app 会在同步/推送集成分支、确保 MR 或
+连接 hc 之前先做同 spec 的 active preflight：live supervisor 直接拒绝并
+给出 `hc attach` 信息，dead supervisor 的可接管现场才进入 scheduler 恢复。
+
 ### 图形界面 fastimpl-gui
 
 `cmd/fastimpl-gui` 是同一套运行管线的桌面前端（NSGo）。它复用 app 层的
@@ -275,7 +322,7 @@ usage: fastimpl-gui [-version] [-j N] [-config path] [-template path]
 
 - 窗口顶部在 `fastimpl` 标题旁显示当前构建版本；`fastimpl-gui -version`
   打印版本后退出，不打开窗口。
-- 不传 issue：主窗口以空状态打开，在界面里录入后先构建依赖图。
+- 不传 issue：主窗口启动并解析目录后会扫描本仓库 active metadata。发现可接管的崩溃/关闭现场时自动填入并恢复原 spec；发现仍活着的 supervisor 时进入只读观察，不要求用户重新输入 issue。
 - 传 issue：窗口出现后在后台自动构图；图就绪后停在"ready"，必须点击
   **开始调度**才会准备集成分支、连接 hcgo 并启动 worker。
 - `-repo-dir` 与启动表单里的"仓库目录"只对本次运行有效，不写回配置。
@@ -301,8 +348,16 @@ usage: fastimpl-gui [-version] [-j N] [-config path] [-template path]
   集成、错误与结束等），界面保留最近 200 行；在底部时自动跟随新日志，
   向上翻阅时暂停跟随。设置里的 `log_file` 非空时同时 append 到该文件，
   并在下次运行时限量读回尾部。
-- 停止按钮、关闭窗口与 Ctrl+C/SIGTERM 都会取消运行并给调度器收尾时间
-  （最多 8 秒）；取消后的状态显示"已停止"，不会显示成完成。
+- **停止按钮是 GUI 中唯一正常的显式取消入口**：它会取消调度、停止本实例
+  管理的终端并释放 claim/lock。普通关闭窗口采用 detach 语义——GUI 进程退出，
+  但 hc 里的 worker 继续运行，active metadata/heartbeat 留在本机供下次启动
+  观察或接管。即使 GUI 进程收到 Ctrl+C/SIGTERM 也不会偷偷取消 worker；GUI
+  的唯一显式停止入口就是停止按钮。
+- 只读观察页不会发 prompt、claim、merge、close 或 kill；终端键盘输入、
+  自动应答与 resize 都不会写入原 worker，resize 只影响本地视图。页面按任务
+  列出 issue、阶段、worktree、hc terminal/addr、supervisor pid、instance 与
+  heartbeat。观察者只读本机 metadata 并刷新这些字段；原 supervisor 后续派发
+  的同 spec 新任务也会进入观察。发现原 supervisor 退出且现场安全时会自动转为接管。
 - 界面线程只读本地快照（约 400ms 合并刷新，结果到达时强制刷新），
   绝不轮询 forge，也不在 UI 线程上做 hc/网络/git 调用。
 
@@ -333,6 +388,7 @@ git 时把短提交哈希附在后面，形如 `0.1.0+abcdef0`，拿不到 hash 
 # agent_cmd = "devin --permission-mode dangerous"  # worker 的 agent 命令行
 # integration = "branch"     # 覆盖默认集成分支 issue-<spec>-integration
 # require_review = true      # worker 提示词是否强制 leader + 第三方双审（默认 false）
+# reviewer = "gpt-reviewer"  # 第三方 reviewer 名称；可填 gemini-reviewer、swe-reviewer 等
 # hc_socket = "/run/user/1000/hc.sock"  # herdr-core socket（与 hc_binary 二选一）
 # hc_binary = "hc"                      # 或经 hc connect 连接
 ```
@@ -344,6 +400,10 @@ git 时把短提交哈希附在后面，形如 `0.1.0+abcdef0`，拿不到 hash 
 - **`hc_binary` 与 `hc_socket` 互斥**：前者执行 `hc connect` 拉起/连接
   herdr-core，后者直连已有 Unix socket。
 - **`retries = 0` 是合法值**（只尝试一次，不续写）。
+- **`reviewer`** 是第三方 reviewer 名称，默认 `gpt-reviewer`；可配置为
+  `gemini-reviewer`、`swe-reviewer` 或自己的 reviewer。该值通过提示词模板
+  变量 `{{.Reviewer}}` 原样填入，只有 `require_review = true` 时默认模板
+  才会包含这段双审要求。
 - **`terminal_retention`** 是单个 Go duration 或 `never`。`0s` 保持旧行为：
   任务成功整合后立即停止终端；`10m` 等正值会把终端保留到到期后由后台
   尽力停止；`never` 不自动停止。延迟/永不停止时 fastimpl 会把终端地址、
@@ -390,6 +450,8 @@ git 时把短提交哈希附在后面，形如 `0.1.0+abcdef0`，拿不到 hash 
 - `{{.ForgeCLI}}` — 对应的 issue 命令行工具（`glab`/`gh`）
 - `{{.RequireReview}}` — 是否强制 leader + 第三方独立审核
   （`require_review` 配置，默认 false）
+- `{{.Reviewer}}` — 第三方 reviewer 名称（`reviewer` 配置，默认
+  `gpt-reviewer`；默认模板在 `require_review` 打开时把它填入独立审核要求）
 
 模板与 fastimpl 的**唯一契约是报告协议**：任务全部完成（含仓库要求的
 验证）后在回复末尾单独一行输出 `FASTIMPL-READY <token>`，随后最多六行
@@ -427,15 +489,25 @@ forge      配置 forge > origin 主机名推断 > glab/gh 探测 > gitlab
   轮次超时（90min，复杂任务可拆小）、claim 被拒（权限）、跨项目前置
   仍开放（只能等外部关闭或人工处理后重跑）。
 
-### 中断与重跑
+### 中断、关闭与重跑
 
-- **Ctrl+C / SIGTERM**：`signal.NotifyContext` 取消运行，调度器走 defer
-  清理（回收集成终端等）后退出；正在跑的任务终端与 worktree 保留。
-- **重跑**：命令是幂等的——已关闭/已集成的不会重做；已存在的
-  `issue-*` 分支与 worktree 会复用；集成分支存在则在其上继续。把上次
-  needs-attention 的 issue 处理好（或确认它本就该被关闭）后直接再次
-  `fastimpl <spec>` 即可续跑。若上一轮按 `terminal_retention` 保留了同一
-  issue 的终端，重启后会先接管它；身份匹配时默认复用，过期 delayed
+- **CLI Ctrl+C / SIGTERM**：先询问是否停止。只有输入 `y`/`yes` 才取消运行、
+  停掉本实例管理的 worker 并释放 claim/lock；其它回答、EOF 或非交互 stdin
+  都按默认 detach，只退出 CLI，hc worker 继续运行。停止失败时仍保留现场并
+  提示人工处理。
+- **GUI 停止按钮**：同上的显式取消入口。
+- **GUI 普通关闭窗口 / 进程崩溃 / shell 断开**：detach。hc worker 继续运行，
+  active metadata 与本地 lock 留在本机；因为进程已退出，heartbeat 不再刷新。
+- **CLI 无 spec 重启**：扫描当前仓库 active metadata。死 supervisor 的可接管
+  现场自动恢复原 spec；活 supervisor 只报告 `hc attach` 观察方式；不安全状态
+  直接报错。显式输入 spec 也会先做这个 preflight，避免先写集成分支/MR 后
+  才发现另一个 supervisor。
+- **GUI 无 issue 启动**：目录解析后自动扫描当前仓库 active metadata。可接管
+  时自动恢复；活 supervisor 时进入只读观察，且观察者发现原 supervisor 退出后
+  会自动评估接管。显式输入 spec 时，scheduler 也会对每个任务做同样判定。
+- **普通重跑**：已关闭/已集成的不会重做；已存在的 `issue-*` 分支与 worktree
+  会复用；集成分支存在则在其上继续。若上一轮按 `terminal_retention` 保留了同一
+  issue 的已完成终端，重启后会先接管它；身份匹配时默认复用，过期 delayed
   终端会先清理，无法安全复用时则提示人工处理。
 
 ### 跨机器认领与 stale 锁
@@ -463,16 +535,19 @@ worker；不同机器之间用 **issue 评论里的认领标记**做尽力仲裁
   仲裁按服务端 `created_at` 升序、同时间按评论 ID 升序；同一
   (author, instance, claim-id) 保留首次出现的位置，`release` 只对已经
   出现过的同作者认领立墓碑，重复 release 幂等，重复 claim 不会让已释放
-  的认领复活。机器 ID 是稳定的，重启后仍会被视为别的实例的旧认领，
-  不会自动接手。
+  的认领复活。机器 ID 是稳定的；active recovery 不会绕过远端 claim 仲裁。接管前必须确认
+  原 supervisor 已死亡，且原 claim 仍有效、最早且未被释放。
 - **已知限制**：评论 API 没有原子互斥，仲裁是尽力而为——两个实例可能
   短暂同时运行，直到某次复查才发现并让后到者退出；直接在网页上并发
   人工操作同样不受该协议约束。
 - **遗留认领不会自动过期**：看到 `issue already claimed elsewhere` 的
   告警时，先确认对应实例的 worker 确实已经不在跑，再**手工删除**那条
   `fastimpl-claim/v1 claim …` 评论。
-- **遗留本地锁**：启动日志会给出锁文件路径。确认旧 worker 已停止后手工
-  `rm` 该锁文件即可；fastimpl 不会抢锁、也不会自动过期。
+- **遗留本地锁**：如果旁边存在可核验的 active metadata，且 metadata 里的
+  supervisor 已死亡，fastimpl 会在身份/claim/终端全部通过后偷回该锁并接管；
+  没有 metadata、metadata 不安全或 supervisor 状态不明时不会抢锁。此时确认旧
+  worker 已停止后可手工 `rm` 锁文件，并同时清理对应 `.active.json`；旁边的
+  `.adopt` 文件只是 flock 载体，本身不表示锁被持有，通常无需删除。
 - **两边都保留的情况**：如果 fastimpl 无法确认 worker 已停止（启动结果
   不明确、停止失败），会同时保留本地锁与 claim 评论，并打印终端名、
   锁路径、issue 与 claim token。按提示先确认对应 worker 已停止，再删

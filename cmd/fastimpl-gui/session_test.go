@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -646,5 +648,202 @@ func TestSessionStopReleasesScheduleGate(t *testing.T) {
 	waitDone(t, s, changes)
 	if snap := s.Snapshot(); snap.Phase != phaseStopped {
 		t.Fatalf("phase = %v, want stopped after canceling at the gate", snap.Phase)
+	}
+}
+
+// 显式输入 issue 也不能绕过只读观察：app preflight 发现 live supervisor 后，
+// GUI 应切到 observer，而不是先把这次运行标成失败或继续准备集成分支。
+func TestSessionRunActiveConflictSwitchesToObserving(t *testing.T) {
+	meta := guiActiveMeta(t.TempDir(), 8, 9, os.Getpid(), time.Now())
+	s := newSession()
+	s.runFn = func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		return &app.ActiveRunConflictError{SpecIID: 8, Tasks: []scheduler.ActiveTaskMeta{meta}}
+	}
+	if err := s.Start(app.Options{SpecIID: 8}); err != nil {
+		t.Fatal(err)
+	}
+	snap := waitCondition(t, s, "observer mode after an active run conflict", func(snap snapshot) bool { return snap.Observing })
+	if snap.Phase != phaseObserving || snap.Err != nil {
+		t.Fatalf("snapshot = %+v, want clean read-only observation", snap)
+	}
+	if len(snap.Status) != 1 || snap.Status[0].Addr != "t-active" {
+		t.Fatalf("status = %+v, want the observed terminal", snap.Status)
+	}
+}
+
+// guiActiveMeta 构造一份 active metadata。scheduler 的 stage 类型故意不导出，
+// 但它是字符串类型，测试可以用可赋值的字符串常量填写 JSON 字段。
+func guiActiveMeta(repoDir string, spec, issue int, pid int, heartbeat time.Time) scheduler.ActiveTaskMeta {
+	return scheduler.ActiveTaskMeta{
+		Version:           1,
+		RepoDir:           repoDir,
+		WorkDir:           repoDir + "/work",
+		TreeDir:           repoDir + "/.worktrees",
+		Worktree:          repoDir + "/.worktrees/issue-" + strconv.Itoa(issue),
+		IntegrationDir:    repoDir + "/.worktrees/issue-" + strconv.Itoa(spec) + "-integration",
+		ProjectID:         1,
+		SpecIID:           spec,
+		IssueIID:          issue,
+		Branch:            "issue-" + strconv.Itoa(issue),
+		IntegrationBranch: "issue-" + strconv.Itoa(spec) + "-integration",
+		TerminalAddr:      "t-active",
+		TerminalName:      "repo-issue-" + strconv.Itoa(issue),
+		HCBinary:          "hc",
+		ClaimToken:        "claim",
+		ReportToken:       "report",
+		Stage:             "waiting_report",
+		StartedAt:         heartbeat.Add(-time.Minute),
+		UpdatedAt:         heartbeat,
+		Supervisor: scheduler.SupervisorMeta{
+			PID:         pid,
+			InstanceID:  "test-box-1",
+			HeartbeatAt: heartbeat,
+		},
+	}
+}
+
+func writeGUIActiveMeta(t *testing.T, meta scheduler.ActiveTaskMeta) {
+	t.Helper()
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scheduler.ActiveMetaPath(meta.RepoDir, meta.IssueIID), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 目录预览完成后必须扫描本仓库 active metadata；这让空 issue 启动的 GUI
+// 能发现上次关闭时仍在运行的 worker。
+func TestDiscoverScansActiveRuns(t *testing.T) {
+	repoDir := t.TempDir()
+	meta := guiActiveMeta(repoDir, 8, 9, -1, time.Now())
+	writeGUIActiveMeta(t, meta)
+	s, _ := discoverSession(func(context.Context, app.Options) (app.PathsPreview, error) {
+		return app.PathsPreview{Paths: app.Paths{WorkDir: repoDir + "/work", RepoDir: repoDir, TreeDir: repoDir + "/.worktrees"}}, nil
+	})
+	s.Discover(app.Options{})
+	snap := waitCondition(t, s, "active run scan", func(snap snapshot) bool { return len(snap.ActiveRuns) == 1 })
+	if snap.ActiveRuns[0].SpecIID != 8 || snap.ActiveRuns[0].IssueIID != 9 || snap.ActiveRuns[0].TerminalAddr != "t-active" {
+		t.Fatalf("ActiveRuns = %+v, want the scanned worker", snap.ActiveRuns)
+	}
+}
+
+// 只读观察模式不是一次调度：running 必须为 false，但状态里要有终端页
+// 所需的 addr/label/started，以便用户能看到原 supervisor 正在管理的 hc 终端。
+func TestObserveActiveRunPopulatesTerminalSnapshot(t *testing.T) {
+	meta := guiActiveMeta(t.TempDir(), 8, 9, os.Getpid(), time.Now())
+	s := newSession()
+	s.ObserveActive([]scheduler.ActiveTaskMeta{meta})
+	snap := s.Snapshot()
+	if snap.Phase != phaseObserving || !snap.Observing {
+		t.Fatalf("phase/observing = %v/%v, want observing", snap.Phase, snap.Observing)
+	}
+	if snap.Running {
+		t.Fatal("observer mode must not count as a local scheduler run")
+	}
+	if len(snap.Status) != 1 || snap.Status[0].Addr != "t-active" || snap.Status[0].StartedAt.IsZero() {
+		t.Fatalf("status = %+v, want terminal identity and original start time", snap.Status)
+	}
+	if len(snap.ActiveRuns) != 1 || snap.ActiveRuns[0].Worktree == "" || snap.ActiveRuns[0].Supervisor.PID != os.Getpid() {
+		t.Fatalf("ActiveRuns = %+v, want observer metadata retained for the page", snap.ActiveRuns)
+	}
+	if snap.Issue != 8 {
+		t.Fatalf("issue = %d, want the observed spec", snap.Issue)
+	}
+}
+
+// 并行任务中其中一个完成并删除 metadata，不代表其他 active worker 也消失。
+// 只要还有任务的 supervisor 活着，观察者就必须收缩到剩余任务继续只读观察，
+// 不能退出成一个既不看也不接管的空状态。
+func TestObservedPartialCompletionKeepsWatchingRemainingRuns(t *testing.T) {
+	repoDir := t.TempDir()
+	meta9 := guiActiveMeta(repoDir, 8, 9, os.Getpid(), time.Now())
+	meta10 := guiActiveMeta(repoDir, 8, 10, os.Getpid(), time.Now())
+	writeGUIActiveMeta(t, meta9)
+	writeGUIActiveMeta(t, meta10)
+	s := newSession()
+	s.ObserveActive([]scheduler.ActiveTaskMeta{meta9, meta10})
+	defer s.StopObserving()
+	if err := os.Remove(scheduler.ActiveMetaPath(repoDir, 9)); err != nil {
+		t.Fatal(err)
+	}
+	if s.checkObserved([]scheduler.ActiveTaskMeta{meta9, meta10}) {
+		t.Fatal("observer exited when only one of two active tasks disappeared")
+	}
+	snap := s.Snapshot()
+	if !snap.Observing || len(snap.ActiveRuns) != 1 || snap.ActiveRuns[0].IssueIID != 10 {
+		t.Fatalf("observing=%v active=%+v, want continued observation of issue 10", snap.Observing, snap.ActiveRuns)
+	}
+}
+
+// active metadata 没变化时观察轮询不应重复通知 UI。否则缩短轮询或任务较多时，
+// 无意义 revision 会持续喂给 Settle/渲染队列，甚至让界面事件循环饿死。
+func TestObservedUnchangedMetadataDoesNotNotifyAgain(t *testing.T) {
+	repoDir := t.TempDir()
+	meta := guiActiveMeta(repoDir, 8, 9, os.Getpid(), time.Now())
+	writeGUIActiveMeta(t, meta)
+	s := newSession()
+	changes := make(chan struct{}, 16)
+	s.SetOnChange(func() { changes <- struct{}{} })
+	s.ObserveActive([]scheduler.ActiveTaskMeta{meta})
+	defer s.StopObserving()
+	for len(changes) > 0 {
+		<-changes
+	}
+	if s.checkObserved([]scheduler.ActiveTaskMeta{meta}) {
+		t.Fatal("fresh live supervisor unexpectedly ended observation")
+	}
+	for len(changes) > 0 {
+		<-changes
+	}
+	if s.checkObserved([]scheduler.ActiveTaskMeta{meta}) {
+		t.Fatal("fresh live supervisor unexpectedly ended observation on the second poll")
+	}
+	select {
+	case <-changes:
+		t.Fatal("unchanged active metadata produced a duplicate UI notification")
+	default:
+	}
+}
+
+// 无法解析/版本不符的 active metadata 不能在 GUI 启动扫描里静默消失；
+// 它可能属于一个当前二进制不理解的新版 worker，自动启动必须保守提示。
+func TestDiscoverReportsInvalidActiveMetadata(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.WriteFile(scheduler.ActiveMetaPath(repoDir, 9), []byte(`{"version":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := discoverSession(func(context.Context, app.Options) (app.PathsPreview, error) {
+		return app.PathsPreview{Paths: app.Paths{WorkDir: repoDir + "/work", RepoDir: repoDir, TreeDir: repoDir + "/.worktrees"}}, nil
+	})
+	s.Discover(app.Options{})
+	snap := waitCondition(t, s, "invalid active metadata scan error", func(snap snapshot) bool { return snap.ActiveScanErr != nil })
+	if len(snap.ActiveRuns) != 0 {
+		t.Fatalf("ActiveRuns = %+v, want invalid metadata excluded", snap.ActiveRuns)
+	}
+}
+
+// 原 supervisor 在观察开始后仍可能派发新的并行任务。观察者是按 spec 观察
+// 整组 active metadata，不是只盯启动瞬间已有的 issue；否则后续任务会脱离
+// 只读观察，也不会参与原进程退出后的接管评估。
+func TestObservedSpecPicksUpTasksAddedAfterObservationStarted(t *testing.T) {
+	repoDir := t.TempDir()
+	meta9 := guiActiveMeta(repoDir, 8, 9, os.Getpid(), time.Now())
+	writeGUIActiveMeta(t, meta9)
+	s := newSession()
+	s.ObserveActive([]scheduler.ActiveTaskMeta{meta9})
+	defer s.StopObserving()
+	meta10 := guiActiveMeta(repoDir, 8, 10, os.Getpid(), time.Now())
+	writeGUIActiveMeta(t, meta10)
+	if s.checkObserved([]scheduler.ActiveTaskMeta{meta9}) {
+		t.Fatal("fresh live supervisor unexpectedly ended observation")
+	}
+	snap := s.Snapshot()
+	if len(snap.ActiveRuns) != 2 {
+		t.Fatalf("ActiveRuns = %+v, want the later issue-10 metadata included", snap.ActiveRuns)
+	}
+	if len(snap.Status) != 2 {
+		t.Fatalf("Status = %+v, want a read-only terminal entry for the later issue-10 worker", snap.Status)
 	}
 }

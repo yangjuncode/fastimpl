@@ -38,6 +38,7 @@ type settingsModel struct {
 	agentCmd          *core.Signal[string]
 	integration       *core.Signal[string]
 	requireReview     *core.Signal[bool]
+	reviewer          *core.Signal[string]
 	hcBinary          *core.Signal[string]
 	hcSocket          *core.Signal[string]
 	instanceID        *core.Signal[string]
@@ -63,6 +64,7 @@ func newSettingsModel(cx *core.Scope) *settingsModel {
 		agentCmd:          core.NewSignal(cx, ""),
 		integration:       core.NewSignal(cx, ""),
 		requireReview:     core.NewSignal(cx, false),
+		reviewer:          core.NewSignal(cx, ""),
 		hcBinary:          core.NewSignal(cx, ""),
 		hcSocket:          core.NewSignal(cx, ""),
 		instanceID:        core.NewSignal(cx, ""),
@@ -124,6 +126,7 @@ func (m *model) loadSettings() {
 		st.agentCmd.Set(cfg.AgentCmd)
 		st.integration.Set(cfg.Integration)
 		st.requireReview.Set(cfg.RequireReview)
+		st.reviewer.Set(cfg.ReviewerName())
 		st.hcBinary.Set(cfg.HcBinary)
 		st.hcSocket.Set(cfg.HcSocket)
 		st.instanceID.Set(cfg.InstanceID)
@@ -215,6 +218,7 @@ func (m *model) configFromForm() (config.Config, error) {
 	cfg.AgentCmd = strings.TrimSpace(st.agentCmd.GetUntracked())
 	cfg.Integration = strings.TrimSpace(st.integration.GetUntracked())
 	cfg.RequireReview = st.requireReview.GetUntracked()
+	cfg.Reviewer = strings.TrimSpace(st.reviewer.GetUntracked())
 	cfg.HcBinary = strings.TrimSpace(st.hcBinary.GetUntracked())
 	cfg.HcSocket = strings.TrimSpace(st.hcSocket.GetUntracked())
 	if err := cfg.Validate(); err != nil {
@@ -394,6 +398,7 @@ func (m *model) configSettingsTab() core.Node {
 		m.settingsInputRow("agent_cmd", "worker 的 agent 命令行", st.agentCmd, "settings-agent-cmd"),
 		m.settingsInputRow("integration", "集成分支名；空为 issue-<spec>-integration", st.integration, "settings-integration"),
 		settingsCheckboxRow(m, "require_review", "提示词强制 leader + 第三方双审", st.requireReview, "settings-require-review"),
+		m.settingsInputRow("reviewer", "第三方 reviewer；默认 gpt-reviewer，可填 gemini-reviewer/swe-reviewer", st.reviewer, "settings-reviewer"),
 		m.settingsInputRow("hc_binary", "hc 命令；与 hc_socket 二选一", st.hcBinary, "settings-hc-binary"),
 		m.settingsInputRow("hc_socket", "herdr-core Unix socket；与 hc_binary 二选一", st.hcSocket, "settings-hc-socket"),
 		settingsReadonlyRow(m, "instance_id", st.instanceID, "settings-instance-id"),

@@ -64,6 +64,11 @@ type Record struct {
 	// Name 是终端名；Labels 是归属标签，供 retained terminal 安全接管/复用前校验。
 	Name   string
 	Labels map[string]string
+	// PID/Cwd/Argv 是 hc 记录里的终端进程信息；它们写进 active metadata，
+	// 供崩溃重启后核对“仍是同一个 worker”以及人工排障。
+	PID  int
+	Cwd  string
+	Argv []string
 }
 
 // Settled 报告该记录是否表示一轮已经结束。
@@ -156,14 +161,20 @@ func (r *Runner) Snapshot(ctx context.Context, addr string) (Record, error) {
 	if term.Name != nil {
 		name = *term.Name
 	}
-	return Record{
+	record := Record{
 		Turn:     term.Turn,
 		Status:   term.StatusWord(),
 		Reported: term.Reported,
 		Live:     term.Live(),
 		Name:     name,
 		Labels:   term.Labels,
-	}, nil
+		Cwd:      term.Cwd,
+		Argv:     append([]string(nil), term.Argv...),
+	}
+	if term.Pid != nil {
+		record.PID = *term.Pid
+	}
+	return record, nil
 }
 
 // ReadScreen 读取终端屏幕文本（lines=0 只要当前屏幕，不读 scrollback），

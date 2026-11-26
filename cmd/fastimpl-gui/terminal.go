@@ -50,6 +50,9 @@ type viewerConn struct {
 	// Attach 打开一次观看流；GUI 一定带它。
 	Attach app.AttachTerminal
 	Addr   string
+	// ReadOnly 是 active worker 观察模式：按键与自动应答都不能写入
+	// 原 worker，否则“观察”就会变成一个隐藏的控制通道。
+	ReadOnly bool
 	// Width、Height 是打开时的初始网格；terminal.View 随后会按自己的
 	// 尺寸再 resize。
 	Width, Height int
@@ -110,6 +113,9 @@ func (c *viewerConn) open() (interface {
 
 // Write 把按键送进终端；还没连上时先连。
 func (c *viewerConn) Write(p []byte) (int, error) {
+	if c.ReadOnly {
+		return len(p), nil
+	}
 	stream, err := c.open()
 	if err != nil {
 		return 0, err
@@ -125,7 +131,7 @@ func (c *viewerConn) Resize(cols, rows int) error {
 	stream, closed := c.stream, c.closed
 	c.Width, c.Height = cols, rows
 	c.mu.Unlock()
-	if closed || stream == nil {
+	if closed || stream == nil || c.ReadOnly {
 		return nil
 	}
 	if resizer, ok := stream.(interface{ Resize(int, int) error }); ok {
@@ -136,6 +142,9 @@ func (c *viewerConn) Resize(cols, rows int) error {
 
 // WriteAuto 送程序自动应答，不算人工输入；流不支持时退回 Write。
 func (c *viewerConn) WriteAuto(p []byte) (int, error) {
+	if c.ReadOnly {
+		return len(p), nil
+	}
 	c.mu.Lock()
 	stream := c.stream
 	c.mu.Unlock()
@@ -272,8 +281,9 @@ func (t *terminals) ensure(cx *core.Scope, tab *termTab) *terminal.Terminal {
 		return tab.term
 	}
 	conn := &viewerConn{
-		Attach: t.session.attach,
-		Addr:   tab.Addr,
+		Attach:   t.session.attach,
+		Addr:     tab.Addr,
+		ReadOnly: t.session.Observing(),
 	}
 	term, err := terminal.New(terminal.Options{
 		Conn: conn,

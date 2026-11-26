@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"io"
+	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -33,6 +36,28 @@ func headlessWith(t *testing.T, opts app.Options, preview func(context.Context, 
 		return m.build()
 	}, nsgotest.Idiom(core.IdiomDesktop), nsgotest.Size(1180, 760))
 	return app, m, s
+}
+
+// headlessRecovery 在启动扫描发生前就装好 runFn；否则非常快完成
+// 的 Discover 可能在测试替换 runFn 前触发自动接管，跑到真实 app 管线。
+func headlessRecovery(t *testing.T, preview func(context.Context, app.Options) (app.PathsPreview, error), runFn func(context.Context, app.Options, io.Writer, app.Observer) error) (*nsgotest.App, *model, *session) {
+	t.Helper()
+	return headlessRecoveryOpts(t, app.Options{}, preview, runFn)
+}
+
+// headlessRecoveryOpts 同 headlessRecovery，但保留调用方传入的启动 spec。
+func headlessRecoveryOpts(t *testing.T, opts app.Options, preview func(context.Context, app.Options) (app.PathsPreview, error), runFn func(context.Context, app.Options, io.Writer, app.Observer) error) (*nsgotest.App, *model, *session) {
+	t.Helper()
+	var m *model
+	var s *session
+	gui := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		s = newSession()
+		s.previewFn = preview
+		s.runFn = runFn
+		m = newModel(cx, s, opts)
+		return m.build()
+	}, nsgotest.Idiom(core.IdiomDesktop), nsgotest.Size(1180, 760))
+	return gui, m, s
 }
 
 // fakePreview 是三个目录都解析成功的假预览。
@@ -238,9 +263,249 @@ func TestSettingsDialogRendersConfigAndPromptTabs(t *testing.T) {
 	gui.Find("id:settings-agent-cmd")
 	gui.Find("id:settings-integration")
 	gui.Find("id:settings-require-review")
+	gui.Find("id:settings-reviewer")
 	gui.Find("id:settings-hc-binary")
 	gui.Find("id:settings-hc-socket")
 	gui.Find("id:settings-instance-id")
 	gui.Press("id:settings-tab-prompt")
 	gui.Find("id:settings-prompt")
+}
+
+// 空 issue 启动时，如果发现 dead supervisor 留下的可接管 metadata，GUI 应
+// 自动恢复原 spec，而不是要求用户重新输入编号。
+func TestEmptyStartAutoRecoversDeadActiveRun(t *testing.T) {
+	repoDir := t.TempDir()
+	writeGUIActiveMeta(t, guiActiveMeta(repoDir, 8, 9, -1, time.Now()))
+	started := make(chan int, 1)
+	gui, m, _ := headlessRecovery(t, func(context.Context, app.Options) (app.PathsPreview, error) {
+		return app.PathsPreview{Paths: app.Paths{WorkDir: repoDir + "/work", RepoDir: repoDir, TreeDir: repoDir + "/.worktrees"}}, nil
+	}, func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		started <- opts.SpecIID
+		return nil
+	})
+	sess := m.session
+	waitPaths(t, gui, m)
+	select {
+	case spec := <-started:
+		if spec != 8 {
+			t.Fatalf("auto recovered spec = %d, want 8", spec)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("the GUI did not auto-start recovery; snapshot = %+v", sess.Snapshot())
+	}
+	if m.issueText.GetUntracked() != "8" {
+		t.Fatalf("issue input = %q, want the recovered spec filled", m.issueText.GetUntracked())
+	}
+}
+
+// 活 supervisor 且 heartbeat 新鲜时，GUI 只能进入只读观察：不能启动本地
+// scheduler，更不能重发 prompt/偷锁；终端页只用于查看 hc 现场。
+func TestEmptyStartObservesLiveActiveRun(t *testing.T) {
+	repoDir := t.TempDir()
+	writeGUIActiveMeta(t, guiActiveMeta(repoDir, 8, 9, os.Getpid(), time.Now()))
+	ran := make(chan struct{}, 1)
+	gui, m, sess := headlessRecovery(t, func(context.Context, app.Options) (app.PathsPreview, error) {
+		return app.PathsPreview{Paths: app.Paths{WorkDir: repoDir + "/work", RepoDir: repoDir, TreeDir: repoDir + "/.worktrees"}}, nil
+	}, func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		ran <- struct{}{}
+		return nil
+	})
+	waitPaths(t, gui, m)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && sess.Snapshot().Phase != phaseObserving {
+		gui.Settle()
+		time.Sleep(5 * time.Millisecond)
+	}
+	snap := sess.Snapshot()
+	if snap.Phase != phaseObserving || !snap.Observing {
+		t.Fatalf("snapshot = %+v, want read-only observation", snap)
+	}
+	select {
+	case <-ran:
+		t.Fatal("a live active supervisor was taken over by the observer GUI")
+	default:
+	}
+	if m.issueText.GetUntracked() != "8" {
+		t.Fatalf("issue input = %q, want the observed spec filled", m.issueText.GetUntracked())
+	}
+	gui.Settle()
+	gui.Find("id:terminal-tab-1!9")
+	gui.Find("id:observer-page")
+	gui.Find("id:observer-run-9")
+	gui.Find("text:worktree:")
+	gui.Find("text:supervisor pid:")
+	gui.Find("text:heartbeat:")
+}
+
+// 显式启动 spec #9 时，仓库里无关 spec #8 的 active worker 不能劫持本次
+// 启动。空 issue 才扫描全部 active run；显式 issue 只受同 spec 的 active
+// metadata 影响。
+func TestExplicitSpecIsNotHijackedByOtherActiveSpec(t *testing.T) {
+	repoDir := t.TempDir()
+	writeGUIActiveMeta(t, guiActiveMeta(repoDir, 8, 9, os.Getpid(), time.Now()))
+	started := make(chan int, 1)
+	gui, m, sess := headlessRecoveryOpts(t, app.Options{SpecIID: 9}, func(context.Context, app.Options) (app.PathsPreview, error) {
+		return app.PathsPreview{Paths: app.Paths{WorkDir: repoDir + "/work", RepoDir: repoDir, TreeDir: repoDir + "/.worktrees"}}, nil
+	}, func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		started <- opts.SpecIID
+		return nil
+	})
+	waitPaths(t, gui, m)
+	select {
+	case spec := <-started:
+		if spec != 9 {
+			t.Fatalf("explicit startup spec = %d, want 9 rather than unrelated active spec 8", spec)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("explicit spec did not start; snapshot = %+v", sess.Snapshot())
+	}
+	if sess.Snapshot().Observing {
+		t.Fatal("an unrelated active spec put the explicit run into observer mode")
+	}
+}
+
+// 观察者不是永远只读：它只读轮询本机 metadata；原 supervisor 进程退出后，
+// 同一个 GUI 实例应退出观察模式并自动接管原 spec，而不是要求用户重开/重输。
+func TestObserverTakesOverAfterSupervisorExits(t *testing.T) {
+	repoDir := t.TempDir()
+	supervisor := exec.Command("sleep", "30")
+	if err := supervisor.Start(); err != nil {
+		t.Skipf("cannot start a temporary supervisor process: %v", err)
+	}
+	defer func() {
+		_ = supervisor.Process.Kill()
+		_ = supervisor.Wait()
+	}()
+	writeGUIActiveMeta(t, guiActiveMeta(repoDir, 8, 9, supervisor.Process.Pid, time.Now()))
+	oldInterval := observePollIntervalNanos.Swap(int64(5 * time.Millisecond))
+	defer observePollIntervalNanos.Store(oldInterval)
+	started := make(chan int, 1)
+	gui, m, sess := headlessRecovery(t, func(context.Context, app.Options) (app.PathsPreview, error) {
+		return app.PathsPreview{Paths: app.Paths{WorkDir: repoDir + "/work", RepoDir: repoDir, TreeDir: repoDir + "/.worktrees"}}, nil
+	}, func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		started <- opts.SpecIID
+		return nil
+	})
+	waitPaths(t, gui, m)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && !sess.Snapshot().Observing {
+		gui.Settle()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !sess.Snapshot().Observing {
+		t.Fatalf("snapshot = %+v, want initial read-only observation", sess.Snapshot())
+	}
+	if err := supervisor.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = supervisor.Wait()
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case spec := <-started:
+			if spec != 8 {
+				t.Fatalf("auto takeover spec = %d, want 8", spec)
+			}
+			return
+		default:
+		}
+		gui.Settle()
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("observer did not take over after supervisor exit; snapshot = %+v", sess.Snapshot())
+}
+
+// 损坏/新版 active metadata 必须在界面上变成可见的保守失败，而不是
+// 让空 issue 首页表现得像本仓库没有任何 active worker。
+func TestInvalidActiveMetadataBlocksAutomaticRecoveryVisibly(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.WriteFile(scheduler.ActiveMetaPath(repoDir, 9), []byte(`{"version":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gui, _, sess := headlessRecovery(t, func(context.Context, app.Options) (app.PathsPreview, error) {
+		return app.PathsPreview{Paths: app.Paths{WorkDir: repoDir + "/work", RepoDir: repoDir, TreeDir: repoDir + "/.worktrees"}}, nil
+	}, func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		return nil
+	})
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		gui.Settle()
+		if snap := sess.Snapshot(); snap.Phase == phaseFailed && snap.Err != nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("invalid active metadata did not surface as a visible failure; snapshot = %+v", sess.Snapshot())
+}
+
+// 显式输入 spec 撞上 live supervisor 时也会进入观察模式。此时首次自动启动
+// 已经消费过 AutoStarted；原 supervisor 退出后的接管恢复不能因此被挡住，
+// 否则“自动接管”只对空 issue 启动有效，对显式恢复场景失效。
+func TestExplicitConflictObserverTakesOverAfterSupervisorExits(t *testing.T) {
+	repoDir := t.TempDir()
+	supervisor := exec.Command("sleep", "30")
+	if err := supervisor.Start(); err != nil {
+		t.Skipf("cannot start a temporary supervisor process: %v", err)
+	}
+	defer func() {
+		_ = supervisor.Process.Kill()
+		_ = supervisor.Wait()
+	}()
+	meta := guiActiveMeta(repoDir, 8, 9, supervisor.Process.Pid, time.Now())
+	oldInterval := observePollIntervalNanos.Swap(int64(5 * time.Millisecond))
+	defer observePollIntervalNanos.Store(oldInterval)
+	started := make(chan int, 2)
+	first := make(chan struct{}, 1)
+	first <- struct{}{}
+	gui, m, sess := headlessRecoveryOpts(t, app.Options{SpecIID: 8}, func(context.Context, app.Options) (app.PathsPreview, error) {
+		return app.PathsPreview{Paths: app.Paths{WorkDir: repoDir + "/work", RepoDir: repoDir, TreeDir: repoDir + "/.worktrees"}}, nil
+	}, func(ctx context.Context, opts app.Options, w io.Writer, obs app.Observer) error {
+		started <- opts.SpecIID
+		select {
+		case <-first:
+			// 启动扫描时该 metadata 尚不存在，因此显式启动已经消费了
+			// AutoStarted；metadata 在 preflight 前出现，冲突只能在 runFn
+			// 中才发现。正是这个路径曾经会让观察者退出后无法自动接管。
+			writeGUIActiveMeta(t, meta)
+			return &app.ActiveRunConflictError{SpecIID: 8, Tasks: []scheduler.ActiveTaskMeta{meta}}
+		default:
+			return nil
+		}
+	})
+	waitPaths(t, gui, m)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !sess.Snapshot().Observing {
+		gui.Settle()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !sess.Snapshot().Observing {
+		t.Fatalf("snapshot = %+v, want explicit active conflict to enter observation", sess.Snapshot())
+	}
+	// 第一次冲突启动已经发生； recovery 需要的是第二次启动。
+	select {
+	case spec := <-started:
+		if spec != 8 {
+			t.Fatalf("initial explicit spec = %d, want 8", spec)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial explicit run did not happen")
+	}
+	if err := supervisor.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = supervisor.Wait()
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case spec := <-started:
+			if spec != 8 {
+				t.Fatalf("takeover spec = %d, want 8", spec)
+			}
+			return
+		default:
+		}
+		gui.Settle()
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("explicit-conflict observer did not take over; snapshot = %+v", sess.Snapshot())
 }

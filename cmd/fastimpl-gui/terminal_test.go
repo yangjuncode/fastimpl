@@ -328,3 +328,35 @@ func TestNotifyCoalesces(t *testing.T) {
 		t.Fatalf("posted %d updates, want one coalesced update", got)
 	}
 }
+
+// 只读观察的终端连接必须吞掉键盘输入，并且不能因为要写输入而打开 hc 流。
+func TestReadOnlyViewerConnDropsInput(t *testing.T) {
+	conn := &viewerConn{ReadOnly: true}
+	n, err := conn.Write([]byte("rm -rf /\n"))
+	if err != nil || n != len("rm -rf /\n") {
+		t.Fatalf("Write = %d,%v, want input dropped as a successful no-op", n, err)
+	}
+	n, err = conn.WriteAuto([]byte("y\n"))
+	if err != nil || n != 2 {
+		t.Fatalf("WriteAuto = %d,%v, want auto input dropped as a successful no-op", n, err)
+	}
+	conn.mu.Lock()
+	stream := conn.stream
+	conn.mu.Unlock()
+	if stream != nil {
+		t.Fatal("read-only input opened a terminal stream")
+	}
+
+	// 已连接的观看流也不能收到 resize：观察页只允许本地重排视图，
+	// 不得向原 worker 的控制面写任何信息。
+	fake := newFakeStream()
+	conn = &viewerConn{ReadOnly: true}
+	conn.stream = fake
+	if err := conn.Resize(120, 40); err != nil {
+		t.Fatal(err)
+	}
+	_, resized, _ := fake.snapshot()
+	if len(resized) != 0 {
+		t.Fatalf("read-only resize forwarded %v, want no control-plane write", resized)
+	}
+}

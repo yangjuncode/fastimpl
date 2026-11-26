@@ -72,15 +72,7 @@ func writeRetainedMeta(path string, meta retainedTerminalMeta) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return writeFileAtomic0600(path, append(data, '\n'))
 }
 
 func readRetainedMeta(path string) (retainedTerminalMeta, error) {
@@ -252,6 +244,15 @@ func retainedRecordMatches(record worker.Record, meta retainedTerminalMeta) bool
 		record.Labels["task"] == meta.TerminalName
 }
 
+// retainedRecordProcessMatches 核验 hc 中实际进程的 cwd/agent argv。
+// 名字与 labels 只是归属线索；它们一致但进程身份不一致时，既不能复用，
+// 也不能按 retained metadata 去停止这个可能属于别处的终端。
+func retainedRecordProcessMatches(record worker.Record, meta retainedTerminalMeta) bool {
+	return record.Cwd != "" && len(record.Argv) > 0 &&
+		CanonicalRepoPath(record.Cwd) == meta.Cwd &&
+		agentArgvHash(record.Argv) == meta.AgentHash
+}
+
 // reconcileRetained 接管上次进程留下的 retained terminal：过期立即清，
 // 未过期重排定时器，never 只重新暴露给 GUI。
 func (s *Scheduler) reconcileRetained(ctx context.Context) {
@@ -273,7 +274,7 @@ func (s *Scheduler) reconcileRetained(ctx context.Context) {
 			_ = os.Remove(path)
 			continue
 		}
-		if !retainedRecordMatches(record, meta) {
+		if !retainedRecordMatches(record, meta) || !retainedRecordProcessMatches(record, meta) {
 			s.log.Warn("retained terminal identity mismatch; metadata discarded without touching terminal", "addr", meta.TerminalAddr, "name", meta.TerminalName)
 			_ = os.Remove(path)
 			continue
@@ -318,6 +319,9 @@ func (s *Scheduler) claimRetainedTerminal(ctx context.Context, key graph.Key, is
 		_ = os.Remove(path)
 		return "", false, nil
 	}
+	if !retainedRecordMatches(record, meta) || !retainedRecordProcessMatches(record, meta) {
+		return "", false, fmt.Errorf("retained terminal %s identity changed; refusing to reuse or replace it", meta.TerminalName)
+	}
 	if expired {
 		s.cancelRetained(id)
 		if err := s.stopWorker(meta.TerminalAddr, meta.TerminalName); err != nil {
@@ -326,9 +330,6 @@ func (s *Scheduler) claimRetainedTerminal(ctx context.Context, key graph.Key, is
 		_ = os.Remove(path)
 		s.runtime.clearAddr(key)
 		return "", false, nil
-	}
-	if !retainedRecordMatches(record, meta) {
-		return "", false, fmt.Errorf("retained terminal %s identity changed; refusing to reuse or replace it", meta.TerminalName)
 	}
 	if !s.staticRetainedMatch(meta, issueIID, integration, termName, cwd) {
 		return "", false, fmt.Errorf("retained terminal %s cannot be reused after agent/cwd/name change; inspect it with hc attach %s", meta.TerminalName, meta.TerminalName)

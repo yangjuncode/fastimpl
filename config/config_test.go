@@ -91,6 +91,7 @@ func TestSaveWorkDirCopy(t *testing.T) {
 		AgentCmd:          `codex --model "o4 mini"`,
 		Integration:       "spec-integration",
 		RequireReview:     true,
+		Reviewer:          "gemini-reviewer",
 		HcSocket:          filepath.Join(work, "hc.sock"),
 		TerminalRetention: "15m",
 		LogFile:           "fastimpl-run.log",
@@ -110,7 +111,7 @@ func TestSaveWorkDirCopy(t *testing.T) {
 	text := string(data)
 	for _, want := range []string{
 		"parallelism = 4", "retries = 2", `forge = 'github'`, "repo_dir", "tree_dir",
-		"agent_cmd", "integration", "require_review = true", "hc_socket", "hc_binary", "terminal_retention", "log_file",
+		"agent_cmd", "integration", "require_review = true", "reviewer = 'gemini-reviewer'", "hc_socket", "hc_binary", "terminal_retention", "log_file",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("saved config does not contain %q:\n%s", want, text)
@@ -127,7 +128,7 @@ func TestSaveWorkDirCopy(t *testing.T) {
 		loaded.RepoDir != cfg.RepoDir || loaded.TreeDir != cfg.TreeDir || loaded.AgentCmd != cfg.AgentCmd ||
 		loaded.Integration != cfg.Integration || loaded.RequireReview != cfg.RequireReview ||
 		loaded.HcSocket != cfg.HcSocket || loaded.HcBinary != cfg.HcBinary || loaded.TerminalRetention != cfg.TerminalRetention ||
-		loaded.LogFile != cfg.LogFile {
+		loaded.LogFile != cfg.LogFile || loaded.ReviewerName() != cfg.ReviewerName() {
 		t.Fatalf("loaded config = %+v, want the saved effective values %+v", loaded, cfg)
 	}
 }
@@ -162,5 +163,33 @@ func TestParseTerminalRetention(t *testing.T) {
 		if err := (Config{Parallelism: 1, TerminalRetention: bad}).Validate(); err == nil {
 			t.Errorf("terminal_retention %q must be rejected", bad)
 		}
+	}
+}
+
+// reviewer 是可配置的多模型审核后端：未配置时使用 gpt-reviewer，项目层可用
+// reviewer = "gemini-reviewer"/"swe-reviewer" 等覆盖；空串表示回到默认。
+func TestReviewerDefaultAndOverlay(t *testing.T) {
+	work := t.TempDir()
+	stubExeDir(t, t.TempDir())
+	if got := (Config{}).ReviewerName(); got != "gpt-reviewer" {
+		t.Fatalf("zero-value reviewer default = %q, want gpt-reviewer", got)
+	}
+	loadedDefault, err := Load(work, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loadedDefault.ReviewerName(); got != "gpt-reviewer" {
+		t.Fatalf("loaded default reviewer = %q, want gpt-reviewer", got)
+	}
+	explicit := filepath.Join(work, "custom.toml")
+	if err := os.WriteFile(explicit, []byte("reviewer = \"gemini-reviewer\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(work, explicit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.ReviewerName(); got != "gemini-reviewer" {
+		t.Fatalf("overlay reviewer = %q, want gemini-reviewer", got)
 	}
 }

@@ -56,3 +56,31 @@ func TestParseArgumentsVersionFlag(t *testing.T) {
 		t.Fatal("parseArguments(-version) did not report the version request")
 	}
 }
+
+// 无 spec 是合法命令行：是否可启动取决于 app 层是否扫描到 active run。
+func TestParseArgumentsAllowsMissingSpecForActiveRecovery(t *testing.T) {
+	opts, show, err := parseArguments(nil, new(bytes.Buffer))
+	if err != nil {
+		t.Fatalf("parseArguments(nil) = %v, want no error", err)
+	}
+	if show {
+		t.Fatal("show version = true without -version")
+	}
+	if opts.SpecIID != 0 {
+		t.Fatalf("SpecIID = %d, want zero so app recovery scanning can choose one", opts.SpecIID)
+	}
+}
+
+// CLI 中断确认的默认答案必须是 detach；只有用户明确输入 y/yes 才停止 worker。
+func TestInterruptStopAnswerRequiresExplicitYes(t *testing.T) {
+	for _, answer := range []string{"y", "Y", "yes", " YES \n"} {
+		if !shouldStopWorkers(answer) {
+			t.Errorf("shouldStopWorkers(%q) = false, want explicit yes accepted", answer)
+		}
+	}
+	for _, answer := range []string{"", "n", "no", "detach", "yep"} {
+		if shouldStopWorkers(answer) {
+			t.Errorf("shouldStopWorkers(%q) = true, want default detach", answer)
+		}
+	}
+}

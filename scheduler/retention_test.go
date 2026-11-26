@@ -137,7 +137,7 @@ func TestRetainedTerminalReconcileAndReuse(t *testing.T) {
 	termName := "-issue-9" // runnableTask 未设置 repo.Name，生产环境是 <repo>-issue-<iid>
 	addr := "t-retained"
 	base.records = map[string]worker.Record{
-		addr: {Live: true, Status: "idle", Reported: true, Name: termName, Labels: map[string]string{
+		addr: {Live: true, Status: "idle", Reported: true, Name: termName, Cwd: CanonicalRepoPath(repoDir), Argv: []string{"devin"}, Labels: map[string]string{
 			"fastimpl": "8", "task": termName,
 		}},
 	}
@@ -194,7 +194,7 @@ func TestClaimExpiredRetainedTerminalCleansBeforeStart(t *testing.T) {
 	termName := "-issue-9"
 	addr := "t-expired"
 	base.records = map[string]worker.Record{
-		addr: {Live: true, Status: "idle", Reported: true, Name: termName, Labels: map[string]string{
+		addr: {Live: true, Status: "idle", Reported: true, Name: termName, Cwd: CanonicalRepoPath(repoDir), Argv: []string{"devin"}, Labels: map[string]string{
 			"fastimpl": "8", "task": termName,
 		}},
 	}
@@ -223,5 +223,37 @@ func TestClaimExpiredRetainedTerminalCleansBeforeStart(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("expired retained metadata still exists: %v", err)
+	}
+}
+
+// retained terminal 的名字/labels 可以被误用或重建；真正复用前还必须核对
+// hc 记录里的实际 cwd 与 agent argv。否则同 issue 重跑可能把 prompt 送进
+// 一个只“看起来像”的错误终端。
+func TestClaimRetainedTerminalRejectsProcessIdentityMismatch(t *testing.T) {
+	taskLockDir(t)
+	base := &fakeSessions{}
+	s, _, repoDir := runnableTask(t, &fakeForge{}, base, nil)
+	key := graph.Key{ProjectID: 1, IID: 9}
+	termName := "-issue-9"
+	addr := "t-retained-mismatch"
+	base.records = map[string]worker.Record{
+		addr: {Live: true, Status: "idle", Reported: true, Name: termName, PID: 7001,
+			Cwd: repoDir + "/elsewhere", Argv: []string{"devin"}, Labels: map[string]string{
+				"fastimpl": "8", "task": termName,
+			}},
+	}
+	path := retainedMetaPath(repoDir, 8, 9, false)
+	meta := retainedTerminalMeta{
+		Version: 1, RepoDir: CanonicalRepoPath(repoDir), SpecIID: 8, IssueIID: 9,
+		TerminalAddr: addr, TerminalName: termName, Cwd: CanonicalRepoPath(repoDir),
+		AgentHash: agentArgvHash([]string{"devin"}), CompletedAt: time.Now().Add(-time.Minute),
+		CleanupAt: time.Now().Add(time.Hour),
+	}
+	if err := writeRetainedMeta(path, meta); err != nil {
+		t.Fatal(err)
+	}
+	got, reused, err := s.claimRetainedTerminal(context.Background(), key, 9, false, termName, repoDir)
+	if err == nil || reused || got != "" {
+		t.Fatalf("claimRetainedTerminal = %q,%v,%v, want process identity mismatch rejected", got, reused, err)
 	}
 }

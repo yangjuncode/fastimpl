@@ -44,7 +44,9 @@ const DefaultConfig = `# fastimpl 配置（TOML）
 #                                                 # 缺省即此
 # integration = "branch"           # 覆盖默认集成分支 issue-<spec>-integration
 # require_review = true            # worker 提示词是否强制 leader + 第三方
-#                                # （fusion-3rd-reviewer-swe2max）双审（默认 false）
+#                                # reviewer 双审（默认 false）
+# reviewer = "gpt-reviewer"        # 第三方 reviewer 名称；也可用
+#                                # "gemini-reviewer"/"swe-reviewer" 等
 # hc_socket = "/run/user/1000/hc.sock"  # herdr-core socket（与 hc_binary 二选一）
 # hc_binary = "hc"                      # 或经 hc connect 连接
 #
@@ -55,6 +57,8 @@ const DefaultConfig = `# fastimpl 配置（TOML）
 const (
 	// DefaultRetries 是单个任务在首次尝试之外的重试次数。
 	DefaultRetries = 8
+	// DefaultReviewer 是 require_review 打开时提示词默认使用的第三方 reviewer。
+	DefaultReviewer = "gpt-reviewer"
 	// LLM 相关环境变量名：不会读入配置，只用于把它们从子进程
 	// 环境中清除，防止凭据泄漏给 glab/gh/agent 进程。
 	LLMAPIKeyEnv  = "FASTIMPL_LLM_API_KEY"
@@ -102,8 +106,11 @@ type Config struct {
 	// origin 主机名推断，推断不出按 ForgeGitLab。
 	Forge string
 	// RequireReview 控制 worker 提示词是否写入"leader + 第三方
-	// 独立审核全部通过"的硬性要求（默认 true）。
+	// 独立审核全部通过"的硬性要求（默认 false）。
 	RequireReview bool
+	// Reviewer 是第三方 reviewer 名称，经 {{.Reviewer}} 填入 worker
+	// 提示词。空表示 DefaultReviewer；可配置 gemini-reviewer、swe-reviewer 等。
+	Reviewer string
 	// InstanceID 是本机稳定标识，跨机器认领 issue 时写进评论标记。
 	// 只从 exe 同目录的 fastimpl.toml 读取，工作目录与 -config
 	// 都不能覆盖它。
@@ -129,6 +136,7 @@ type rawConfig struct {
 	AgentCmd          *string `toml:"agent_cmd"`
 	Integration       *string `toml:"integration"`
 	RequireReview     *bool   `toml:"require_review"`
+	Reviewer          *string `toml:"reviewer"`
 	HcBinary          *string `toml:"hc_binary"`
 	HcSocket          *string `toml:"hc_socket"`
 	Forge             *string `toml:"forge"`
@@ -153,6 +161,15 @@ func (c Config) AgentArgv() ([]string, error) {
 		return splitCmd(c.AgentCmd)
 	}
 	return append([]string{}, defaultAgentArgv...), nil
+}
+
+// ReviewerName 返回提示词使用的第三方 reviewer。手工构造的零值 Config
+// 与显式空串都回退到 DefaultReviewer，便于项目层把全局覆盖恢复成默认。
+func (c Config) ReviewerName() string {
+	if reviewer := strings.TrimSpace(c.Reviewer); reviewer != "" {
+		return reviewer
+	}
+	return DefaultReviewer
 }
 
 // splitCmd 按简化 shell 规则拆分命令行：空格分词、单双引号、
@@ -221,6 +238,7 @@ type workDirCopy struct {
 	AgentCmd          string `toml:"agent_cmd"`
 	Integration       string `toml:"integration"`
 	RequireReview     bool   `toml:"require_review"`
+	Reviewer          string `toml:"reviewer"`
 	HcSocket          string `toml:"hc_socket"`
 	HcBinary          string `toml:"hc_binary"`
 	TerminalRetention string `toml:"terminal_retention"`
@@ -249,6 +267,7 @@ func MarshalWorkDirCopy(cfg Config) ([]byte, error) {
 		AgentCmd:          cfg.AgentCmd,
 		Integration:       cfg.Integration,
 		RequireReview:     cfg.RequireReview,
+		Reviewer:          cfg.ReviewerName(),
 		HcSocket:          cfg.HcSocket,
 		HcBinary:          cfg.HcBinary,
 		TerminalRetention: cfg.TerminalRetention,
@@ -315,6 +334,7 @@ func Load(workDir, path string) (Config, error) {
 		Retries:           DefaultRetries,
 		WorkDir:           workDir,
 		RequireReview:     false,
+		Reviewer:          DefaultReviewer,
 		ResumeBudget:      DefaultResumeBudget,
 		TerminalRetention: "0s",
 	}
@@ -375,6 +395,9 @@ func applyRaw(cfg *Config, raw rawConfig) {
 	}
 	if raw.RequireReview != nil {
 		cfg.RequireReview = *raw.RequireReview
+	}
+	if raw.Reviewer != nil {
+		cfg.Reviewer = strings.TrimSpace(*raw.Reviewer)
 	}
 	if raw.HcBinary != nil {
 		cfg.HcBinary = *raw.HcBinary

@@ -235,7 +235,11 @@ func (f *fakeSessions) StartWorker(ctx context.Context, p worker.Params) (string
 	if f.records == nil {
 		f.records = map[string]worker.Record{}
 	}
-	f.records[addr] = worker.Record{Live: true, Status: "idle", Reported: true, Name: name, Labels: map[string]string{
+	cwd := p.Cwd
+	if cwd == "" {
+		cwd = p.Worktree
+	}
+	f.records[addr] = worker.Record{Live: true, Status: "idle", Reported: true, Name: name, PID: 5000 + f.nextID, Cwd: cwd, Argv: append([]string(nil), p.Argv...), Labels: map[string]string{
 		"fastimpl": fmt.Sprintf("%d", p.SpecIID), "task": name,
 	}}
 	return addr, nil
@@ -785,5 +789,36 @@ func TestSchedulerWarnsDirtyBoard(t *testing.T) {
 	}
 	if n := strings.Count(out, "board status not in a done column"); n != 1 {
 		t.Fatalf("warn count = %d, want 1 (dedup)", n)
+	}
+}
+
+type promptTextSessions struct {
+	*fakeSessions
+	texts []string
+}
+
+func (p *promptTextSessions) Prompt(ctx context.Context, addr, text string) (uint64, error) {
+	p.texts = append(p.texts, text)
+	return p.fakeSessions.Prompt(ctx, addr, text)
+}
+
+// worker prompt 中的第三方 reviewer 必须来自配置，而不是默认模板里的
+// 硬编码名字；这样同一模板可切换 gpt/gemini/swe 等审核后端。
+func TestWorkerPromptUsesConfiguredReviewer(t *testing.T) {
+	taskLockDir(t)
+	base := &fakeSessions{}
+	sessions := &promptTextSessions{fakeSessions: base}
+	s, _, _ := runnableTask(t, &fakeForge{}, sessions, nil)
+	s.cfg.RequireReview = true
+	s.cfg.Reviewer = "swe-reviewer"
+	s.template = "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}| reviewer={{.Reviewer}}"
+	if err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions.texts) == 0 {
+		t.Fatal("no worker prompt was sent")
+	}
+	if !strings.Contains(sessions.texts[0], "reviewer=swe-reviewer") {
+		t.Fatalf("worker prompt missing configured reviewer:\n%s", sessions.texts[0])
 	}
 }

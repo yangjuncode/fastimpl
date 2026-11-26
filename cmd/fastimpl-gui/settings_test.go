@@ -25,6 +25,7 @@ func TestSettingsSaveWritesWorkDirCopies(t *testing.T) {
 
 	m.editText(m.settings.parallelism)("5")
 	m.editText(m.settings.logFile)("run.log")
+	m.editText(m.settings.reviewer)("swe-reviewer")
 	m.editText(m.settings.promptText)("custom prompt {{.IssueNo}}\n")
 	m.saveSettings()
 
@@ -53,6 +54,9 @@ func TestSettingsSaveWritesWorkDirCopies(t *testing.T) {
 	}
 	if loaded.LogFile != "run.log" {
 		t.Fatalf("loaded log_file = %q, want the GUI-saved run.log", loaded.LogFile)
+	}
+	if loaded.ReviewerName() != "swe-reviewer" {
+		t.Fatalf("loaded reviewer = %q, want the GUI-saved swe-reviewer", loaded.ReviewerName())
 	}
 	if m.settings.dirty.GetUntracked() {
 		t.Error("settings remain dirty after a successful save")
