@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/nsgo-dev/nsgo/core"
 	"github.com/nsgo-dev/nsgo/icons/lucide"
@@ -12,11 +13,12 @@ import (
 	"github.com/yangjuncode/fastimpl/scheduler"
 )
 
-// cardWidth 与 cardHeight 固定卡片尺寸：布局因此稳定，状态刷新
-// 不会让节点在相机里跳动。
+// cardWidth 与 cardHeight 是 flow 为每个节点预留的固定布局尺寸。
+// 最高的完结态卡片（开始/结束/用时两行）也放得下，状态与时间刷新
+// 因此不会改变拓扑布局，更不会让节点在相机里跳动。
 const (
 	cardWidth  core.Points = 236
-	cardHeight core.Points = 104
+	cardHeight core.Points = 145
 )
 
 // viewState 是一个节点在图上显示的状态。
@@ -249,16 +251,58 @@ func (d diagram) flowData(look *liveGraph) uiflow.Data {
 type liveGraph struct {
 	// Revision 递增即表示某处的运行状态变了。
 	Revision *core.Signal[int]
+	// Now 是界面秒级时钟。只有已经开始且尚未结束的卡片订阅它，
+	// 因此完结/未开始的节点不会每秒重画。
+	Now *core.Signal[time.Time]
 	// Lookup 按 key 返回最新的节点、运行数据、是否 ready 与是否存在。
 	Lookup func(graph.Key) (graph.Node, scheduler.TaskRuntime, bool, bool)
 }
 
-// read 订阅刷新信号并返回当前值。
-func (g *liveGraph) read(cx *core.Scope) int {
-	if g == nil || g.Revision == nil {
-		return 0
+// formatCardTime 是卡片里的紧凑时间：跨天时仍看得出日期，又不把
+// 236pt 宽的节点撑成完整日志时间。
+func formatCardTime(t time.Time) string {
+	return t.Format("01-02 15:04:05")
+}
+
+// nodeTimingLines 组出节点卡片的运行时间。只有 StartedAt 已记录才显示；
+// 运行中“用时”算到 now，结束后由 terminalWorkTime 固定到 FinishedAt。
+func nodeTimingLines(rt scheduler.TaskRuntime, now time.Time) []string {
+	if rt.StartedAt.IsZero() {
+		return nil
 	}
-	return g.Revision.Get()
+	lines := []string{"开始 " + formatCardTime(rt.StartedAt) + " · 用时 " + terminalWorkTime(rt, now)}
+	if !rt.FinishedAt.IsZero() {
+		lines = append(lines, "结束 "+formatCardTime(rt.FinishedAt))
+	}
+	return lines
+}
+
+// nodeLive 是一张卡片关心的全部运行输入。它和日志/其他节点分开比较：
+// 日志刷新或别的节点变化只会让这个 memo 重算一次小结构，不会重建卡片。
+type nodeLive struct {
+	node  graph.Node
+	rt    scheduler.TaskRuntime
+	ready bool
+}
+
+// sameGraphNode 比较一个节点会影响卡片展示的字段，含依赖列表。
+func sameGraphNode(a, b graph.Node) bool {
+	if a.Key != b.Key || a.Title != b.Title || a.Type != b.Type || a.Kind != b.Kind ||
+		a.State != b.State || a.Closed != b.Closed || a.InFlight != b.InFlight || len(a.Deps) != len(b.Deps) {
+		return false
+	}
+	for i := range a.Deps {
+		if a.Deps[i] != b.Deps[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameNodeLive 是 nodeLive memo 的 equality。TaskRuntime 可比较；Node
+// 因 Deps 切片需要逐项比较。
+func sameNodeLive(a, b nodeLive) bool {
+	return a.rt == b.rt && a.ready == b.ready && sameGraphNode(a.node, b.node)
 }
 
 // nodeCard 是依赖图里一个节点的卡片。
@@ -266,28 +310,44 @@ type nodeCard struct {
 	look     *liveGraph
 	key      graph.Key
 	spec     graph.Key
-	title    string
 	specCard bool
-	// node 是建图时的节点，作为 Lookup 还没算出来时的兜底。
-	node graph.Node
+	title    string
+	node     graph.Node
 }
 
-// Render 实现 core.Node。
-func (c nodeCard) Render(cx *core.Scope) core.Node {
-	colors := ui.ColorsOf(cx)
-	c.look.read(cx)
-	node, rt := c.node, scheduler.TaskRuntime{}
-	ready := false
+// readLive 读取这张卡片当前的节点与运行数据。它必须在 memo/effect 里
+// 调用，Revision.Get 才会形成订阅。
+func (c nodeCard) readLive() nodeLive {
+	out := nodeLive{node: c.node}
+	if c.look != nil && c.look.Revision != nil {
+		c.look.Revision.Get()
+	}
 	if c.look != nil && c.look.Lookup != nil {
-		if live, r, isReady, ok := c.look.Lookup(c.key); ok {
-			node = live
-			rt = r
-			ready = isReady
+		if live, rt, ready, ok := c.look.Lookup(c.key); ok {
+			out.node, out.rt, out.ready = live, rt, ready
 		}
 	}
 	if c.specCard {
-		node.Title = c.title
+		out.node.Title = c.title
 	}
+	return out
+}
+
+// Render 实现 core.Node。外层 Dynamic 只订阅“这张卡片相关输入”的 memo：
+// 状态/地址/结束时间变化时重建卡片；秒级 elapsed 不在这里订阅，否则每个
+// 运行节点每秒都会整卡卸载重挂，图稍大就会卡。
+func (c nodeCard) Render(cx *core.Scope) core.Node {
+	live := core.NewMemoFunc(cx, c.readLive, sameNodeLive)
+	return core.Dynamic(func(cx *core.Scope) core.Node {
+		return c.render(cx, live.Get(), live)
+	})
+}
+
+// render 生成当前状态的卡片。只有运行中的 elapsed 文本单独订阅 Now，
+// 因此秒级 tick 只更新那一个 text view，不碰卡片结构、布局与相机。
+func (c nodeCard) render(cx *core.Scope, current nodeLive, live *core.Memo[nodeLive]) core.Node {
+	colors := ui.ColorsOf(cx)
+	node, rt, ready := current.node, current.rt, current.ready
 	state := nodeState(node)
 	if ready && state == viewPending {
 		state = viewReady
@@ -311,11 +371,35 @@ func (c nodeCard) Render(cx *core.Scope) core.Node {
 	if c.specCard {
 		kind = "spec"
 	}
+	elapsed := core.Text{MaxLines: 1,
+		Style: core.Style{FontSize: 11, LineHeight: 15}, StyleFunc: ui.Colored(colors.Muted),
+		ContentFunc: func() string {
+			current := live.Get().rt
+			if current.StartedAt.IsZero() {
+				return ""
+			}
+			now := time.Now()
+			if current.FinishedAt.IsZero() && c.look != nil && c.look.Now != nil {
+				now = c.look.Now.Get()
+			}
+			lines := nodeTimingLines(current, now)
+			if len(lines) == 0 {
+				return ""
+			}
+			return lines[0]
+		}}
 	body := core.Group{
 		core.Text{Content: node.Title, MaxLines: 2, Style: ui.TypeBody.Merge(core.Style{FontWeight: ui.Semibold}),
 			StyleFunc: ui.Colored(colors.Text)},
 		core.Text{Content: displayKey(c.spec, node.Key) + " · " + kind, MaxLines: 1,
 			Style: core.Style{FontSize: 11, LineHeight: 15}, StyleFunc: ui.Colored(colors.Muted)},
+	}
+	if !rt.StartedAt.IsZero() {
+		body = append(body, elapsed)
+	}
+	if lines := nodeTimingLines(rt, rt.FinishedAt); len(lines) > 1 {
+		body = append(body, core.Text{Content: lines[1], MaxLines: 1,
+			Style: core.Style{FontSize: 11, LineHeight: 15}, StyleFunc: ui.Colored(colors.Muted)})
 	}
 
 	var footer core.Node

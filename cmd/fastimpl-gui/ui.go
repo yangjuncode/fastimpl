@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nsgo-dev/nsgo/base"
 	"github.com/nsgo-dev/nsgo/base/camera"
 	"github.com/nsgo-dev/nsgo/base/terminal"
 	"github.com/nsgo-dev/nsgo/core"
@@ -40,6 +41,12 @@ type model struct {
 
 	// rev 随状态刷新递增，全部读状态的界面元素读它即订阅变化。
 	rev *core.Signal[int]
+	// structureRev 只在节点/依赖拓扑变化时递增。flow 的 Data 订阅它，
+	// 因此日志或运行状态刷新不会触发拓扑布局，拓扑变化也不会漏刷新。
+	structureRev *core.Signal[int]
+	// termsRev 只在终端页集合或地址变化时递增。tab 选项订阅它而不是
+	// 全局 rev，避免日志刷新反复重算所有终端 tab。
+	termsRev *core.Signal[int]
 
 	// issueText 是录入的 issue 编号。
 	issueText *core.Signal[string]
@@ -87,6 +94,8 @@ func newModel(cx *core.Scope, s *session, opts app.Options) *model {
 	m := &model{
 		cx: cx, session: s, opts: opts,
 		rev:          core.NewSignal(cx, 0),
+		structureRev: core.NewSignal(cx, 0),
+		termsRev:     core.NewSignal(cx, 0),
 		issueText:    core.NewSignal(cx, ""),
 		workText:     core.NewSignal(cx, ""),
 		repoText:     core.NewSignal(cx, ""),
@@ -182,9 +191,15 @@ func (m *model) sync() {
 
 	// 终端页跟着调度器状态走：每次刷新只同步页的存在与地址，
 	// 连接在页第一次显示时才建立。
-	m.terms.sync(snap.Status)
+	termsChanged := m.terms.sync(snap.Status)
 
 	m.rev.Update(func(n int) int { return n + 1 })
+	if termsChanged {
+		m.termsRev.Update(func(n int) int { return n + 1 })
+	}
+	if rebuild {
+		m.structureRev.Update(func(n int) int { return n + 1 })
+	}
 	if firstGraph {
 		// 图刚建好：等布局量出尺寸后把相机对准整张图。
 		m.post(m.cam.Fit)
@@ -278,7 +293,7 @@ func (m *model) snapshot() snapshot {
 
 // look 返回卡片读运行状态的入口。
 func (m *model) look() *liveGraph {
-	return &liveGraph{Revision: m.rev, Lookup: func(k graph.Key) (graph.Node, scheduler.TaskRuntime, bool, bool) {
+	return &liveGraph{Revision: m.rev, Now: m.now, Lookup: func(k graph.Key) (graph.Node, scheduler.TaskRuntime, bool, bool) {
 		m.rev.Get()
 		m.mu.Lock()
 		defer m.mu.Unlock()
@@ -346,7 +361,7 @@ func (m *model) build() core.Node {
 			Background: colors.Background(), Color: colors.Text()}
 	}, Children: []core.Node{
 		m.header(),
-		core.View{Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0), Direction: core.Column, Gap: 0, Overflow: core.Hidden},
+		core.View{Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Direction: core.Column, Gap: 0, Overflow: core.Hidden},
 			Children: []core.Node{m.tabs(), m.body()}},
 		m.pathsBar(),
 		m.settingsDialog(),
@@ -509,7 +524,7 @@ func (m *model) pickWork() {
 func (m *model) tabs() core.Node {
 	colors := ui.ColorsOf(m.cx)
 	options := func() []ui.Option[string] {
-		m.snapshot()
+		m.termsRev.Get()
 		opts := []ui.Option[string]{
 			{Value: pageGraph, Label: "依赖图", Icon: lucide.Workflow, TestID: "tab-graph"},
 			{Value: pageLog, Label: "日志", Icon: lucide.ScrollText, TestID: "tab-log"},
@@ -534,7 +549,7 @@ func (m *model) tabs() core.Node {
 
 // body 是当前页。
 func (m *model) body() core.Node {
-	return core.View{Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0), Overflow: core.Hidden},
+	return core.View{Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Overflow: core.Hidden},
 		Children: []core.Node{core.Show{
 			When: func() bool { return m.tab.Get() == pageGraph },
 			Then: func(cx *core.Scope) core.Node { return m.graphPage() },
@@ -585,8 +600,40 @@ func (m *model) terminalTabContent(tab *termTab) core.Node {
 			ui.Icon(lucide.SquareTerminal, 14, ui.Inherited),
 			core.Text{ContentFunc: func() string { return m.terminalTabTitle(tab) }, MaxLines: 1},
 		}}
-	return ui.Tooltip{TextFunc: func() string { return m.terminalTooltip(tab) }, Trigger: trigger,
-		TestID: "terminal-tooltip-" + tab.ID()}
+	if tab.tipOpen == nil {
+		tab.tipOpen = core.NewSignal(m.cx, false)
+	}
+	open := tab.tipOpen
+	return ui.Tooltip{
+		TextFunc: func() string {
+			if !open.Get() {
+				return m.terminalTooltipSummary(tab)
+			}
+			return m.terminalTooltip(tab)
+		},
+		OnOpenChange: func(opened bool, _ base.Reason) { open.Set(opened) },
+		Trigger:      trigger,
+		TestID:       "terminal-tooltip-" + tab.ID(),
+	}
+}
+
+// terminalTooltipSummary 是关闭状态下的静态辅助文本。NSGo 会让关闭的
+// tooltip 隐藏挂载来描述 trigger；这里不能读 now/rev，否则每个终端的
+// 隐藏文本都会每秒刷新，终端多时白白占用 UI 线程。
+func (m *model) terminalTooltipSummary(tab *termTab) string {
+	kind := "任务 worker"
+	if tab.Intg {
+		kind = "集成分支 agent"
+	}
+	lines := []string{
+		"类型：" + kind,
+		fmt.Sprintf("Issue：#%d", tab.Key.IID),
+	}
+	if tab.Label != "" {
+		lines = append(lines, "hc 终端："+tab.Label)
+	}
+	lines = append(lines, "打开 tooltip 后显示开始时间、用时与连接详情")
+	return strings.Join(lines, "\n")
 }
 
 // terminalTooltip 组出一个终端的详细信息。所有字段都来自快照副本；
@@ -720,7 +767,10 @@ func (m *model) logGrown(core.Bounds) {
 // logLines 行，持久文件是否启用由设置里的 log_file 决定。
 func (m *model) logPage() core.Node {
 	colors := ui.ColorsOf(m.cx)
-	return core.View{TestID: "log-page", Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0), Direction: core.Column, Overflow: core.Hidden},
+	logBar := ui.ScrollbarTheme(m.cx)
+	logBar.Mode = base.ScrollbarAlways
+	logBar.Vertical.Label = "运行日志滚动条"
+	return core.View{TestID: "log-page", Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Direction: core.Column, Overflow: core.Hidden},
 		Children: []core.Node{
 			core.View{StyleFunc: func() core.Style {
 				return core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: 8, Padding: core.Symmetric(7, 12),
@@ -733,7 +783,7 @@ func (m *model) logPage() core.Node {
 				core.Text{Content: "在底部时自动跟随新日志；向上翻阅会暂停跟随", MaxLines: 1,
 					Style: ui.TypeCaption, StyleFunc: ui.Colored(colors.Muted)},
 			}},
-			core.Scroll{Ref: m.logScroll, OnScroll: m.logScrolled, TestID: "log-scroll",
+			core.Scroll{Ref: m.logScroll, OnScroll: m.logScrolled, Bar: logBar, TestID: "log-scroll",
 				Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0)},
 				Children: []core.Node{core.View{OnLayout: m.logGrown,
 					Style: core.Style{Padding: core.All(12), MinWidth: core.Pct(100)},
@@ -766,6 +816,7 @@ func (m *model) graphPage() core.Node {
 							Data: func() uiflow.Data {
 								// 只有结构变了才换数据；节点状态的刷新走卡片
 								// 自己订阅的信号，不动布局与相机。
+								m.structureRev.Get()
 								return m.structureOf().flowData(look)
 							},
 							NodeGap: 28, RankGap: 56,

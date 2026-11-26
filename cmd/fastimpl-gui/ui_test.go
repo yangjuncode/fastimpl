@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -82,12 +83,20 @@ func loadGraph(app *nsgotest.App, m *model, snap snapshot) {
 		for _, key := range snap.Ready {
 			ready[key] = true
 		}
+		next := buildDiagram(snap)
+		rebuild := !sameStructure(m.structure, next)
 		m.snap, m.nodes, m.runtime, m.ready = snap, nodes, runtime, ready
-		m.structure = buildDiagram(snap)
+		m.structure = next
 		m.flowReady = true
 		m.mu.Unlock()
-		m.terms.sync(snap.Status)
+		termsChanged := m.terms.sync(snap.Status)
 		m.rev.Update(func(n int) int { return n + 1 })
+		if termsChanged {
+			m.termsRev.Update(func(n int) int { return n + 1 })
+		}
+		if rebuild {
+			m.structureRev.Update(func(n int) int { return n + 1 })
+		}
 	})
 	app.Settle()
 }
@@ -155,6 +164,90 @@ func TestGraphPageRendersNodes(t *testing.T) {
 	app.Find("id:graph")
 }
 
+// 图结构本身也要响应刷新：新增节点必须出现，同时已有节点内容按 ID
+// 保留，不能因为拓扑重排而整卡 remount。
+func TestGraphStructureRefreshesNodesInPlace(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	loadGraph(gui, m, snap)
+	before := gui.Find("text:task A")
+
+	key := graph.Key{ProjectID: 1, IID: 30}
+	snap.Nodes = append(append([]graph.Node(nil), snap.Nodes...), graph.Node{
+		Key: key, Title: "task C", Kind: graph.KindChild, State: graph.Running, Deps: []graph.Key{{ProjectID: 1, IID: 9}},
+	})
+	loadGraph(gui, m, snap)
+	gui.Find("text:task C")
+	after := gui.Find("text:task A")
+	if before.ID != after.ID {
+		t.Fatalf("existing node text remounted during a topology refresh (id %d -> %d)", before.ID, after.ID)
+	}
+}
+
+// 节点卡片在已有运行时间时必须展示开始、结束与用时；完结任务的
+// 用时固定为 FinishedAt - StartedAt。
+func TestGraphNodeShowsRuntimeTimes(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	started := time.Date(2026, time.January, 2, 15, 4, 5, 0, time.Local)
+	finished := started.Add(3*time.Minute + 2*time.Second)
+	snap.Status[0].StartedAt = started
+	snap.Status[0].FinishedAt = finished
+	loadGraph(gui, m, snap)
+	gui.Find("text:开始 " + started.Format("01-02 15:04:05") + " · 用时 3分2秒")
+	gui.Find("text:结束 " + finished.Format("01-02 15:04:05"))
+}
+
+// 运行中的节点用时也要跟着界面时钟走，而不是只显示第一次刷新时的
+// 静态秒数。
+func TestGraphNodeRunningElapsedTicks(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	started := gui.Clock.WallTime()
+	snap.Status[0].StartedAt = started
+	loadGraph(gui, m, snap)
+	prefix := "text:开始 " + started.Format("01-02 15:04:05") + " · 用时 "
+	before := gui.Find(prefix + "0秒")
+	gui.Advance(3 * time.Second)
+	after := gui.Find(prefix + "2秒")
+	if before.ID != after.ID {
+		t.Fatalf("elapsed text view was remounted (id %d -> %d); ticking must update text in place, not rebuild the card", before.ID, after.ID)
+	}
+}
+
+// 节点状态变化必须在原卡片上更新，而不是只在首次挂载时画一张
+// 静态快照；这也防止结构未变时重建依赖图、移动相机。
+func TestGraphNodeStatusUpdatesInPlace(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	loadGraph(gui, m, specSnapshot())
+	gui.Find("text:可开始工作")
+	key := graph.Key{ProjectID: 1, IID: 9}
+	gui.Post(func() {
+		m.mu.Lock()
+		node := m.nodes[key]
+		node.State = graph.Running
+		m.nodes[key] = node
+		m.mu.Unlock()
+		m.rev.Update(func(n int) int { return n + 1 })
+	})
+	gui.Settle()
+	gui.Find("id:graph >> text:运行中")
+}
+
+// 日志-only 的全局 revision 不能重建图卡片：卡片 memo 发现自己关心的
+// 节点/运行数据没变后，Dynamic 不重新挂载任何 view。
+func TestGraphNodeDoesNotRebuildForLogOnlyRevision(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	loadGraph(gui, m, specSnapshot())
+	before := gui.Find("text:task A")
+	gui.Post(func() { m.rev.Update(func(n int) int { return n + 1 }) })
+	gui.Settle()
+	after := gui.Find("text:task A")
+	if before.ID != after.ID {
+		t.Fatalf("log-only revision remounted the node card text (id %d -> %d)", before.ID, after.ID)
+	}
+}
+
 // 日志 tab 是独立的运行日志页：从图页切过去后能看到快照里的实时日志。
 func TestLogTabRendersRunLog(t *testing.T) {
 	gui, m, _ := headless(t, app.Options{})
@@ -170,6 +263,68 @@ func TestLogTabRendersRunLog(t *testing.T) {
 	gui.Find("id:log-scroll")
 	gui.Find("text:worker started")
 	gui.Find("text:task integrated")
+}
+
+// 日志内容超出 viewport 时必须有一条可见、可拖的滚动条。用户不能
+// 只靠滚轮/触摸板猜测位置；滚动条常显，但内容放得下时仍不出现。
+func TestLogTabShowsScrollbarWhenLogsOverflow(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	for i := range 120 {
+		snap.Log = append(snap.Log, fmt.Sprintf("time=2026-01-01T00:%02d:00Z level=INFO msg=line-%03d", i%60, i))
+	}
+	loadGraph(gui, m, snap)
+	gui.Press("id:tab-log")
+	scroll := gui.Find("id:log-scroll")
+	if scroll.Content.Height <= scroll.Frame.Size.Height {
+		t.Fatalf("log content %v does not overflow frame %v; test setup is ineffective", scroll.Content, scroll.Frame.Size)
+	}
+	bar := gui.Find("label:运行日志滚动条")
+	if bar.Animated.Opacity != 1 {
+		t.Fatalf("overflowing log scrollbar opacity = %v, want 1", bar.Animated.Opacity)
+	}
+	if !scroll.Scroll.HideIndicator {
+		t.Fatal("the custom log scrollbar did not replace the native indicator")
+	}
+}
+
+// 内容放得下时滚动条仍挂载但完全透明、不接收指针；只有真溢出才占
+// 用户的视觉注意力。
+func TestLogTabHidesScrollbarWhenLogsFit(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	loadGraph(gui, m, specSnapshot())
+	gui.Press("id:tab-log")
+	scroll := gui.Find("id:log-scroll")
+	if scroll.Content.Height > scroll.Frame.Size.Height {
+		t.Fatalf("log content %v unexpectedly overflows frame %v; test setup is ineffective", scroll.Content, scroll.Frame.Size)
+	}
+	if opacity := gui.Find("label:运行日志滚动条").Animated.Opacity; opacity != 0 {
+		t.Fatalf("short log scrollbar opacity = %v, want 0", opacity)
+	}
+}
+
+// 终端 tab 的选项结构只跟随“页集合/地址”变化。StartedAt 这类运行
+// 元数据仍由标题自己的 ContentFunc 更新，不能触发整排 tab 选项重算。
+func TestTerminalTabsDoNotRebuildForRuntimeOnlyRevision(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	loadGraph(gui, m, snap)
+	base := m.termsRev.GetUntracked()
+
+	loadGraph(gui, m, snap)
+	if got := m.termsRev.GetUntracked(); got != base {
+		t.Fatalf("identical status changed termsRev %d -> %d", base, got)
+	}
+	snap.Status[0].StartedAt = gui.Clock.WallTime()
+	loadGraph(gui, m, snap)
+	if got := m.termsRev.GetUntracked(); got != base {
+		t.Fatalf("runtime-only status changed termsRev %d -> %d", base, got)
+	}
+	snap.Status[0].Addr = "t1-new"
+	loadGraph(gui, m, snap)
+	if got := m.termsRev.GetUntracked(); got == base {
+		t.Fatal("terminal address change did not refresh the terminal tab options")
+	}
 }
 
 // 终端 tab 用 issue 号与开始时间命名；tooltip 展示 issue、标题、
@@ -195,6 +350,40 @@ func TestTerminalTabShowsStartTimeAndTooltip(t *testing.T) {
 	// 截断显示的时长才稳定落在 2 秒。
 	gui.Advance(3 * time.Second)
 	gui.Find("text:已工作时间：2秒")
+}
+
+// 关闭中的 tooltip 只是隐藏挂载，不能因为它让界面时钟每秒更新所有
+// 终端的隐藏文本；只有用户真正打开 tooltip 后才需要实时详情。
+func TestTerminalTooltipDoesNotTickWhileClosed(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	started := gui.Clock.WallTime()
+	snap.Status[0].StartedAt = started
+	loadGraph(gui, m, snap)
+	textOf := func() []string {
+		views := gui.QueryMounted("text:已工作时间")
+		out := make([]string, len(views))
+		for i, view := range views {
+			out[i] = view.Text
+		}
+		return out
+	}
+	before := textOf()
+	gui.Advance(3 * time.Second)
+	after := textOf()
+	if len(before) != len(after) {
+		t.Fatalf("mounted elapsed tooltip texts changed count while closed: %q -> %q", before, after)
+	}
+	for i := range before {
+		if before[i] != after[i] {
+			t.Fatalf("closed tooltip elapsed text ticked: %q -> %q", before[i], after[i])
+		}
+	}
+	// 选择器本身必须有效：真正打开 tooltip 后仍要找到详细工作时间。
+	// 否则上面的比较会在实现完全没有挂载该文本时空转。
+	gui.Hover("id:terminal-tab-1!9")
+	gui.Advance(600 * time.Millisecond)
+	gui.Find("text:已工作时间")
 }
 
 // 已完成的任务不再随界面时钟增长：tooltip 里的时长固定为完成时刻减开始时刻。

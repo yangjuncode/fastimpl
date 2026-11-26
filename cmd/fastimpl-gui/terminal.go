@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/nsgo-dev/nsgo/base/terminal"
 	"github.com/nsgo-dev/nsgo/core"
@@ -29,6 +30,9 @@ type termTab struct {
 	conn  *viewerConn
 	// err 是这一页的可见错误：连不上、断开或结束。
 	err error
+	// tipOpen 只在 tooltip 打开时为真。关闭的 tooltip 在 NSGo 里仍隐藏挂载，
+	// 因此详细文本必须用它在打开时才订阅秒级时钟/运行 revision。
+	tipOpen *core.Signal[bool]
 }
 
 // ID 返回终端页的稳定标识，与 flow 节点 ID 同源。
@@ -107,8 +111,161 @@ func (c *viewerConn) open() (interface {
 	if err != nil {
 		return nil, err
 	}
-	c.stream = stream
-	return stream, nil
+	c.stream = newTerminalOutputBatcher(stream)
+	return c.stream, nil
+}
+
+const (
+	// terminalOutputBatchInterval 是连续输出的合批节奏。空闲后的第一
+	// 段输出立即进入 parser；只有距离上一次喂入不足 40ms 时才等一下，
+	// 让后台已经到达的帧合并。40ms 约等于 25fps：肉眼仍连续，却能避免
+	// 终端输出风暴把每个小网络帧都变成一次整屏重绘。
+	terminalOutputBatchInterval = 40 * time.Millisecond
+	// terminalOutputBufferCap 防止观看端卡住时内存无界增长。达到上限后
+	// pump 停止消费，背压留在 hcgo 自己的有限队列里，而不是 GUI 堆内存。
+	terminalOutputBufferCap = 1 << 20
+	terminalOutputPumpChunk = 32 << 10
+)
+
+// terminalOutputBatcher 在观看流与终端模拟器之间合并连续输出。底层流
+// 的帧大小由网络/核心调度决定，常常远小于一次终端画面；NSGo 的
+// terminal 每 write 一次都会请求重绘，因此不能把帧边界原样传进去。
+//
+// 它有两条 goroutine 边界：pump 持续消费底层流并放入有界 buffer；
+// Read 在输出密集时最多按 terminalOutputBatchInterval 取一批。这样
+// 交互回显的空闲首发不额外延迟，而持续输出合并成少量大块。
+type terminalOutputBatcher struct {
+	src io.ReadWriteCloser
+
+	mu        sync.Mutex
+	cond      sync.Cond
+	buf       []byte
+	err       error
+	closed    bool
+	lastServe time.Time
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// newTerminalOutputBatcher 启动底层消费泵。src 仍由 Close 关闭。
+func newTerminalOutputBatcher(src io.ReadWriteCloser) *terminalOutputBatcher {
+	b := &terminalOutputBatcher{src: src}
+	b.cond.L = &b.mu
+	go b.pump()
+	return b
+}
+
+// pump 持续把底层流搬进有界 buffer。它必须独立于终端 parser 的 Read
+// 节奏运行，否则没有办法知道后续网络帧是否已经到达、也就无法合批。
+func (b *terminalOutputBatcher) pump() {
+	chunk := make([]byte, terminalOutputPumpChunk)
+	for {
+		n, err := b.src.Read(chunk)
+		if n > 0 {
+			b.mu.Lock()
+			for len(b.buf)+n > terminalOutputBufferCap && !b.closed {
+				b.cond.Wait()
+			}
+			if b.closed {
+				b.mu.Unlock()
+				return
+			}
+			b.buf = append(b.buf, chunk[:n]...)
+			b.cond.Signal()
+			b.mu.Unlock()
+		}
+		if err != nil {
+			b.mu.Lock()
+			b.err = err
+			b.cond.Broadcast()
+			b.mu.Unlock()
+			return
+		}
+	}
+}
+
+// Read 返回一批输出。空闲超过合批间隔后的数据立刻返回；输出密集时
+// 短暂等到下一批，让 pump 有时间把连续小帧合并。已有满一 Read 的
+// backlog 不再等待，避免高吞吐时无谓限速。
+func (b *terminalOutputBatcher) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	for {
+		b.mu.Lock()
+		if len(b.buf) > 0 {
+			if len(b.buf) < len(p) && !b.lastServe.IsZero() {
+				if wait := terminalOutputBatchInterval - time.Since(b.lastServe); wait > 0 {
+					b.mu.Unlock()
+					time.Sleep(wait)
+					continue
+				}
+			}
+			n := copy(p, b.buf)
+			copy(b.buf, b.buf[n:])
+			b.buf = b.buf[:len(b.buf)-n]
+			if len(b.buf) == 0 && cap(b.buf) > 64<<10 {
+				// 突发大输出结束后释放 oversized backing array；常态小
+				// buffer 保留，避免每个节拍重新分配。
+				b.buf = nil
+			}
+			b.lastServe = time.Now()
+			b.cond.Broadcast()
+			b.mu.Unlock()
+			return n, nil
+		}
+		if b.err != nil {
+			err := b.err
+			b.mu.Unlock()
+			return 0, err
+		}
+		if b.closed {
+			b.mu.Unlock()
+			return 0, io.EOF
+		}
+		b.cond.Wait()
+		b.mu.Unlock()
+	}
+}
+
+// Write 直接写底层流：输入不能走输出合批，否则按键会被延迟。
+func (b *terminalOutputBatcher) Write(p []byte) (int, error) { return b.src.Write(p) }
+
+// Resize 透传底层观看流的网格调整能力。
+func (b *terminalOutputBatcher) Resize(cols, rows int) error {
+	if resizer, ok := b.src.(interface{ Resize(int, int) error }); ok {
+		return resizer.Resize(cols, rows)
+	}
+	return nil
+}
+
+// WriteAuto 透传终端自动应答能力。
+func (b *terminalOutputBatcher) WriteAuto(p []byte) (int, error) {
+	if auto, ok := b.src.(interface{ WriteAuto([]byte) (int, error) }); ok {
+		return auto.WriteAuto(p)
+	}
+	return b.Write(p)
+}
+
+// EndError 透传底层流结束原因。
+func (b *terminalOutputBatcher) EndError() error {
+	if ender, ok := b.src.(interface{ EndError() error }); ok {
+		return ender.EndError()
+	}
+	return nil
+}
+
+// Close 关闭底层观看流并唤醒 pump/reader；可重复调用。
+func (b *terminalOutputBatcher) Close() error {
+	b.closeOnce.Do(func() {
+		b.mu.Lock()
+		b.closed = true
+		b.cond.Broadcast()
+		b.mu.Unlock()
+		b.closeErr = b.src.Close()
+	})
+	return b.closeErr
 }
 
 // Write 把按键送进终端；还没连上时先连。
@@ -199,7 +356,9 @@ func newTerminals(s *session, notify func()) *terminals {
 // sync 按调度器的运行状态同步终端页：每个有地址的条目一页，按 key
 // 去重。它不主动建连接，连接在终端页第一次被显示时懒建立。
 // 离开的运行（地址消失）会释放自己的观看连接，但绝不 kill 任务。
-func (t *terminals) sync(status []scheduler.TaskRuntime) {
+// 返回值报告页集合/地址是否变化；调用方只在 true 时刷新 tab 选项，
+// 避免日志或无关状态刷新反复重算全部终端 tab。
+func (t *terminals) sync(status []scheduler.TaskRuntime) bool {
 	live := make(map[string]scheduler.TaskRuntime, len(status))
 	for _, r := range status {
 		if r.Addr == "" {
@@ -207,6 +366,7 @@ func (t *terminals) sync(status []scheduler.TaskRuntime) {
 		}
 		live[tabID(r.Key, r.Integration)] = r
 	}
+	changed := false
 	// 先删掉这一轮已经不存在的页。
 	kept := t.tabs[:0]
 	for _, tab := range t.tabs {
@@ -216,6 +376,7 @@ func (t *terminals) sync(status []scheduler.TaskRuntime) {
 		}
 		delete(t.byID, tab.ID())
 		tab.close()
+		changed = true
 	}
 	t.tabs = kept
 	// 再按调度器的顺序补上新页，并更新已有页的地址：地址变了就是
@@ -228,16 +389,19 @@ func (t *terminals) sync(status []scheduler.TaskRuntime) {
 		if tab, ok := t.byID[id]; ok {
 			if tab.Addr != r.Addr {
 				tab.rebind(r.Addr, r.Label)
+				changed = true
 			}
 			continue
 		}
 		tab := &termTab{Key: r.Key, Intg: r.Integration, Addr: r.Addr, Label: r.Label}
 		t.tabs = append(t.tabs, tab)
 		t.byID[id] = tab
+		changed = true
 	}
 	if t.active >= len(t.tabs) {
 		t.active = max(len(t.tabs)-1, 0)
 	}
+	return changed
 }
 
 // closeAll 释放全部观看连接（窗口关闭或运行结束时）。

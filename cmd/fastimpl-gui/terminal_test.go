@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/yangjuncode/fastimpl/app"
 	"github.com/yangjuncode/fastimpl/graph"
@@ -124,6 +125,68 @@ func TestViewerConnForwardsResizeAndInput(t *testing.T) {
 	}
 	if calls := attach.callsOf(); len(calls) != 1 || calls[0] != "t1" {
 		t.Errorf("attach calls = %v, want exactly one for t1", calls)
+	}
+}
+
+// 连续输出不能像网络帧一样一格一格直接喂给终端模拟器：NSGo 每次
+// write 都会请求整屏重绘。突发输出必须在观看连接里合并，交互首发仍
+// 立刻返回，后续密集帧按批次进入 parser。
+func TestViewerConnCoalescesTerminalOutputBursts(t *testing.T) {
+	stream := newFakeStream()
+	attach := &fakeAttach{stream: stream}
+	conn := &viewerConn{Attach: attach.attach, Addr: "t-batch", Width: 80, Height: 24}
+
+	stream.readCh <- []byte("first")
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil || string(buf[:n]) != "first" {
+		t.Fatalf("first Read = %q, %v, want the immediate interactive output", buf[:n], err)
+	}
+	// 这些帧在消费者下一次 Read 前已经全部到达；适配层必须合并，
+	// 不能把它们拆成三次 parser write/整屏重绘。
+	stream.readCh <- []byte("a")
+	stream.readCh <- []byte("b")
+	stream.readCh <- []byte("c")
+	n, err = conn.Read(buf)
+	if err != nil {
+		t.Fatalf("burst Read = %v", err)
+	}
+	if got := string(buf[:n]); got != "abc" {
+		t.Fatalf("burst Read = %q, want the coalesced output %q", got, "abc")
+	}
+}
+
+// 合批层新增了独立的等待路径：终端页被关闭时，正在无数据 Read 中
+// 等待的 goroutine 必须立刻醒来，不能泄漏或拖住 terminal.Close。
+func TestViewerConnCloseUnblocksPendingRead(t *testing.T) {
+	stream := newFakeStream()
+	attach := &fakeAttach{stream: stream}
+	conn := &viewerConn{Attach: attach.attach, Addr: "t-close", Width: 80, Height: 24}
+
+	stream.readCh <- []byte("open")
+	buf := make([]byte, 16)
+	if n, err := conn.Read(buf); err != nil || string(buf[:n]) != "open" {
+		t.Fatalf("opening Read = %q, %v", buf[:n], err)
+	}
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := conn.Read(buf)
+		done <- result{n: n, err: err}
+	}()
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	select {
+	case got := <-done:
+		if got.err == nil {
+			t.Fatalf("pending Read after Close returned n=%d, nil error; want an end error", got.n)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending Read did not unblock after Close")
 	}
 }
 
