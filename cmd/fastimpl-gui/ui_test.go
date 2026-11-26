@@ -238,6 +238,48 @@ func TestIntegrationTerminalTabUsesIntegrationPrefix(t *testing.T) {
 	}
 }
 
+// 点击终端 tab 的“标题文字”必须切换终端。这个测试用标题文字在 tab 内
+// 的真实坐标做命中测试，覆盖“已经在一个终端页时，再点另一个终端 tab，
+// 内容不能继续停留在第一个终端”的回归。
+func TestTerminalTabTitlePressSwitchesTerminal(t *testing.T) {
+	gui, m, sess := headless(t, app.Options{})
+	attach := &fakeAttach{stream: newFakeStream()}
+	sess.attach = attach.attach
+	snap := specSnapshot()
+	started := gui.Clock.WallTime()
+	snap.Status[0].StartedAt = started
+	snap.Status = append(snap.Status, scheduler.TaskRuntime{
+		Key:       graph.Key{ProjectID: 1, IID: 10},
+		Addr:      "t2",
+		Label:     "proj-issue-10",
+		StartedAt: started.Add(time.Minute),
+	})
+	loadGraph(gui, m, snap)
+	if len(m.terms.tabs) != 2 {
+		t.Fatalf("terminal model tabs = %d, want 2", len(m.terms.tabs))
+	}
+	gui.Post(func() { m.tab.Set("1!9") })
+	gui.Settle()
+
+	title := "#10 · " + started.Add(time.Minute).Format("15:04:05")
+	text := gui.Find("text:" + title)
+	at := core.Point{X: text.Frame.Size.Width / 2, Y: text.Frame.Size.Height / 2}
+	gui.PressAt("text:"+title, at)
+	if got := m.tab.GetUntracked(); got != "1!10" {
+		t.Fatalf("pressing the second terminal tab title selected %q, want 1!10", got)
+	}
+	gui.Find("text:地址 t2")
+
+	// 再切回第一个终端，确认这不是只在第一次跳转时碰巧重建。
+	firstTitle := "#9 · " + started.Format("15:04:05")
+	firstText := gui.Find("text:" + firstTitle)
+	gui.PressAt("text:"+firstTitle, core.Point{X: firstText.Frame.Size.Width / 2, Y: firstText.Frame.Size.Height / 2})
+	if got := m.tab.GetUntracked(); got != "1!9" {
+		t.Fatalf("pressing the first terminal tab title selected %q, want 1!9", got)
+	}
+	gui.Find("text:地址 t1")
+}
+
 // 传了 issue 时窗口打开后自动开始：这里只验证录入值被带到选项里，
 // 真正的运行由 session 的测试覆盖。
 func TestIssueFromFlagsPrefills(t *testing.T) {

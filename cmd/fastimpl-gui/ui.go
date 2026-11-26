@@ -542,7 +542,12 @@ func (m *model) body() core.Node {
 				return core.Show{
 					When: func() bool { return m.tab.Get() == pageLog },
 					Then: func(cx *core.Scope) core.Node { return m.logPage() },
-					Else: func(cx *core.Scope) core.Node { return m.terminalPage() },
+					Else: func(cx *core.Scope) core.Node {
+						// 终端 A → 终端 B 时外层两个 Show 的条件都仍然是
+						// false，不会重建分支；这里必须让 terminalPage 跟着
+						// 当前 tab 动态求值，否则界面会停留在第一次打开的终端。
+						return core.Dynamic(func(cx *core.Scope) core.Node { return m.terminalPage() })
+					},
 				}
 			},
 		}}}
