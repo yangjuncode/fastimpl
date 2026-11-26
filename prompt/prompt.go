@@ -29,7 +29,14 @@ const DefaultTemplate = `使用 implement 技能完成 {{.Forge}} 子任务 #{{.
 你的工作目录（cwd）是 fastimpl 的运行目录 {{.WorkDir}}，其中包含主仓库 checkout（{{.RepoDir}}）以及可能的其他目录，可自由查阅参考，但不要在 checkout 中修改。
 {{end}}
 本任务的代码产出目录是 git worktree {{.Worktree}}（当前分支 {{.Branch}}）：所有新代码、修改、提交都在其中进行（可用 git -C {{.Worktree}}）；fastimpl 管理集成分支 {{.IntBranch}}（合并、推送、关闭 issue、清理 worktree 都由它完成），你的提交若与 {{.IntBranch}} 冲突，在 {{.Worktree}} 中 git merge {{.IntBranch}} 解决。
-读取任务正文和评论，先说明任务标题。只在 {{.Worktree}} 中修改和提交。
+{{if .IssueContext}}
+{{.IssueContext}}
+
+先说明任务标题。issue 正文和评论已由 fastimpl 预取；不要先访问 forge 拉取它们，只有明确发现快照缺少关键最新信息时才查询。
+{{else}}
+读取任务正文和评论，先说明任务标题。
+{{end}}
+只在 {{.Worktree}} 中修改和提交。
 {{if .RequireReview}}
 完成实现与仓库要求的验证后，先由 leader 审核，再使用 {{.Reviewer}} 独立审核。修复发现的问题，重新验证及审核后提交。
 {{else}}
@@ -113,6 +120,16 @@ type Vars struct {
 	// Reviewer 是第三方 reviewer 名称，写作 {{.Reviewer}}；由配置
 	// reviewer 提供，默认是 gpt-reviewer，也可换成 gemini-reviewer、swe-reviewer 等。
 	Reviewer string
+	// IssueContext 是 fastimpl 预取并包装好的 issue 上下文段，
+	// 写作 {{.IssueContext}}；为空表示没有本地快照，模板应退回
+	// 让 agent 自行读取正文/评论。
+	IssueContext string
+	// IssueContextPath 是完整本地 Markdown 快照路径，写作
+	// {{.IssueContextPath}}；prompt 截断时 agent 可读它补齐。
+	IssueContextPath string
+	// IssueContextTruncated 表示嵌入内容已因长度上限截断，写作
+	// {{.IssueContextTruncated}}。
+	IssueContextTruncated bool
 }
 
 // Render 用 text/template 渲染模板，{{.Field}} 与 if/range 等

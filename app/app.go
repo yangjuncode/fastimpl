@@ -22,6 +22,7 @@ import (
 	"github.com/yangjuncode/fastimpl/github"
 	"github.com/yangjuncode/fastimpl/gitlab"
 	"github.com/yangjuncode/fastimpl/graph"
+	"github.com/yangjuncode/fastimpl/issuecontext"
 	"github.com/yangjuncode/fastimpl/prompt"
 	"github.com/yangjuncode/fastimpl/scheduler"
 	"github.com/yangjuncode/fastimpl/worker"
@@ -137,9 +138,24 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	forge := resolveForge(ctx, cfg.Forge, host, repoDir)
 	log.Info("building dependency graph", "forge", forge, "origin", host+"/"+projectPath, "spec", opts.SpecIID)
 	buildStart := time.Now()
-	fc, g, err := buildGraph(ctx, forge, repoDir, host, projectPath, opts.SpecIID, log, observer.Progress)
+	fc, g, contexts, err := buildGraph(ctx, forge, repoDir, host, projectPath, opts.SpecIID, log, observer.Progress, !opts.Print)
 	if err != nil {
 		return err
+	}
+	if contexts != nil {
+		contextDir := issuecontext.Dir(path.Base(projectPath))
+		written, writeErr := contexts.WriteAll(contextDir, g)
+		switch {
+		case writeErr != nil:
+			// 这是启动加速快照，不是正确性前提；写失败时让 worker 走模板
+			// 里的 forge 读取兜底，不能把整个调度卡死。
+			log.Warn("write issue context snapshots failed", "dir", contextDir, "err", writeErr)
+		default:
+			log.Info("issue context snapshots written", "dir", contextDir, "files", written.Files)
+		}
+		if written.CommentErrors > 0 {
+			log.Warn("some issue comments could not be prefetched", "count", written.CommentErrors)
+		}
 	}
 	var open, closed int
 	for _, n := range g.Snapshot() {
@@ -384,24 +400,33 @@ func resolveTreeDir(ctx context.Context, flagDir, cfgDir, repoDir string) (strin
 // buildGraph 按 forge 建 client 并构建完整依赖图；返回的 client
 // 同时是调度器的 Forge 端口（Claim/Close/Note）。progress 非 nil 时
 // 在建图过程中按阶段上报。
-func buildGraph(ctx context.Context, kind, dir, host, projectPath string, specIID int, log *slog.Logger, progress func(graph.BuildProgress)) (forge.Forge, *graph.Graph, error) {
+func buildGraph(ctx context.Context, kind, dir, host, projectPath string, specIID int, log *slog.Logger, progress func(graph.BuildProgress), prefetch bool) (forge.Forge, *graph.Graph, *issuecontext.Store, error) {
+	wrap := func(client forge.Forge, base graph.Source) (graph.Source, *issuecontext.Store) {
+		if !prefetch {
+			return base, nil
+		}
+		store := issuecontext.NewStore()
+		return store.WrapSource(base, client), store
+	}
 	switch kind {
 	case config.ForgeGitLab:
 		client, err := gitlab.NewClient(ctx, gitlab.ExecRunner{}, dir, host, projectPath)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		g, err := graph.BuildWithProgress(ctx, glabSource{c: client, log: log}, specIID, progress)
-		return client, g, err
+		src, store := wrap(client, glabSource{c: client, log: log})
+		g, err := graph.BuildWithProgress(ctx, src, specIID, progress)
+		return client, g, store, err
 	case config.ForgeGitHub:
 		client, err := github.NewClient(ctx, github.ExecRunner{}, dir, host, projectPath)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		g, err := graph.BuildWithProgress(ctx, ghSource{c: client, log: log}, specIID, progress)
-		return client, g, err
+		src, store := wrap(client, ghSource{c: client, log: log})
+		g, err := graph.BuildWithProgress(ctx, src, specIID, progress)
+		return client, g, store, err
 	default:
-		return nil, nil, fmt.Errorf("unknown forge %q", kind)
+		return nil, nil, nil, fmt.Errorf("unknown forge %q", kind)
 	}
 }
 

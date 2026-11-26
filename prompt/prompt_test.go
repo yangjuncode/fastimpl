@@ -121,3 +121,44 @@ func TestDefaultTemplateRendersConfiguredReviewer(t *testing.T) {
 		t.Fatalf("prompt still hard-codes the old reviewer: %s", out[:240])
 	}
 }
+
+// IssueContext 是 scheduler 预取后的可选变量：有快照时默认模板直接嵌入
+// 并禁止 agent 先访问 forge；没有快照时保留旧的读取正文/评论兜底。
+func TestDefaultTemplateUsesPrefetchedIssueContext(t *testing.T) {
+	section := "<!-- fastimpl-issue-context-start -->\n任务正文与评论\n<!-- fastimpl-issue-context-end -->"
+	with, err := Render(DefaultTemplate, Vars{
+		IssueNo: 9, Token: "t", Worktree: "/wt", WorkDir: "/wd", RepoDir: "/r",
+		IssueContext: section, IssueContextPath: "/tmp/proj-issues/1-9.md",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(with, section) {
+		t.Fatalf("default template does not embed IssueContext")
+	}
+	if strings.Contains(with, "读取任务正文和评论") {
+		t.Fatalf("prefetched prompt still tells the agent to read issue body/comments")
+	}
+	if !strings.Contains(with, "不要先访问") {
+		t.Fatalf("prefetched prompt does not forbid the slow forge read first")
+	}
+
+	without, err := Render(DefaultTemplate, Vars{IssueNo: 9, Token: "t", Worktree: "/wt", WorkDir: "/wd", RepoDir: "/r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(without, "读取任务正文和评论") {
+		t.Fatalf("fallback prompt lost the old body/comments instruction")
+	}
+}
+
+func TestRenderIssueContextVars(t *testing.T) {
+	out, err := Render("{{.IssueContextPath}}|{{.IssueContextTruncated}}|{{.IssueContext}}",
+		Vars{IssueContextPath: "/tmp/p-issues/1-9.md", IssueContextTruncated: true, IssueContext: "ctx"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "/tmp/p-issues/1-9.md|true|ctx" {
+		t.Fatalf("out %q", out)
+	}
+}

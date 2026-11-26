@@ -19,6 +19,7 @@ import (
 	"github.com/yangjuncode/fastimpl/config"
 	"github.com/yangjuncode/fastimpl/forge"
 	"github.com/yangjuncode/fastimpl/graph"
+	"github.com/yangjuncode/fastimpl/issuecontext"
 	"github.com/yangjuncode/fastimpl/prompt"
 	"github.com/yangjuncode/fastimpl/worker"
 	"github.com/yangjuncode/fastimpl/worktree"
@@ -137,6 +138,25 @@ func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, forgeName string
 		retentionChanged: make(chan struct{}),
 		activeHeartbeat:  ActiveHeartbeatInterval,
 	}
+}
+
+// issuePromptContext 读取 graph build 阶段物化的本地 issue 快照，并包装成
+// prompt 段。快照只是启动加速：文件不存在/不可读时返回空，模板仍走
+// 原来的 forge 读取兜底，不能把任务启动变成失败。
+func (s *Scheduler) issuePromptContext(key graph.Key) (section, path string, truncated bool) {
+	if s.repo == nil || s.repo.Name == "" {
+		return "", "", false
+	}
+	path = issuecontext.FilePath(issuecontext.Dir(s.repo.Name), key)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", false
+	}
+	markdown := strings.TrimSpace(string(data))
+	if markdown == "" {
+		return "", "", false
+	}
+	return issuecontext.PromptSection(markdown, path), path, len(markdown) > issuecontext.PromptContextLimit
 }
 
 // forgeCLI 返回 forge 类型对应的 issue 命令行工具名；
@@ -1080,24 +1100,29 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			s.taskFailed(taskCtx, key, "await worker boot", err, termName, &finish, &res, fail)
 			return
 		}
+		contextSection, contextPath, contextTruncated := s.issuePromptContext(key)
 		text, err := prompt.Render(s.template, prompt.Vars{
-			IssueNo:       iid,
-			Token:         reportToken,
-			SpecNo:        s.specIID,
-			Worktree:      dir,
-			WorkDir:       s.workDir,
-			RepoDir:       s.repo.Root,
-			IntBranch:     s.branch,
-			Branch:        branch,
-			Forge:         s.forgeName,
-			ForgeCLI:      forgeCLI(s.forgeName),
-			RequireReview: s.cfg.RequireReview,
-			Reviewer:      s.cfg.ReviewerName(),
+			IssueNo:               iid,
+			Token:                 reportToken,
+			SpecNo:                s.specIID,
+			Worktree:              dir,
+			WorkDir:               s.workDir,
+			RepoDir:               s.repo.Root,
+			IntBranch:             s.branch,
+			Branch:                branch,
+			Forge:                 s.forgeName,
+			ForgeCLI:              forgeCLI(s.forgeName),
+			RequireReview:         s.cfg.RequireReview,
+			Reviewer:              s.cfg.ReviewerName(),
+			IssueContext:          contextSection,
+			IssueContextPath:      contextPath,
+			IssueContextTruncated: contextTruncated,
 		})
 		if err != nil {
 			s.taskFailed(taskCtx, key, "render prompt", err, termName, &finish, &res, fail)
 			return
 		}
+		text = issuecontext.EnsureInPrompt(text, contextSection)
 		// 首次 Prompt 前明确重验自己的认领仍然有效。
 		if err := s.confirmClaim(taskCtx, ctx, key, token); err != nil {
 			s.taskFailed(taskCtx, key, "verify claim before prompt", err, termName, &finish, &res, fail)

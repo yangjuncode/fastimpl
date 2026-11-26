@@ -549,6 +549,7 @@ type note struct {
 	ID        int64  `json:"id"`
 	Body      string `json:"body"`
 	CreatedAt string `json:"created_at"`
+	System    bool   `json:"system"`
 	Author    struct {
 		ID int64 `json:"id"`
 	} `json:"author"`
@@ -574,6 +575,7 @@ func (c *Client) IssueComments(ctx context.Context, projectID, iid int) ([]forge
 				AuthorID:  n.Author.ID,
 				CreatedAt: created,
 				Body:      n.Body,
+				System:    n.System,
 			})
 		}
 		return nil

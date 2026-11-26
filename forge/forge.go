@@ -34,6 +34,9 @@ type IssueComment struct {
 	CreatedAt time.Time
 	// Body 是评论正文。
 	Body string
+	// System 表示 forge 自动生成的状态/字段变更记录（GitLab system note）。
+	// 这类记录对实现任务通常是噪音，生成给 agent 的快照时会过滤。
+	System bool
 }
 
 // Forge 是调度器需要的 issue/MR 操作；gitlab.Client 与 github.Client

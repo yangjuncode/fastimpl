@@ -51,7 +51,7 @@ func TestIssueCommentsPaginated(t *testing.T) {
 	r := &fakeRunner{out: map[string][]byte{
 		"api --hostname gitlab.example.com --paginate projects/group%2Fproj/issues/7/notes?per_page=100": []byte(
 			`[{"id":11,"body":"first","created_at":"2024-01-02T03:04:05Z","author":{"id":101}}]` +
-				`[{"id":12,"body":"second","created_at":"2024-01-02T03:04:06Z","author":{"id":102}}]`),
+				`[{"id":12,"body":"second","created_at":"2024-01-02T03:04:06Z","system":true,"author":{"id":102}}]`),
 	}}
 	c := newTestClient(r)
 	comments, err := c.IssueComments(context.Background(), 42, 7)
@@ -60,7 +60,7 @@ func TestIssueCommentsPaginated(t *testing.T) {
 	}
 	want := []forge.IssueComment{
 		{ID: 11, AuthorID: 101, CreatedAt: time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC), Body: "first"},
-		{ID: 12, AuthorID: 102, CreatedAt: time.Date(2024, 1, 2, 3, 4, 6, 0, time.UTC), Body: "second"},
+		{ID: 12, AuthorID: 102, CreatedAt: time.Date(2024, 1, 2, 3, 4, 6, 0, time.UTC), Body: "second", System: true},
 	}
 	if len(comments) != len(want) {
 		t.Fatalf("comments = %+v, want %d", comments, len(want))

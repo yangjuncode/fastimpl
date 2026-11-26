@@ -16,6 +16,7 @@ import (
 	"github.com/yangjuncode/fastimpl/config"
 	"github.com/yangjuncode/fastimpl/forge"
 	"github.com/yangjuncode/fastimpl/graph"
+	"github.com/yangjuncode/fastimpl/issuecontext"
 	"github.com/yangjuncode/fastimpl/worker"
 	"github.com/yangjuncode/fastimpl/worktree"
 )
@@ -217,6 +218,9 @@ type fakeSessions struct {
 	stopErr  error
 	stops    []string
 	records  map[string]worker.Record
+	// prompts 记录每个地址收到的完整提示词，供 scheduler seam 断言
+	// issue 上下文确实进入首次 worker prompt。
+	prompts map[string][]string
 }
 
 func (f *fakeSessions) StartWorker(ctx context.Context, p worker.Params) (string, error) {
@@ -285,6 +289,10 @@ func (f *fakeSessions) Prompt(ctx context.Context, addr, text string) (uint64, e
 	if f.tokens == nil {
 		f.tokens = map[string]string{}
 	}
+	if f.prompts == nil {
+		f.prompts = map[string][]string{}
+	}
+	f.prompts[addr] = append(f.prompts[addr], text)
 	// 续写/冲突提示词不含模板分隔符，从提示词里的
 	// "FASTIMPL-READY <token>" 按令牌格式提取（token 后可能紧跟
 	// 中文标点，不能用空白分词）；都没有则沿用已记录令牌。
@@ -820,5 +828,59 @@ func TestWorkerPromptUsesConfiguredReviewer(t *testing.T) {
 	}
 	if !strings.Contains(sessions.texts[0], "reviewer=swe-reviewer") {
 		t.Fatalf("worker prompt missing configured reviewer:\n%s", sessions.texts[0])
+	}
+}
+
+// scheduler seam：任务首次 prompt 必须直接携带 graph build 阶段写入的
+// issue 快照内容，并把旧式“读取任务正文和评论”指令移除；agent 不应再
+// 先花多轮工具调用去 forge 拉取同一个 issue。
+func TestWorkerPromptIncludesPrefetchedIssueContext(t *testing.T) {
+	repoDir := initRepo(t)
+	repo := worktree.NewRepo(repoDir, filepath.Join(repoDir, ".wt"))
+	repo.Name = "ctxproj"
+	contextDir := issuecontext.Dir(repo.Name)
+	t.Cleanup(func() { _ = os.RemoveAll(contextDir) })
+	ctx := context.Background()
+	intBranch, intDir, baseName, err := repo.EnsureIntegration(ctx, 8, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := graph.Key{ProjectID: 1, IID: 9}
+	g := graph.New(graph.Key{ProjectID: 1, IID: 8})
+	g.Add(graph.Node{Key: key, Title: "预取任务", Type: "task", Kind: graph.KindChild})
+	store := issuecontext.NewStore()
+	store.Put(key, "正文：必须提前注入", []forge.IssueComment{
+		{ID: 9, CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), Body: "评论：验收边界"},
+	}, nil)
+	if _, err := store.WriteAll(contextDir, g); err != nil {
+		t.Fatalf("WriteAll = %v", err)
+	}
+
+	forge := &fakeForge{}
+	baseSessions := &fakeSessions{}
+	sessions := &commitSessions{fakeSessions: baseSessions, t: t}
+	cfg := config.Config{Parallelism: 1, SpecIID: 8, InstanceID: testInstanceID}
+	s := newTestScheduler(cfg, repo, forge, "gitlab", g, sessions, "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}\n读取任务正文和评论，先说明任务标题。", repoDir, intDir, intBranch, baseName, []string{"devin"}, slog.Default())
+	if err := s.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	baseSessions.mu.Lock()
+	var prompts []string
+	for _, got := range baseSessions.prompts {
+		prompts = append(prompts, got...)
+	}
+	baseSessions.mu.Unlock()
+	if len(prompts) == 0 {
+		t.Fatal("worker received no prompt")
+	}
+	text := prompts[0]
+	for _, want := range []string{"正文：必须提前注入", "评论：验收边界", "完整本地文件", "不要先访问"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("worker prompt lacks %q", want)
+		}
+	}
+	if strings.Contains(text, "读取任务正文和评论") {
+		t.Errorf("worker prompt still tells the agent to read body/comments from forge")
 	}
 }

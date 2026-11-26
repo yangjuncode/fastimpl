@@ -70,6 +70,13 @@
 项目内 IID；GitHub 上是仓库的 database id + issue number。这样跨仓库
 依赖（GitHub sub-issue 可以跨同 owner 仓库、GitLab 跨项目）都能正确定位。
 
+真正调度的运行在建图的同时还会并行预取每个入图 issue 的正文与评论，
+并物化到 `<系统 temp 目录>/<项目名>-issues/<projectID>-<IID>.md`
+（Linux 默认即 `/tmp/<项目名>-issues/`）。fastimpl 自己的 claim/release
+协议评论、运行状态备注与 forge 系统自动状态变更会被过滤。评论读取失败
+不会阻断建图：正文仍写入快照并在文件里标注评论缺失。`-print` 是只读导出路径，不做
+这批额外预取。快照用于 worker 启动加速，不是调度正确性前提。
+
 `-print` 的输出按 **Kahn 拓扑分层**打印：level 0 是无前置任务，level n
 的任务全部前置都在更低的层——同一层内可并行。
 
@@ -146,7 +153,11 @@ refspec 下又会缺少真实分支；普通 fetch 也不会 prune）。之后�
    日志立即打印 `worker running key=<proj!iid> terminal=<名> addr=<地址>`。
 5. **等启动**：轮询 OSC 7501 状态到 idle/done（上限 5 分钟）。
 6. **发提示词**：渲染模板（`{{.IssueNo}}` `{{.SpecNo}}` `{{.Token}}` 等，
-   token 是本任务随机的报告令牌）后发送。
+   token 是本任务随机的报告令牌）后发送。若建图阶段已写出该 issue 的
+   本地 Markdown 快照，prompt 会直接嵌入其中的正文、依赖元数据与过滤后的
+   有效评论（最多 32KiB，超出时截断并指向完整本地文件），agent 不必先
+   自己访问 forge 慢速拉取；只有快照明确缺评论或内容被截断且确实关键时，
+   才需要补查。
 7. **等一轮结束**：轮询到轮次前进且状态 idle/done（上限 90 分钟）。
 8. **判定完成**：读终端屏幕，找本任务令牌的 **`FASTIMPL-READY <token>`**
    行。fastimpl **不做任何 LLM 判定**——完成与否只看这一个标记，
@@ -452,6 +463,17 @@ git 时把短提交哈希附在后面，形如 `0.1.0+abcdef0`，拿不到 hash 
   （`require_review` 配置，默认 false）
 - `{{.Reviewer}}` — 第三方 reviewer 名称（`reviewer` 配置，默认
   `gpt-reviewer`；默认模板在 `require_review` 打开时把它填入独立审核要求）
+- `{{.IssueContext}}` — fastimpl 预取并包装好的本地 issue 上下文段；
+  为空表示没有可用快照
+- `{{.IssueContextPath}}` — 该 issue 完整 Markdown 快照的本地路径，
+  形如 `/tmp/<项目名>-issues/<projectID>-<IID>.md`
+- `{{.IssueContextTruncated}}` — 嵌入 prompt 的上下文是否因 32KiB 上限
+  被截断；完整内容始终在 `IssueContextPath`
+
+`{{.IssueContext}}` 已经带有开始/结束标记、完整文件路径与“不要先访问
+forge”的说明。定制模板可以把它放在工作目录/分支说明之后；没有使用该
+变量但仍保留旧默认句式“读取任务正文和评论，先说明任务标题。”的模板，
+fastimpl 会把该句就地替换为预取上下文，避免升级后静默失去加速效果。
 
 模板与 fastimpl 的**唯一契约是报告协议**：任务全部完成（含仓库要求的
 验证）后在回复末尾单独一行输出 `FASTIMPL-READY <token>`，随后最多六行
@@ -479,6 +501,10 @@ forge      配置 forge > origin 主机名推断 > glab/gh 探测 > gitlab
   直接 `hc attach <repo>-issue-<iid>` 进终端看输出、必要时接管对话。
 - **查看整体进度**：`-print` 随时可跑（只读）；MR/PR 页面上能看到集成
   分支累积的提交。
+- **查看预取 issue 上下文**：每次实际调度建图后，快照位于
+  `/tmp/<项目名>-issues/`（严格说是 `<系统 temp 目录>/<项目名>-issues/`），
+  文件名 `<projectID>-<IID>.md`；目录权限 0700、文件 0600。内容是本次
+  建图时刻的快照，不会后台自动刷新；下一次运行会原子覆盖同 issue 文件。
 - **needs-attention 任务**：日志有
   `task needs attention key=… reason=…`，issue 上有说明评论，hc 终端
   和 worktree 都保留——`hc attach` 进去看 agent 到底输出了什么，或直接
@@ -575,9 +601,10 @@ worktree            git 操作：FindRoot/ResolveTreeDir/分支与 worktree CRUD
                     merge/push/SyncBase/ConflictError
 gitlab / github     forge 客户端：依赖图源（Spec/Children/BlockedBy）+
                     forge.Forge 实现（IssueState/Claim/Close/Note/EnsureMR/Probe）
-forge               Forge 接口与 IssueInfo：issue/MR 操作抽象（调度器↔客户端共享）
+forge               Forge 接口与 IssueInfo/IssueComment：issue/MR/评论操作抽象
 graph               依赖图：Build 传递闭包、Ready/Done、拓扑分层、文本/JSON 渲染
-prompt              fastimpl.prompt.md 加载/播种与 {issue-no}/{token} 渲染
+issuecontext        issue 正文/评论预取、噪音过滤、本地 Markdown 快照与 prompt 注入
+prompt              fastimpl.prompt.md 加载/播种与 Go template 变量渲染
 worker              hcgo 终端管理：启动/发提示词/轮询 7501/读屏/停止；
                     FASTIMPL-READY 报告协议与令牌
 scheduler           调度核心：就绪即派、任务生命周期、串行集成、
