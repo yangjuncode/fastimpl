@@ -79,6 +79,12 @@ type TaskRuntime struct {
 	Key graph.Key
 	// Addr 是当前 worker 会话的 hc 终端地址；无运行时为空。
 	Addr string
+	// Starting 表示任务仍处在首个 prompt 发送前的启动链路。即使 Addr
+	// 已因预热而就绪，GUI 也应继续展示启动进度；prompt 发送后才切换
+	// 到真实 agent 终端。
+	Starting bool
+	// StartupPhase 是给用户看的当前启动阶段说明。
+	StartupPhase string
 	// Label 是终端名（<repo>-issue-<iid>，集成分支的是
 	// <repo>-<分支名>），供状态视图给终端页命名，也是人工
 	// hc attach 时用的名字。
@@ -99,6 +105,14 @@ type TaskRuntime struct {
 	FinishedAt time.Time
 }
 
+const (
+	startupPhaseReading   = "正在读取 issue 状态与认领评论…"
+	startupPhasePosting   = "正在提交认领、创建 worktree 并启动终端…"
+	startupPhaseVerifying = "正在确认认领与 issue 指派…"
+	startupPhaseBooting   = "正在等待 agent 启动并进行最终安全检查…"
+	startupPhasePrompting = "正在发送首个 prompt…"
+)
+
 // Scheduler 是分批并行调度的核心。
 type Scheduler struct {
 	cfg       config.Config
@@ -116,7 +130,13 @@ type Scheduler struct {
 	baseName  string             // 集成分支的基点（origin/<baseName>），用于上游同步
 	agentArgv []string           // worker 的 agent 命令行（config.AgentArgv 给出）
 	warned    map[graph.Key]bool // 已告警过的"closed 但看板未终态"节点，防重复刷日志
-	integrate sync.Mutex         // 集成分支上的 merge/push 串行化
+	integrate sync.Mutex         // 集成分支上的准备/merge/push 串行化
+	// integrationPrep/integrationPrepErr 描述初始 push+EnsureMR 这一
+	// 段可后台执行的准备工作。它们只在 integrate 锁内读写：tryMerge
+	// 若追上仍在运行的准备工作会自然等同一把锁，绝不会并发 push。
+	integrationPrep     func(context.Context) (string, error)
+	integrationPrepErr  error
+	integrationPrepDone chan struct{}
 	// 以下两个字段只在 integrate 锁内读写（stopIntegrationAgent 在
 	// Run 结束后、所有任务 goroutine 退出后读取，无竞争）。
 	intAddr      string   // 集成专属 agent 终端地址；空表示未启动
@@ -187,6 +207,48 @@ func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, forgeName string
 		attentionPoll:        5 * time.Second,
 		attentionControls:    make(map[graph.Key]*attentionControl),
 	}
+}
+
+// PrepareIntegrationAsync 把初始 push+EnsureMR 移出 worker 启动关键路径。
+// prep 必须只在 integrate 锁内执行；第一个任务真正合并前若准备失败会
+// 重试一次，成功前不会合并/推送任务成果。
+func (s *Scheduler) PrepareIntegrationAsync(ctx context.Context, prep func(context.Context) (string, error)) {
+	if prep == nil {
+		return
+	}
+	s.integrationPrep = prep
+	done := make(chan struct{})
+	s.integrationPrepDone = done
+	go func() {
+		defer close(done)
+		s.integrate.Lock()
+		defer s.integrate.Unlock()
+		s.runIntegrationPrepLocked(ctx)
+	}()
+}
+
+// runIntegrationPrepLocked 执行一次初始集成分支准备并记录结果；
+// 调用方必须持有 integrate 锁。
+func (s *Scheduler) runIntegrationPrepLocked(ctx context.Context) {
+	mrURL, err := s.integrationPrep(ctx)
+	s.integrationPrepErr = err
+	if err != nil {
+		s.log.Warn("integration branch preparation failed; workers continue and the first merge will retry", "branch", s.branch, "err", err)
+		return
+	}
+	s.log.Info("integration ready", "branch", s.branch, "mr", mrURL)
+}
+
+// IntegrationPrepError 返回后台初始准备的结果。读取时持 integrate 锁，
+// 因此若准备仍在进行，它会等准备结束而不是让进程提前退出留下后台 git/forge
+// 操作；未配置准备时返回 nil。
+func (s *Scheduler) IntegrationPrepError() error {
+	if s.integrationPrepDone != nil {
+		<-s.integrationPrepDone
+	}
+	s.integrate.Lock()
+	defer s.integrate.Unlock()
+	return s.integrationPrepErr
 }
 
 func runtimeSettingsFromConfig(cfg config.Config, template string, agentArgv []string) RuntimeSettings {
@@ -288,6 +350,128 @@ func forgeCLI(name string) string {
 		return "gh"
 	}
 	return ""
+}
+
+// issueStateRead 是一次后台 issue 状态读取的结果。
+type issueStateRead struct {
+	info forge.IssueInfo
+	err  error
+}
+
+// claimCheckRead 是一次后台认领仲裁读取的结果。
+type claimCheckRead struct {
+	winner *activeClaim
+	mine   *activeClaim
+	err    error
+}
+
+// warmWorkerResult 是预热终端 goroutine 的结局。terminalMaybeLive 表示
+// 错误边界无法排除终端已经创建；调用方必须按现状保留锁供人工排查。
+type warmWorkerResult struct {
+	dir               string
+	branch            string
+	termName          string
+	addr              string
+	reused            bool
+	err               error
+	terminalMaybeLive bool
+}
+
+// readIssueStateAsync 并行读取 issue 状态；缓冲为 1，调用方提前返回也不会
+// 留下卡住的 goroutine。
+func (s *Scheduler) readIssueStateAsync(ctx context.Context, key graph.Key) <-chan issueStateRead {
+	ch := make(chan issueStateRead, 1)
+	go func() {
+		info, err := s.forge.IssueState(ctx, key.ProjectID, key.IID)
+		ch <- issueStateRead{info: info, err: err}
+	}()
+	return ch
+}
+
+// readClaimAsync 并行读取认领评论仲裁结果。
+func (s *Scheduler) readClaimAsync(ctx context.Context, key graph.Key, token string) <-chan claimCheckRead {
+	ch := make(chan claimCheckRead, 1)
+	go func() {
+		winner, mine, err := s.boundedRead(ctx, key, token)
+		ch <- claimCheckRead{winner: winner, mine: mine, err: err}
+	}()
+	return ch
+}
+
+// confirmClaimAsync 并行执行一次认领确认。
+func (s *Scheduler) confirmClaimAsync(ctx, parent context.Context, key graph.Key, token string) <-chan error {
+	ch := make(chan error, 1)
+	go func() {
+		ch <- s.confirmClaim(ctx, parent, key, token)
+	}()
+	return ch
+}
+
+// warmWorker 在认领验证仍在后台进行时准备 worktree 并启动空转终端。
+// 它只是让终端进程提前 boot：调用方在认领、指派与最终确认全部通过前
+// 绝不发送 prompt；验证失败时会停止这个终端。
+func (s *Scheduler) warmWorker(ctx context.Context, key graph.Key, iid int, agentArgv []string) <-chan warmWorkerResult {
+	ch := make(chan warmWorkerResult, 1)
+	go func() {
+		var res warmWorkerResult
+		dir, branch, err := s.repo.Create(ctx, s.branch, iid)
+		res.dir, res.branch = dir, branch
+		if err != nil {
+			res.err = fmt.Errorf("create worktree: %w", err)
+			ch <- res
+			return
+		}
+		// 终端名 <repo>-issue-<iid>：多项目并行时不会撞名，
+		// 且一眼能看出属于哪个仓库。
+		res.termName = s.repo.Name + "-" + branch
+		// 预热终端可能已经创建但启动调用失败时无法确认，按可能存活处理。
+		res.terminalMaybeLive = true
+		addr, reused, err := s.claimRetainedTerminal(ctx, key, iid, false, res.termName, s.workDir, agentArgv)
+		if err != nil {
+			res.err = err
+			ch <- res
+			return
+		}
+		if !reused {
+			addr, err = s.sessions.StartWorker(ctx, worker.Params{
+				SpecIID:  s.specIID,
+				IssueIID: iid,
+				Name:     res.termName,
+				Worktree: dir,
+				// agent 在外层工作区（work-dir）工作：其中可能还有它需要
+				// 参考的主 checkout 与其他目录；worktree 只作产出目录，
+				// 通过提示词告知。
+				Cwd:  s.workDir,
+				Argv: agentArgv,
+			})
+			if err != nil {
+				res.err = fmt.Errorf("start worker: %w", err)
+				ch <- res
+				return
+			}
+			// 地址一旦拿到就立刻公开：GUI 可以在后台认领验证仍在进行时
+			// 看到预热终端。此时它只是空转 boot，尚未收到 prompt。开始时间
+			// 也在这个最早可见时刻固定，避免状态视图先看到无时间的地址。
+			s.runtime.setAddr(key, addr, res.termName, false)
+			s.runtime.start(key, time.Now())
+		}
+		res.addr, res.reused = addr, reused
+		res.err = nil
+		ch <- res
+	}()
+	return ch
+}
+
+// markInProgressAsync 把 best-effort 看板标记移出启动关键路径。任务后续
+// 失败/取消不应撤回这次标记，因此使用脱离任务取消链的有界 context。
+func (s *Scheduler) markInProgressAsync(ctx context.Context, key graph.Key) {
+	mctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	go func() {
+		defer cancel()
+		if err := s.forge.MarkInProgress(mctx, key.ProjectID, key.IID); err != nil {
+			s.log.Warn("mark issue in progress failed", "key", key, "err", err)
+		}
+	}()
 }
 
 // taskResult 是一个任务 goroutine 的结局。
@@ -548,8 +732,23 @@ func updateMergeProgress(progress mergeProgress, fn func(*ActiveTaskMeta)) error
 // 后普通 sync/merge/push 可以幂等重入，base 冲突 agent 则凭保存的
 // token/baseline 继续等待，而不是重启第二个 agent。
 func (s *Scheduler) tryMerge(ctx context.Context, branch string, progress mergeProgress, recovery *ActiveTaskMeta) error {
+	// 初始 push+EnsureMR 与 worker 启动并行。第一个任务真正合并前必须先
+	// 等这段准备收束；不能在拿着 integrate 锁时等，否则准备本身无法进锁。
+	if s.integrationPrepDone != nil {
+		<-s.integrationPrepDone
+	}
 	s.integrate.Lock()
 	defer s.integrate.Unlock()
+	// 正常情况下 agent 工作远慢于
+	// 这次准备；若准备失败，在第一次真正合并前于同一把串行锁内重试，
+	// 既不阻塞 prompt，也不让任务成果绕过远端集成检查。
+	if s.integrationPrepErr != nil && s.integrationPrep != nil {
+		s.log.Warn("retrying integration branch preparation before merge", "branch", s.branch, "previous_err", s.integrationPrepErr)
+		s.runIntegrationPrepLocked(ctx)
+	}
+	if s.integrationPrepErr != nil {
+		return fmt.Errorf("prepare integration branch: %w", s.integrationPrepErr)
+	}
 	if !s.baseStuck {
 		if err := updateMergeProgress(progress, func(m *ActiveTaskMeta) { m.IntegrationPhase = integrationPhaseSyncingBase }); err != nil {
 			return fmt.Errorf("record base-sync integration phase: %w", err)
@@ -845,6 +1044,10 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		return
 	}
 	startSettings := s.currentRuntimeSettings(ctx)
+	// 从进入启动链路这一刻就先给 GUI 一个占位终端页；真实 hc 地址
+	// 就绪后 setAddr 会替换它。若启动在拿到地址前失败，defer 清掉占位。
+	s.runtime.setStarting(key, s.repo.Name+"-"+worktree.BranchName(iid), startupPhaseReading)
+	defer s.runtime.clearStarting(key)
 
 	// 先看有没有崩溃/关闭后留下的 active worker。只要 metadata 表明
 	// 另一个 supervisor 仍可能活着，或者接管边界不安全，就绝不启动新 agent。
@@ -1027,12 +1230,17 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		addr, termName = recovery.TerminalAddr, recovery.TerminalName
 		s.log.Info("recovering active worker", "key", key, "terminal", termName, "addr", addr, "stage", recovery.Stage)
 	} else {
-		// 开跑前重读现场状态：建图快照可能已过期。
-		info, err := s.forge.IssueState(ctx, key.ProjectID, iid)
-		if err != nil {
-			fail(fmt.Errorf("read issue state: %w", err))
+		// 开跑前的状态读取与评论仲裁互不依赖：并行发起，弱网实例上
+		// 直接省掉一次完整 forge 往返。安全性不变——两边都通过后才写 claim。
+		stateCh := s.readIssueStateAsync(ctx, key)
+		claimsCh := s.readClaimAsync(ctx, key, token)
+		stateRead := <-stateCh
+		claimRead := <-claimsCh
+		if stateRead.err != nil {
+			fail(fmt.Errorf("read issue state: %w", stateRead.err))
 			return
 		}
+		info := stateRead.info
 		if !info.Open {
 			res.closed = true
 			return
@@ -1047,19 +1255,48 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		}
 
 		// 评论仲裁：已有活跃认领就只告警，不发新评论、不改 issue 状态。
-		winner, _, err := s.boundedRead(ctx, key, token)
-		if err != nil {
-			fail(fmt.Errorf("verify claim before starting: %w", err))
+		if claimRead.err != nil {
+			fail(fmt.Errorf("verify claim before starting: %w", claimRead.err))
 			return
 		}
-		if winner != nil {
-			res.attention = claimBusy(winner).Error()
+		if claimRead.winner != nil {
+			res.attention = claimBusy(claimRead.winner).Error()
 			s.log.Warn("issue already claimed elsewhere; not starting",
-				"key", key, "instance", winner.instance, "claim", winner.token, "comment", winner.commentID)
+				"key", key, "instance", claimRead.winner.instance, "claim", claimRead.winner.token, "comment", claimRead.winner.commentID)
 			return
 		}
+		s.runtime.setStartupPhase(key, startupPhasePosting)
+		// 激进预热：初始状态与评论仲裁都已经通过，但 claim POST 本身也是
+		// 一次慢速 forge 往返。建 worktree/启动空转终端与它并行；终端只提前
+		// boot，后台仍严格完成认领仲裁与指派验证，全部通过前不会发送 prompt。
+		warmCh := s.warmWorker(taskCtx, key, iid, startSettings.AgentArgv)
+		// 从这里开始，任何失败都可能留下一个存活的终端；只有确认预热终端
+		// 已停止（或确定从未创建）时才会重新降为 finishNone。
+		finish = finishKeep
+		abandonWarm := func(warm warmWorkerResult) {
+			if warm.addr != "" {
+				if err := s.stopWorker(warm.addr, warm.termName); err != nil {
+					s.log.Warn("stop warm worker after startup abort failed; keeping both locks", "key", key, "terminal", warm.termName, "addr", warm.addr, "err", err)
+				} else {
+					stopped = true
+					finish = finishNone
+					s.runtime.clearAddr(key)
+				}
+			} else if warm.err != nil && !warm.terminalMaybeLive {
+				// worktree 创建失败发生在任何终端启动之前，可按无终端清理。
+				finish = finishNone
+			}
+			if warm.err != nil && warm.terminalMaybeLive {
+				s.log.Warn("warm worker startup outcome is ambiguous; keeping the local lock and the claim marker", "key", key, "err", warm.err)
+			}
+		}
+
 		if err := s.postMarker(ctx, key, claimKindYes, token); err != nil {
-			// POST 报错也可能已经落地：按同一 token 安全释放后放弃。
+			// POST 报错也可能已经落地：按同一 token 安全释放后放弃。先收束
+			// 并尽量停止预热终端，否则这里会把尚未收到 prompt 的空 agent 留成
+			// 需要人工清理的现场。
+			warm := <-warmCh
+			abandonWarm(warm)
 			s.log.Warn("post claim marker failed; releasing the same token", "key", key, "err", err)
 			s.releaseMarker(ctx, key, token)
 			fail(fmt.Errorf("post claim marker: %w", err))
@@ -1068,101 +1305,107 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		markerPosted = true
 		updateActive(func(m *ActiveTaskMeta) { m.Stage = activeStageClaimed })
 		s.log.Info("claim marker posted", "key", key, "instance", s.cfg.InstanceID, "claim", token)
-		if !s.waitClaimWindow(ctx) {
-			fail(fmt.Errorf("wait for claim window: %w", ctx.Err()))
-			return
-		}
-		if err := s.confirmClaim(ctx, ctx, key, token); err != nil {
-			fail(fmt.Errorf("lose claim arbitration: %w", err))
-			return
-		}
+		s.runtime.setStartupPhase(key, startupPhaseVerifying)
 
-		// 获胜后重读：仍开放、无他人/占用才真正指派。
-		info, err = s.forge.IssueState(ctx, key.ProjectID, iid)
-		if err != nil {
-			fail(fmt.Errorf("re-read issue state: %w", err))
-			return
-		}
-		if !info.Open {
-			res.closed = true
-			return
-		}
-		if info.AssignedToOther || info.InFlight {
-			res.attention = "issue 已被他人领取或占用，不抢占"
-			return
-		}
-		if !info.AssignedToMe {
-			if err := s.forge.Claim(ctx, key.ProjectID, iid); err != nil {
-				fail(fmt.Errorf("claim issue: %w", err))
-				return
+		var validationErr error
+		var validationClosed bool
+		var validationAttention string
+		if !s.waitClaimWindow(ctx) {
+			validationErr = fmt.Errorf("wait for claim window: %w", ctx.Err())
+		} else {
+			// 仲裁确认与“获胜后重读 issue”互不依赖，并行执行；终端预热
+			// 同时在第三条 goroutine 里进行。
+			confirmCh := s.confirmClaimAsync(ctx, ctx, key, token)
+			postClaimStateCh := s.readIssueStateAsync(ctx, key)
+			confirmErr := <-confirmCh
+			postClaimState := <-postClaimStateCh
+			switch {
+			case confirmErr != nil:
+				validationErr = fmt.Errorf("lose claim arbitration: %w", confirmErr)
+			case postClaimState.err != nil:
+				validationErr = fmt.Errorf("re-read issue state: %w", postClaimState.err)
+			case !postClaimState.info.Open:
+				validationClosed = true
+			case postClaimState.info.AssignedToOther || postClaimState.info.InFlight:
+				validationAttention = "issue 已被他人领取或占用，不抢占"
+			default:
+				info = postClaimState.info
+			}
+
+			needAssign := false
+			if validationErr == nil && !validationClosed && validationAttention == "" {
+				needAssign = !info.AssignedToMe
+				if needAssign {
+					if err := s.forge.Claim(ctx, key.ProjectID, iid); err != nil {
+						validationErr = fmt.Errorf("claim issue: %w", err)
+					}
+				}
+			}
+			if needAssign && validationErr == nil && !validationClosed && validationAttention == "" {
+				// 只有真的发起指派 mutation 才需要回读：仍是本人、无他人、无占用，
+				// 且自己的 claim 标记仍最早有效，才算领取成功。已经指派给本人的
+				// 续跑直接使用刚完成的并行验证，少一次 forge 往返。
+				confirmAfterAssignCh := s.confirmClaimAsync(ctx, ctx, key, token)
+				afterAssignStateCh := s.readIssueStateAsync(ctx, key)
+				confirmAfterAssignErr := <-confirmAfterAssignCh
+				afterAssignState := <-afterAssignStateCh
+				switch {
+				case confirmAfterAssignErr != nil:
+					validationErr = fmt.Errorf("verify claim after assignment: %w", confirmAfterAssignErr)
+				case afterAssignState.err != nil:
+					validationErr = fmt.Errorf("re-read issue state after claim: %w", afterAssignState.err)
+				case !afterAssignState.info.Open:
+					validationClosed = true
+				case !afterAssignState.info.AssignedToMe || afterAssignState.info.AssignedToOther || afterAssignState.info.InFlight:
+					validationErr = fmt.Errorf("claim not confirmed (open=%v me=%v other=%v in_flight=%v)",
+						afterAssignState.info.Open, afterAssignState.info.AssignedToMe, afterAssignState.info.AssignedToOther, afterAssignState.info.InFlight)
+				default:
+					info = afterAssignState.info
+				}
 			}
 		}
-		// 指派后回读：必须是本人、无他人、无占用才算领取成功。
-		info, err = s.forge.IssueState(ctx, key.ProjectID, iid)
-		if err != nil {
-			fail(fmt.Errorf("re-read issue state after claim: %w", err))
+
+		// 不论验证成败都先收束预热 goroutine：只有这样才知道终端地址，
+		// 才能在失锁/关闭/竞争失败时把尚未收到 prompt 的终端安全停掉。
+		warm := <-warmCh
+		if warm.err == nil {
+			dir, branch, termName, addr = warm.dir, warm.branch, warm.termName, warm.addr
+			updateActive(func(m *ActiveTaskMeta) {
+				m.Worktree = dir
+				m.Branch = branch
+			})
+			s.log.Info("worktree ready", "key", key, "dir", dir, "branch", branch)
+		}
+
+		if validationErr != nil || validationClosed || validationAttention != "" {
+			abandonWarm(warm)
+			switch {
+			case validationClosed && finish == finishNone:
+				res.closed = true
+			case validationAttention != "":
+				res.attention = validationAttention
+			case validationErr != nil:
+				fail(validationErr)
+			case validationClosed:
+				// issue 已关闭但预热终端/启动结果无法确认：保留现场给人查，
+				// 同时仍按 closed 记录，避免调度器把它当成可继续任务。
+				res.closed = true
+			}
 			return
 		}
-		if !info.Open {
-			res.closed = true
-			return
-		}
-		if !info.AssignedToMe || info.AssignedToOther || info.InFlight {
-			fail(fmt.Errorf("claim not confirmed (open=%v me=%v other=%v in_flight=%v)",
-				info.Open, info.AssignedToMe, info.AssignedToOther, info.InFlight))
+		if warm.err != nil {
+			if !warm.terminalMaybeLive {
+				finish = finishNone
+			} else {
+				s.log.Warn("warm worker failed; keeping the local lock and the claim marker", "key", key, "terminal", warm.termName, "err", warm.err)
+			}
+			fail(warm.err)
 			return
 		}
 		s.log.Info("issue claimed", "key", key)
 		// 看板状态标记尽力而为：GitHub 未开 preview、GitLab CE/低版本
-		// 都不支持，失败只记 warn 不阻塞任务。
-		if err := s.forge.MarkInProgress(ctx, key.ProjectID, iid); err != nil {
-			s.log.Warn("mark issue in progress failed", "key", key, "err", err)
-		}
-		dir, branch, err = s.repo.Create(ctx, s.branch, iid)
-		if err != nil {
-			fail(fmt.Errorf("create worktree: %w", err))
-			return
-		}
-		updateActive(func(m *ActiveTaskMeta) {
-			m.Worktree = dir
-			m.Branch = branch
-		})
-		s.log.Info("worktree ready", "key", key, "dir", dir, "branch", branch)
-		// 终端名 <repo>-issue-<iid>：多项目并行时不会撞名，
-		// 且一眼能看出属于哪个仓库。
-		termName = s.repo.Name + "-" + branch
-		// 启动前最后确认一次：认领仍有效且任务未被取消，避免刚失锁就起终端。
-		if err := s.confirmClaim(ctx, ctx, key, token); err != nil {
-			fail(fmt.Errorf("verify claim before starting the worker: %w", err))
-			return
-		}
-		// 从这里开始，任何失败都可能留下一个存活的终端。
-		finish = finishKeep
-		var reused bool
-		addr, reused, err = s.claimRetainedTerminal(taskCtx, key, iid, false, termName, s.workDir, startSettings.AgentArgv)
-		if err != nil {
-			fail(err)
-			return
-		}
-		if !reused {
-			addr, err = s.sessions.StartWorker(taskCtx, worker.Params{
-				SpecIID:  s.specIID,
-				IssueIID: iid,
-				Name:     termName,
-				Worktree: dir,
-				// agent 在外层工作区（work-dir）工作：其中可能还有它需要
-				// 参考的主 checkout 与其他目录；worktree 只作产出目录，
-				// 通过提示词告知。
-				Cwd:  s.workDir,
-				Argv: startSettings.AgentArgv,
-			})
-			if err != nil {
-				// 启动结果不明确：可能已有终端，保留两把锁让人工确认。
-				fail(fmt.Errorf("start worker: %w", err))
-				s.log.Warn("start worker failed; keeping the local lock and the claim marker", "key", key, "terminal", termName, "err", err)
-				return
-			}
-		}
+		// 都不支持，失败只记 warn。它在后台执行，不再占用启动关键路径。
+		s.markInProgressAsync(ctx, key)
 	}
 
 	if recovered {
@@ -1181,10 +1424,13 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		// 崩溃接管是同一轮工作：保留原开始时间，而不是从重启重新计时。
 		s.runtime.setTimes(key, startedAt, time.Time{})
 	} else {
-		// 即使复用 retained terminal，也把这里视为本轮任务工作的开始；
-		// 原完成时长已经在上一轮保留期间展示过，不应并入本轮工作时长。
-		s.runtime.start(key, time.Now())
+		// 预热 goroutine 在地址第一次公开时已经固定本轮开始时间（retained
+		// terminal 则由激活路径固定）；这里只把它写进 active metadata。
 		startedAt, _ := s.runtime.times(key)
+		if startedAt.IsZero() {
+			startedAt = time.Now()
+			s.runtime.start(key, startedAt)
+		}
 		updateActive(func(m *ActiveTaskMeta) { m.StartedAt = startedAt })
 	}
 	if err := lock.Update(lockContentWithTerminal(os.Getpid(), s.cfg.InstanceID, token, addr, termName)); err != nil {
@@ -1251,6 +1497,10 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			s.taskFailed(taskCtx, key, "record booting state", err, termName, &finish, &res, fail)
 			return
 		}
+		s.runtime.setStartupPhase(key, startupPhaseBooting)
+		// boot 等待与 prompt 前认领复查互不依赖：并行发起。真正发送前仍
+		// 两边都必须成功，但慢速 forge 不再叠在慢速 agent boot 后面。
+		confirmBeforePromptCh := s.confirmClaimAsync(taskCtx, ctx, key, token)
 		s.log.Info("awaiting worker boot", "key", key, "addr", addr)
 		if _, err := s.sessions.AwaitBoot(taskCtx, addr); err != nil {
 			s.taskFailed(taskCtx, key, "await worker boot", err, termName, &finish, &res, fail)
@@ -1280,8 +1530,9 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			return
 		}
 		text = issuecontext.EnsureInPrompt(text, contextSection)
-		// 首次 Prompt 前明确重验自己的认领仍然有效。
-		if err := s.confirmClaim(taskCtx, ctx, key, token); err != nil {
+		// 首次 Prompt 前明确重验自己的认领仍然有效；该复查已与 boot 并行，
+		// 这里只收束结果，不再额外串行等待一轮 forge 往返。
+		if err := <-confirmBeforePromptCh; err != nil {
 			s.taskFailed(taskCtx, key, "verify claim before prompt", err, termName, &finish, &res, fail)
 			return
 		}
@@ -1292,6 +1543,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			s.taskFailed(taskCtx, key, "record prompt transition", err, termName, &finish, &res, fail)
 			return
 		}
+		s.runtime.setStartupPhase(key, startupPhasePrompting)
 		baseline, err = s.sessions.Prompt(taskCtx, addr, text)
 		if err != nil {
 			s.taskFailed(taskCtx, key, "send prompt", err, termName, &finish, &res, fail)
@@ -1309,6 +1561,9 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	} else {
 		s.log.Info("recovered worker prompt already in flight; waiting for report", "key", key, "baseline", baseline)
 	}
+	// 首个 prompt 已发出（recovery 场景则是上一轮已经发出）：此刻才把
+	// 终端页从启动进度切换到真实 agent，避免预热期间看起来像空白终端。
+	s.runtime.clearStarting(key)
 
 	for {
 		if _, err := s.sessions.WaitTurn(taskCtx, addr, baseline, worker.TurnBudget); err != nil {

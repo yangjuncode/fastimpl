@@ -26,8 +26,10 @@ type termTab struct {
 	Addr string
 	// Label 是终端名，供页标题与人工 hc attach。
 	Label string
-	term  *terminal.Terminal
-	conn  *viewerConn
+	// StartupPhase 是首个 prompt 发送前展示在占位页里的进度说明。
+	StartupPhase string
+	term         *terminal.Terminal
+	conn         terminalConn
 	// err 是这一页的可见错误：连不上、断开或结束。
 	err error
 	// tipOpen 只在 tooltip 打开时为真。关闭的 tooltip 在 NSGo 里仍隐藏挂载，
@@ -45,6 +47,13 @@ func tabID(k graph.Key, integration bool) string {
 		return "integration-" + k.String()
 	}
 	return k.String()
+}
+
+// terminalConn 是终端页底层连接的最小接口。真实终端用 viewerConn；
+// 启动占位页用 startingConn。
+type terminalConn interface {
+	io.ReadWriteCloser
+	EndError() error
 }
 
 // viewerConn 是 terminal.Options.Conn 的适配层：把 worker.Viewer 的
@@ -113,6 +122,96 @@ func (c *viewerConn) open() (interface {
 	}
 	c.stream = newTerminalOutputBatcher(stream)
 	return c.stream, nil
+}
+
+// startingConn 是“终端正在启动”占位页的假连接：先写出一屏中文说明，
+// 之后阻塞到页面 rebind/close。它不连接 hc，也不会向任务写入任何内容。
+type startingConn struct {
+	mu       sync.Mutex
+	pending  []byte
+	closeCh  chan struct{}
+	closeOne sync.Once
+}
+
+func newStartingConn(phase string) *startingConn {
+	if phase == "" {
+		phase = "正在准备任务运行环境…"
+	}
+	return &startingConn{
+		pending: []byte("\r\n  正在启动终端…\r\n\r\n  当前进度：" + phase + "\r\n\r\n  agent 终端就绪后，此页会自动切换并显示真实终端；启动进度也会写入终端画面。\r\n"),
+		closeCh: make(chan struct{}),
+	}
+}
+
+func (c *startingConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	if len(c.pending) > 0 {
+		n := copy(p, c.pending)
+		c.pending = c.pending[n:]
+		c.mu.Unlock()
+		return n, nil
+	}
+	c.mu.Unlock()
+	<-c.closeCh
+	return 0, io.EOF
+}
+
+func (c *startingConn) Write(p []byte) (int, error) { return len(p), nil }
+
+func (c *startingConn) Close() error {
+	c.closeOne.Do(func() { close(c.closeCh) })
+	return nil
+}
+
+func (c *startingConn) EndError() error { return nil }
+
+// progressConn 在真实终端输出前注入一段 fastimpl 启动进度。它只包装
+// Read：Write/Resize/WriteAuto 仍直达真实终端，因此 agent 的权限确认、
+// 信任弹窗和用户输入都不会被占位进度挡住。
+type progressConn struct {
+	base    terminalConn
+	mu      sync.Mutex
+	pending []byte
+}
+
+func newProgressConn(base terminalConn, phase string) *progressConn {
+	if phase == "" {
+		phase = "正在准备任务运行环境…"
+	}
+	return &progressConn{
+		base:    base,
+		pending: []byte("\r\n\x1b[7m [fastimpl] 当前进度：" + phase + " \x1b[0m\r\n"),
+	}
+}
+
+func (c *progressConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	if len(c.pending) > 0 {
+		n := copy(p, c.pending)
+		c.pending = c.pending[n:]
+		c.mu.Unlock()
+		return n, nil
+	}
+	c.mu.Unlock()
+	return c.base.Read(p)
+}
+
+func (c *progressConn) Write(p []byte) (int, error) { return c.base.Write(p) }
+func (c *progressConn) Close() error                { return c.base.Close() }
+func (c *progressConn) EndError() error             { return c.base.EndError() }
+
+func (c *progressConn) Resize(cols, rows int) error {
+	if resizer, ok := c.base.(interface{ Resize(int, int) error }); ok {
+		return resizer.Resize(cols, rows)
+	}
+	return nil
+}
+
+func (c *progressConn) WriteAuto(p []byte) (int, error) {
+	if auto, ok := c.base.(interface{ WriteAuto([]byte) (int, error) }); ok {
+		return auto.WriteAuto(p)
+	}
+	return c.base.Write(p)
 }
 
 const (
@@ -353,17 +452,24 @@ func newTerminals(s *session, notify func()) *terminals {
 	return &terminals{session: s, byID: map[string]*termTab{}, notify: notify}
 }
 
-// sync 按调度器的运行状态同步终端页：每个有地址的条目一页，按 key
-// 去重。它不主动建连接，连接在终端页第一次被显示时懒建立。
+// sync 按调度器的运行状态同步终端页：有地址的运行一页；Starting 但
+// 还没地址的运行先给占位页，按 key 去重。它不主动建连接，连接在终端
+// 页第一次被显示时懒建立。
 // 离开的运行（地址消失）会释放自己的观看连接，但绝不 kill 任务。
 // 返回值报告页集合/地址是否变化；调用方只在 true 时刷新 tab 选项，
 // 避免日志或无关状态刷新反复重算全部终端 tab。
 func (t *terminals) sync(status []scheduler.TaskRuntime) bool {
-	live := make(map[string]scheduler.TaskRuntime, len(status))
+	// Starting 期间预热终端可能有 Addr，也可能还没有；有 Addr 时直接
+	// 接入真实终端，并把 fastimpl 启动进度注入它的输出流，保持可交互。
+	display := make([]scheduler.TaskRuntime, 0, len(status))
 	for _, r := range status {
-		if r.Addr == "" {
+		if r.Addr == "" && !r.Starting {
 			continue
 		}
+		display = append(display, r)
+	}
+	live := make(map[string]scheduler.TaskRuntime, len(display))
+	for _, r := range display {
 		live[tabID(r.Key, r.Integration)] = r
 	}
 	changed := false
@@ -379,21 +485,30 @@ func (t *terminals) sync(status []scheduler.TaskRuntime) bool {
 		changed = true
 	}
 	t.tabs = kept
-	// 再按调度器的顺序补上新页，并更新已有页的地址：地址变了就是
-	// 另一个终端，必须重连，不能继续显示旧的流。
-	for _, r := range status {
-		if r.Addr == "" {
-			continue
-		}
+	// 再按调度器的顺序补上新页，并更新已有页的地址/阶段：地址变了就是
+	// 另一个终端，必须重连；启动阶段变了则重建占位页，让进度可见。
+	for _, r := range display {
 		id := tabID(r.Key, r.Integration)
 		if tab, ok := t.byID[id]; ok {
-			if tab.Addr != r.Addr {
+			switch {
+			case tab.Addr != r.Addr:
+				tab.StartupPhase = r.StartupPhase
 				tab.rebind(r.Addr, r.Label)
 				changed = true
+			case tab.StartupPhase != r.StartupPhase && r.Starting:
+				// 阶段变化时重连一次观看流，把新的进度横幅注入真实终端输出；
+				// 输入仍然直达 agent，不会挡住权限/信任确认。
+				tab.StartupPhase = r.StartupPhase
+				tab.rebind(r.Addr, r.Label)
+				changed = true
+			case tab.StartupPhase != r.StartupPhase:
+				// prompt 发出后无需仅为去掉包装器而重连：progressConn 的横幅
+				// 用完以后本来就是透明转发，直接切到真实终端输出。
+				tab.StartupPhase = r.StartupPhase
 			}
 			continue
 		}
-		tab := &termTab{Key: r.Key, Intg: r.Integration, Addr: r.Addr, Label: r.Label}
+		tab := &termTab{Key: r.Key, Intg: r.Integration, Addr: r.Addr, Label: r.Label, StartupPhase: r.StartupPhase}
 		t.tabs = append(t.tabs, tab)
 		t.byID[id] = tab
 		changed = true
@@ -444,10 +559,19 @@ func (t *terminals) ensure(cx *core.Scope, tab *termTab) *terminal.Terminal {
 	if tab.term != nil {
 		return tab.term
 	}
-	conn := &viewerConn{
-		Attach:   t.session.attach,
-		Addr:     tab.Addr,
-		ReadOnly: t.session.Observing(),
+	var conn terminalConn
+	if tab.Addr == "" {
+		conn = newStartingConn(tab.StartupPhase)
+	} else {
+		viewer := &viewerConn{
+			Attach:   t.session.attach,
+			Addr:     tab.Addr,
+			ReadOnly: t.session.Observing(),
+		}
+		conn = viewer
+		if tab.StartupPhase != "" {
+			conn = newProgressConn(viewer, tab.StartupPhase)
+		}
 	}
 	term, err := terminal.New(terminal.Options{
 		Conn: conn,

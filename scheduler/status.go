@@ -31,6 +31,35 @@ func (s *runtimeStore) update(k graph.Key, fn func(*TaskRuntime)) {
 	s.tasks[k] = r
 }
 
+// setStarting 公开“终端正在启动”的占位状态。label 只是预计的终端名；
+// 真实地址可能因预热提前就绪，但 Starting 会一直保持到首个 prompt 发出。
+func (s *runtimeStore) setStarting(k graph.Key, label, phase string) {
+	s.update(k, func(r *TaskRuntime) {
+		r.Starting = true
+		r.StartupPhase = phase
+		if r.Label == "" {
+			r.Label = label
+		}
+	})
+}
+
+// setStartupPhase 更新占位终端页展示给用户看的启动阶段。
+func (s *runtimeStore) setStartupPhase(k graph.Key, phase string) {
+	s.update(k, func(r *TaskRuntime) {
+		if r.Starting {
+			r.StartupPhase = phase
+		}
+	})
+}
+
+// clearStarting 清除启动占位状态。
+func (s *runtimeStore) clearStarting(k graph.Key) {
+	s.update(k, func(r *TaskRuntime) {
+		r.Starting = false
+		r.StartupPhase = ""
+	})
+}
+
 // setAddr 公开一次运行中的终端；label 是终端名。
 func (s *runtimeStore) setAddr(k graph.Key, addr, label string, integration bool) {
 	s.update(k, func(r *TaskRuntime) {
@@ -45,6 +74,8 @@ func (s *runtimeStore) setAddr(k graph.Key, addr, label string, integration bool
 func (s *runtimeStore) clearAddr(k graph.Key) {
 	s.update(k, func(r *TaskRuntime) {
 		r.Addr = ""
+		r.Starting = false
+		r.StartupPhase = ""
 	})
 }
 

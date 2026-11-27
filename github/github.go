@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yangjuncode/fastimpl/config"
@@ -187,9 +188,11 @@ type Client struct {
 	repoID int
 	// login 是当前 gh 登录用户，用于领取判定。
 	login string
-	// repoNames 缓存 repo database id → "owner/name"；
+	// repoMu 保护 repoNames/repoIDs：scheduler 会并行执行多个任务的
+	// forge 调用。repoNames 缓存 repo database id → "owner/name"；
 	// repoIDs 缓存反向映射。跨仓库关联在返回时登记，
 	// Issue/写操作经 repoNames 解析目标仓库。
+	repoMu    sync.Mutex
 	repoNames map[int]string
 	repoIDs   map[string]int
 }
@@ -280,6 +283,8 @@ func (c *Client) repoPath(ctx context.Context, repoID int) (string, error) {
 	if repoID == c.repoID {
 		return c.repoRef, nil
 	}
+	c.repoMu.Lock()
+	defer c.repoMu.Unlock()
 	if path, ok := c.repoNames[repoID]; ok {
 		return path, nil
 	}
@@ -304,6 +309,8 @@ func (c *Client) repoIdentity(ctx context.Context, path string) (int, error) {
 	if path == c.repoRef {
 		return c.repoID, nil
 	}
+	c.repoMu.Lock()
+	defer c.repoMu.Unlock()
 	if id, ok := c.repoIDs[path]; ok {
 		return id, nil
 	}

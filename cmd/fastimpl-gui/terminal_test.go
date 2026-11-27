@@ -270,6 +270,118 @@ func TestTerminalsSync(t *testing.T) {
 	}
 }
 
+func TestTerminalsSyncStartingPlaceholder(t *testing.T) {
+	s := &session{}
+	terms := newTerminals(s, nil)
+	key := graph.Key{ProjectID: 1, IID: 9}
+
+	terms.sync([]scheduler.TaskRuntime{{Key: key, Label: "proj-issue-9", Starting: true}})
+	if len(terms.tabs) != 1 {
+		t.Fatalf("tabs = %d, want one starting placeholder", len(terms.tabs))
+	}
+	if terms.tabs[0].Addr != "" {
+		t.Fatalf("placeholder addr = %q, want empty", terms.tabs[0].Addr)
+	}
+
+	// 地址就绪后同一页 rebind，而不是另开一页。
+	terms.sync([]scheduler.TaskRuntime{{Key: key, Addr: "t1", Label: "proj-issue-9"}})
+	if len(terms.tabs) != 1 || terms.tabs[0].Addr != "t1" {
+		t.Fatalf("rebound tabs = %#v, want one tab at t1", terms.tabs)
+	}
+
+	// 启动失败且没有地址时，占位页随状态消失。
+	terms.sync([]scheduler.TaskRuntime{{Key: key, Label: "proj-issue-9"}})
+	if len(terms.tabs) != 0 {
+		t.Fatalf("tabs = %d after starting state disappears, want 0", len(terms.tabs))
+	}
+}
+
+func TestTerminalsSyncStartingKeepsWarmAddrInteractive(t *testing.T) {
+	s := &session{}
+	terms := newTerminals(s, nil)
+	key := graph.Key{ProjectID: 1, IID: 9}
+
+	terms.sync([]scheduler.TaskRuntime{{Key: key, Addr: "t1", Label: "proj-issue-9", Starting: true, StartupPhase: "正在确认认领"}})
+	if len(terms.tabs) != 1 || terms.tabs[0].Addr != "t1" {
+		t.Fatalf("starting tab = %#v, want the warm terminal to stay visible and interactive", terms.tabs)
+	}
+
+	// 阶段变化仍用同一个真实地址，只重建观看连接来注入新的进度横幅。
+	terms.sync([]scheduler.TaskRuntime{{Key: key, Addr: "t1", Label: "proj-issue-9", Starting: true, StartupPhase: "正在发送 prompt"}})
+	if len(terms.tabs) != 1 || terms.tabs[0].Addr != "t1" || terms.tabs[0].StartupPhase != "正在发送 prompt" {
+		t.Fatalf("phase update tab = %#v, want updated progress on t1", terms.tabs[0])
+	}
+
+	// prompt 发送后不需要重连；progressConn 的横幅用完以后就是透明转发。
+	terms.sync([]scheduler.TaskRuntime{{Key: key, Addr: "t1", Label: "proj-issue-9"}})
+	if len(terms.tabs) != 1 || terms.tabs[0].Addr != "t1" || terms.tabs[0].StartupPhase != "" {
+		t.Fatalf("prompted tab = %#v, want the same t1 terminal without a startup phase", terms.tabs[0])
+	}
+}
+
+func TestProgressConnInjectsBannerButForwardsRealTerminal(t *testing.T) {
+	stream := newFakeStream()
+	attach := &fakeAttach{stream: stream}
+	base := &viewerConn{Attach: attach.attach, Addr: "t1", Width: 80, Height: 24}
+	conn := newProgressConn(base, "正在确认认领")
+
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		t.Fatalf("banner Read = %d, %v; want progress output", n, err)
+	}
+	if !strings.Contains(string(buf[:n]), "正在确认认领") {
+		t.Fatalf("banner = %q, want the startup phase", string(buf[:n]))
+	}
+
+	stream.readCh <- []byte("agent output")
+	n, err = conn.Read(buf)
+	if err != nil || string(buf[:n]) != "agent output" {
+		t.Fatalf("real Read = %q, %v, want terminal output", buf[:n], err)
+	}
+	if _, err := conn.Write([]byte("input")); err != nil {
+		t.Fatalf("Write = %v", err)
+	}
+	if err := conn.Resize(100, 30); err != nil {
+		t.Fatalf("Resize = %v", err)
+	}
+	written, resized, _ := stream.snapshot()
+	if written != "input" {
+		t.Fatalf("written = %q, want input forwarded", written)
+	}
+	if len(resized) != 1 || resized[0] != [2]int{100, 30} {
+		t.Fatalf("resized = %v, want forwarded resize", resized)
+	}
+}
+
+func TestStartingConn(t *testing.T) {
+	conn := newStartingConn("正在测试启动进度…")
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		t.Fatalf("first Read = %d, %v; want placeholder text", n, err)
+	}
+	if !strings.Contains(string(buf[:n]), "正在启动终端") {
+		t.Fatalf("placeholder text = %q", string(buf[:n]))
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Read(make([]byte, 8))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("second Read finished before Close: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if err := <-done; err != io.EOF {
+		t.Fatalf("second Read after Close = %v, want EOF", err)
+	}
+}
+
 func TestTerminalsCloseAll(t *testing.T) {
 	stream := newFakeStream()
 	attach := &fakeAttach{stream: stream}

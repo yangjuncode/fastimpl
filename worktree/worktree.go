@@ -467,15 +467,31 @@ func (r *Repo) EnsureIntegration(ctx context.Context, spec int, base, want strin
 	if err = os.MkdirAll(r.TreeDir, 0o755); err != nil {
 		return "", "", "", fmt.Errorf("create tree dir %s: %w", r.TreeDir, err)
 	}
-	// 先 fetch 再定 baseName，避免旧 remote-tracking ref 导致误选 base。
-	if err = r.fetchOrigin(ctx); err != nil {
-		return "", "", "", err
+	// fetch 与 ls-remote 都是启动前的网络往返且互不依赖：ls-remote
+	// 直接读远端，不等待本地 remote-tracking ref 更新。并行后 baseName
+	// 仍使用本次 fetch 后的 refs，分支候选仍以 ls-remote 为准。
+	type fetchResult struct{ err error }
+	type headsResult struct {
+		heads map[string]string
+		err   error
+	}
+	fetchCh := make(chan fetchResult, 1)
+	headsCh := make(chan headsResult, 1)
+	go func() { fetchCh <- fetchResult{err: r.fetchOrigin(ctx)} }()
+	go func() {
+		heads, err := r.remoteHeads(ctx)
+		headsCh <- headsResult{heads: heads, err: err}
+	}()
+	fetchRes := <-fetchCh
+	headsRes := <-headsCh
+	if fetchRes.err != nil {
+		return "", "", "", fetchRes.err
+	}
+	if headsRes.err != nil {
+		return "", "", "", headsRes.err
 	}
 	baseName = r.baseName(ctx, base)
-	heads, err := r.remoteHeads(ctx)
-	if err != nil {
-		return "", "", "", err
-	}
+	heads := headsRes.heads
 	branches, err := r.localBranches(ctx, spec)
 	if err != nil {
 		return "", "", "", err
@@ -592,8 +608,21 @@ func (r *Repo) Merge(ctx context.Context, integrationDir, branch string) error {
 // 在集成 worktree 中执行。冲突时 abort 并返回 *ConflictError；
 // 调用方决定是否继续（任务分支合并不受影响）。
 func (r *Repo) SyncBase(ctx context.Context, integrationDir, base string) error {
-	if _, err := r.run(ctx, integrationDir, "fetch", "origin", base); err != nil {
-		return fmt.Errorf("fetch origin %s: %w", base, err)
+	return r.syncBase(ctx, integrationDir, base, true)
+}
+
+// SyncBaseAfterFetch 同 SyncBase，但复用调用方刚刚完成的 `fetch origin`。
+// 只有 EnsureIntegration 这类已经把全部 origin ref 拉到本地的前置流程
+// 才能使用；真正合并前仍必须走 SyncBase 重新 fetch，避免漏掉等待期间的上游更新。
+func (r *Repo) SyncBaseAfterFetch(ctx context.Context, integrationDir, base string) error {
+	return r.syncBase(ctx, integrationDir, base, false)
+}
+
+func (r *Repo) syncBase(ctx context.Context, integrationDir, base string, fetch bool) error {
+	if fetch {
+		if _, err := r.run(ctx, integrationDir, "fetch", "origin", base); err != nil {
+			return fmt.Errorf("fetch origin %s: %w", base, err)
+		}
 	}
 	ref := "origin/" + base
 	// 已是祖先则无操作（输出 "Already up to date."）。

@@ -60,8 +60,9 @@ type Options struct {
 // work-dir 解析 → config.Load（分层覆盖）→ repo-dir 解析 → origin
 // 解析 → forge 解析 → graph.Build（子任务 + blocked-by 传递闭包）→
 // -json/-print 导出 → prompt.Load → tree-dir 解析 → EnsureIntegration
-// 集成分支 worktree → SyncBase + push + EnsureMR → worker.Dial（hcgo）
-// → scheduler.Run（就绪即派、完成即放）。
+// 集成分支 worktree → SyncBase → scheduler.Run（就绪即派、完成即放）。
+// worker.Dial、初始 push 与 EnsureMR 都和本地准备/任务预热并行；首个
+// 任务真正合并前 scheduler 会串行确认初始 push+EnsureMR 已成功。
 func Run(ctx context.Context, opts Options, stdout, stderr io.Writer) error {
 	return run(ctx, opts, stdout, stderr, Observer{})
 }
@@ -231,6 +232,37 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	// 终端命名前缀用 origin 项目路径的最后一段（gzdev/bf9100 → bf9100），
 	// 多项目并行时避免 issue-<iid> 终端名互相碰撞。
 	repo.Name = path.Base(projectPath)
+	agentArgv, err := cfg.AgentArgv()
+	if err != nil {
+		return err
+	}
+	// hc 是本机控制面，与集成分支的 git/forge 准备互不依赖。让它在后台
+	// 连接；若本地准备失败，清理 defer 会收束并关闭这条连接，不泄漏 runner。
+	type dialResult struct {
+		runner *worker.Runner
+		err    error
+	}
+	dialCh := make(chan dialResult, 1)
+	log.Info("connecting to herdr-core")
+	dialCtx, cancelDial := context.WithCancel(ctx)
+	go func() {
+		runner, err := worker.Dial(dialCtx, cfg.HcBinary, cfg.HcSocket)
+		dialCh <- dialResult{runner: runner, err: err}
+	}()
+	dialReceived := false
+	defer func() {
+		if dialReceived {
+			return
+		}
+		res := <-dialCh
+		if res.err == nil && res.runner != nil {
+			_ = res.runner.Close()
+		}
+	}()
+	// defer 逆序执行：错误路径先取消 dial，再等待它收束，避免本地准备失败
+	// 却被一个卡住的 hc 连接尝试反挂住。
+	defer cancelDial()
+
 	branch, intDir, baseName, err := repo.EnsureIntegration(ctx, opts.SpecIID, "", cfg.Integration)
 	if err != nil {
 		return err
@@ -238,46 +270,56 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	log.Info("integration worktree", "dir", intDir, "branch", branch, "base", baseName)
 	// 复用的集成分支可能落后 base，先同步上游再推送。
 	// base 同步冲突不阻塞本次运行：任务合并不受影响，冲突留给 MR。
-	if err := repo.SyncBase(ctx, intDir, baseName); err != nil {
+	if err := repo.SyncBaseAfterFetch(ctx, intDir, baseName); err != nil {
 		fmt.Fprintf(stderr, "warning: sync %s into %s failed: %v\n", baseName, branch, err)
 	}
-	// 集成分支就位后立即推送并确保 MR 存在；此后每次集成再推送。
-	log.Info("pushing integration branch", "branch", branch, "base", baseName)
-	if err := repo.Push(ctx, intDir, branch); err != nil {
-		return fmt.Errorf("push integration branch %s: %w", branch, err)
+	dial := <-dialCh
+	dialReceived = true
+	if dial.err != nil {
+		return dial.err
 	}
-	log.Info("ensuring merge request", "source", branch, "target", baseName)
-	mrURL, err := fc.EnsureMR(ctx, g.Spec().ProjectID, branch, baseName,
-		fmt.Sprintf("spec #%d integration", opts.SpecIID),
-		fmt.Sprintf("Close #%d", opts.SpecIID))
-	if err != nil {
-		return fmt.Errorf("ensure merge request: %w", err)
-	}
-	agentArgv, err := cfg.AgentArgv()
-	if err != nil {
-		return err
-	}
-	log.Info("connecting to herdr-core")
-	runner, err := worker.Dial(ctx, cfg.HcBinary, cfg.HcSocket)
-	if err != nil {
-		return err
-	}
+	runner := dial.runner
 	closeRunner := true
 	defer func() {
 		if closeRunner {
 			_ = runner.Close()
 		}
 	}()
-	log.Info("integration ready", "branch", branch, "mr", mrURL)
+
 	log.Info("scheduler started", "parallelism", cfg.Parallelism, "agent", agentArgv)
 	sched := scheduler.New(cfg, repo, fc, forge, g, runner, tmpl, workDir, intDir, branch, baseName, agentArgv, log)
 	sched.SetRuntimeSettingsLoader(runtimeSettingsLoader(workDir, opts))
+	// 初始 push/EnsureMR 不再挡在第一个 worker 前面。它们与 worker 预热
+	// 并行；scheduler 在第一个任务真正 merge/push 前会用同一把集成锁
+	// 确认（必要时重试）这段准备，避免并发 push 或绕过 MR 创建。
+	sched.PrepareIntegrationAsync(ctx, func(pctx context.Context) (string, error) {
+		log.Info("pushing integration branch", "branch", branch, "base", baseName)
+		if err := repo.Push(pctx, intDir, branch); err != nil {
+			return "", fmt.Errorf("push integration branch %s: %w", branch, err)
+		}
+		log.Info("ensuring merge request", "source", branch, "target", baseName)
+		mrURL, err := fc.EnsureMR(pctx, g.Spec().ProjectID, branch, baseName,
+			fmt.Sprintf("spec #%d integration", opts.SpecIID),
+			fmt.Sprintf("Close #%d", opts.SpecIID))
+		if err != nil {
+			return "", fmt.Errorf("ensure merge request: %w", err)
+		}
+		return mrURL, nil
+	})
 	if observer.SchedulerReady != nil {
 		// 调度尚未启动：GUI 此时才能拿到 scheduler，并且在第一个 worker
 		// 起来之前就装上自己的刷新循环与终端连接方式。
 		observer.SchedulerReady(sched, viewerAttach(cfg.HcBinary, cfg.HcSocket))
 	}
 	runErr := sched.Run(ctx)
+	// Run 返回不代表后台初始 push/EnsureMR 已结束（例如全部任务本来
+	// 就关闭时调度会立刻完成）。这里用集成锁收束它，避免进程/GUI 提前
+	// 退出留下后台 git 或 forge 操作；只有调度本身成功时才把准备失败
+	// 作为本轮错误返回。
+	prepErr := sched.IntegrationPrepError()
+	if runErr == nil && prepErr != nil {
+		return fmt.Errorf("prepare integration branch: %w", prepErr)
+	}
 	if sched.RetentionPending() {
 		// delayed terminal 的清理定时器还要使用这条 hc 控制连接；Run 返回后
 		// 由后台 goroutine 等最后一次清理结束再关闭，不阻塞 GUI/CLI 退出。

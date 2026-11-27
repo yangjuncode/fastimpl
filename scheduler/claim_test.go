@@ -213,7 +213,7 @@ func TestRunTaskRespectsExistingClaim(t *testing.T) {
 }
 
 // TestRunTaskClaimNotConfirmed 抢到仲裁后指派异常（缺失/他人/关闭/回读
-// 报错）都不启动 worker，并释放本次自己的标记。
+// 报错）时，预热终端可以出现但绝不能收到 prompt；确认停止后释放本次标记。
 func TestRunTaskClaimNotConfirmed(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -249,9 +249,17 @@ func TestRunTaskClaimNotConfirmed(t *testing.T) {
 			}
 			sessions.mu.Lock()
 			started := len(sessions.started)
+			stopped := len(sessions.stops)
+			prompted := 0
+			for _, texts := range sessions.prompts {
+				prompted += len(texts)
+			}
 			sessions.mu.Unlock()
-			if started != 0 {
-				t.Fatalf("workers started = %d, want 0", started)
+			if started != 1 || stopped != 1 {
+				t.Fatalf("warm workers started/stopped = %d/%d, want 1/1", started, stopped)
+			}
+			if prompted != 0 {
+				t.Fatalf("prompts sent to warm worker = %d, want 0", prompted)
 			}
 			f.mu.Lock()
 			comments := append([]forge.IssueComment{}, f.comments[9]...)
@@ -277,8 +285,8 @@ func TestRunTaskClaimNotConfirmed(t *testing.T) {
 	}
 }
 
-// TestRunTaskClosedBeforeClaim 抢到认领前 issue 已被关闭：按原语义
-// 记为 closed，不启动 worker。
+// TestRunTaskClosedBeforeClaim 抢到认领前 issue 已被关闭：按原语义记为
+// closed；预热终端可以出现，但必须未收到 prompt 且被停止。
 func TestRunTaskClosedBeforeClaim(t *testing.T) {
 	taskLockDir(t)
 	repoDir := initRepo(t)
@@ -304,9 +312,17 @@ func TestRunTaskClosedBeforeClaim(t *testing.T) {
 	}
 	sessions.mu.Lock()
 	started := len(sessions.started)
+	stopped := len(sessions.stops)
+	prompted := 0
+	for _, texts := range sessions.prompts {
+		prompted += len(texts)
+	}
 	sessions.mu.Unlock()
-	if started != 0 {
-		t.Fatalf("workers started = %d, want 0", started)
+	if started != 1 || stopped != 1 {
+		t.Fatalf("warm workers started/stopped = %d/%d, want 1/1", started, stopped)
+	}
+	if prompted != 0 {
+		t.Fatalf("prompts sent to warm worker = %d, want 0", prompted)
 	}
 }
 
@@ -531,7 +547,8 @@ func (l *lateClaimSessions) Stop(ctx context.Context, addr string, specIID int, 
 }
 
 // TestRunTaskTwoInstancesCompete 同账号、不同 instance、各自 checkout 绕过
-// 本地锁并发抢同一 issue：只有一个启动 worker，输的一方清掉自己的标记。
+// 本地锁并发抢同一 issue：两边都可能出现预热终端，但只有胜者能收到
+// prompt；输的一方停止预热终端并清掉自己的标记。
 func TestRunTaskTwoInstancesCompete(t *testing.T) {
 	taskLockDir(t)
 	f := &fakeForge{}
@@ -616,8 +633,24 @@ func TestRunTaskTwoInstancesCompete(t *testing.T) {
 	if claims != 2 || releases != 2 {
 		t.Fatalf("markers claim=%d release=%d, want both sides released: %v", claims, releases, comments)
 	}
-	startedA, startedB := len(a.sessions.started), len(b.sessions.started)
-	if startedA+startedB != 1 {
-		t.Fatalf("workers started a=%d b=%d, want exactly one winner", startedA, startedB)
+	a.sessions.mu.Lock()
+	startedA := len(a.sessions.started)
+	promptsA := 0
+	for _, texts := range a.sessions.prompts {
+		promptsA += len(texts)
+	}
+	a.sessions.mu.Unlock()
+	b.sessions.mu.Lock()
+	startedB := len(b.sessions.started)
+	promptsB := 0
+	for _, texts := range b.sessions.prompts {
+		promptsB += len(texts)
+	}
+	b.sessions.mu.Unlock()
+	if startedA+startedB != 2 {
+		t.Fatalf("warm workers started a=%d b=%d, want both sides preheated", startedA, startedB)
+	}
+	if promptsA+promptsB != 1 {
+		t.Fatalf("prompts sent a=%d b=%d, want exactly one winner", promptsA, promptsB)
 	}
 }

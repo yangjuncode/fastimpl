@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yangjuncode/fastimpl/config"
@@ -138,7 +139,9 @@ type Client struct {
 	projectID int
 	// username 是当前 glab 登录用户，用于领取判定。
 	username string
+	// repoMu 保护 repoRefs：scheduler 会并行执行多个任务的 forge 调用。
 	// repoRefs 缓存跨项目工作项的 project id → "host/path" 引用。
+	repoMu   sync.Mutex
 	repoRefs map[int]string
 }
 
@@ -512,6 +515,8 @@ func (c *Client) repoRefFor(ctx context.Context, projectID int) (string, error) 
 	if projectID == c.projectID {
 		return c.repoRef, nil
 	}
+	c.repoMu.Lock()
+	defer c.repoMu.Unlock()
 	if ref, ok := c.repoRefs[projectID]; ok {
 		return ref, nil
 	}
