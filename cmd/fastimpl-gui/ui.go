@@ -389,12 +389,14 @@ func (m *model) stop() {
 }
 
 // build 返回整个界面：顶部是运行控制，主体是图/终端页，底部是三个
-// 目录的只读信息栏。
+// 目录的只读信息栏。根视图显式声明默认箭头：依赖图和终端屏幕可以在
+// 自己的命中层改用抓取/文本光标，而 Linux/GTK 离开这些层时总能回到
+// 一个明确的默认光标，而不是继承上一次的特殊光标。
 func (m *model) build() core.Node {
 	colors := ui.ColorsOf(m.cx)
 	return core.View{TestID: "root", StyleFunc: func() core.Style {
 		return core.Style{Width: core.Pct(100), Height: core.Pct(100), Direction: core.Column, Overflow: core.Hidden,
-			Background: colors.Background(), Color: colors.Text()}
+			Background: colors.Background(), Color: colors.Text(), Cursor: core.CursorDefault}
 	}, Children: []core.Node{
 		m.header(),
 		core.View{Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Direction: core.Column, Gap: 0, Overflow: core.Hidden},
@@ -578,11 +580,14 @@ func (m *model) tabs() core.Node {
 		}
 		return opts
 	}
+	selectedTab := &core.Style{Color: colors.Accent()}
 	return core.View{TestID: "tabs", StyleFunc: func() core.Style {
-		return core.Style{Padding: core.Symmetric(6, 10), Borders: core.Edges{Bottom: 1}, BorderColor: colors.Border()}
+		return core.Style{Padding: core.Symmetric(2, 10), Borders: core.Edges{Bottom: 1}, BorderColor: colors.Border(),
+			Background: colors.Surface()}
 	}, Children: []core.Node{
-		ui.Tabs[string]{OptionsFunc: options, Value: m.tab.Get, OnChange: m.tab.Set, Size: ui.SizeSmall,
-			Label: "页面"},
+		ui.Tabs[string]{Variant: ui.TabsUnderline, OptionsFunc: options, Value: m.tab.Get, OnChange: m.tab.Set, Size: ui.SizeSmall,
+			TabStyle: core.Style{Padding: core.Symmetric(7, 12), FontWeight: ui.Medium, Selected: selectedTab},
+			Label:    "页面"},
 	}}
 }
 
@@ -992,7 +997,7 @@ func (m *model) legend() core.Node {
 			Borders: core.Edges{Top: 1}, BorderColor: colors.Border(), Background: colors.Surface()}
 	}, Children: []core.Node{
 		ui.Text("箭头从「前置」指向「被阻塞」的 issue", 11, ui.Regular, colors.Muted),
-		item(lucide.CircleDashed, colors.Muted, "等待前置"),
+		item(lucide.CircleDashed, pendingColor(colors), "等待前置"),
 		item(lucide.CirclePlay, colors.Up, "可开始"),
 		item(lucide.LoaderCircle, colors.Accent, "运行中"),
 		item(lucide.GitMerge, colors.Accent, "集成中"),

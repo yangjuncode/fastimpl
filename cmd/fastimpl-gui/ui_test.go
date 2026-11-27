@@ -471,6 +471,90 @@ func TestTerminalTabTitlePressSwitchesTerminal(t *testing.T) {
 	gui.Find("text:地址 t1")
 }
 
+// 当前页是依赖图时，点击终端 tab 的标题也必须切到终端：图画布的
+// 平移/缩放手势层只能覆盖图本身，不能向上盖住 tab 栏。
+func TestTerminalTabTitlePressWorksAboveGraph(t *testing.T) {
+	gui, m, sess := headless(t, app.Options{})
+	attach := &fakeAttach{stream: newFakeStream()}
+	sess.attach = attach.attach
+	snap := specSnapshot()
+	started := gui.Clock.WallTime()
+	snap.Status[0].StartedAt = started
+	loadGraph(gui, m, snap)
+	if got := m.tab.GetUntracked(); got != pageGraph {
+		t.Fatalf("initial tab = %q, want graph", got)
+	}
+
+	title := "#9 · " + started.Format("15:04:05")
+	text := gui.Find("text:" + title)
+	gui.PressAt("text:"+title, core.Point{X: text.Frame.Size.Width / 2, Y: text.Frame.Size.Height / 2})
+	if got := m.tab.GetUntracked(); got != "1!9" {
+		t.Fatalf("pressing the terminal tab title above the graph selected %q, want 1!9", got)
+	}
+	gui.Find("text:地址 t1")
+}
+
+// 依赖图内部可以继续显示抓取光标；一旦指针来到 tab 或顶部设置，
+// 光标必须回到根视图显式声明的默认箭头。这个显式默认值同时避免
+// Linux/GTK 把上一次画布光标作为继承状态留在整个窗口上。
+func TestCursorRestoresDefaultOutsideGraph(t *testing.T) {
+	if nsgotest.Target() != "" {
+		t.Skip("ActiveCursor 只反映无窗口命中模型")
+	}
+	gui, m, sess := headless(t, app.Options{})
+	attach := &fakeAttach{stream: newFakeStream()}
+	sess.attach = attach.attach
+	snap := specSnapshot()
+	started := gui.Clock.WallTime()
+	snap.Status[0].StartedAt = started
+	loadGraph(gui, m, snap)
+
+	gui.Hover("id:graph-pointer")
+	if got := gui.ActiveCursor().Cursor; got != core.CursorGrab {
+		t.Fatalf("cursor over graph = %v, want grab", got)
+	}
+	title := "#9 · " + started.Format("15:04:05")
+	gui.Hover("text:" + title)
+	if got := gui.ActiveCursor().Cursor; got != core.CursorDefault {
+		t.Fatalf("cursor over terminal tab after graph = %v, want default", got)
+	}
+	gui.Hover("id:open-settings")
+	if got := gui.ActiveCursor().Cursor; got != core.CursorDefault {
+		t.Fatalf("cursor over settings after graph = %v, want default", got)
+	}
+}
+
+// 终端屏幕用文本光标，但离开屏幕后同样要恢复默认箭头；否则从图节点
+// 跳到终端后，整个窗口会像仍处在终端文本区一样显示文本光标。
+func TestCursorRestoresDefaultOutsideTerminal(t *testing.T) {
+	if nsgotest.Target() != "" {
+		t.Skip("ActiveCursor 只反映无窗口命中模型")
+	}
+	gui, m, sess := headless(t, app.Options{})
+	attach := &fakeAttach{stream: newFakeStream()}
+	sess.attach = attach.attach
+	snap := specSnapshot()
+	started := gui.Clock.WallTime()
+	snap.Status[0].StartedAt = started
+	loadGraph(gui, m, snap)
+
+	title := "#9 · " + started.Format("15:04:05")
+	gui.Press("text:" + title)
+	gui.Find("id:terminal")
+	gui.Hover("id:terminal-screen")
+	if got := gui.ActiveCursor().Cursor; got != core.CursorText {
+		t.Fatalf("cursor over terminal screen = %v, want text", got)
+	}
+	gui.Hover("text:" + title)
+	if got := gui.ActiveCursor().Cursor; got != core.CursorDefault {
+		t.Fatalf("cursor over terminal tab after terminal = %v, want default", got)
+	}
+	gui.Hover("id:open-settings")
+	if got := gui.ActiveCursor().Cursor; got != core.CursorDefault {
+		t.Fatalf("cursor over settings after terminal = %v, want default", got)
+	}
+}
+
 // 传了 issue 时窗口打开后自动开始：这里只验证录入值被带到选项里，
 // 真正的运行由 session 的测试覆盖。
 func TestIssueFromFlagsPrefills(t *testing.T) {

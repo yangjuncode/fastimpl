@@ -105,6 +105,11 @@ func displayKey(spec, k graph.Key) string {
 	return k.String()
 }
 
+// displayTitle 把 issue 编号放进图节点标题，跨项目时保留完整 project!iid。
+func displayTitle(spec, k graph.Key, title string) string {
+	return displayKey(spec, k) + " " + title
+}
+
 // shortSHA 截短提交哈希，供卡片页脚显示。
 func shortSHA(sha string) string {
 	if len(sha) > 8 {
@@ -121,6 +126,12 @@ func attentionSummary(s string) string {
 		return string(r[:56]) + "…"
 	}
 	return s
+}
+
+// pendingColor 是“等待前置”的浅橙色：保留警告色的橙色含义，同时
+// 降低不透明度，避免小卡片上像失败/告警一样刺眼。
+func pendingColor(colors ui.Colors) func() core.Color {
+	return func() core.Color { return ui.Alpha(colors.Warn(), 0.8) }
 }
 
 // stateBadge 返回状态的颜色、图标与文字。
@@ -143,7 +154,7 @@ func stateBadge(colors ui.Colors, v viewState) (func() core.Color, func() *core.
 	case viewReady:
 		return colors.Up, lucide.CirclePlay, "可开始工作"
 	}
-	return colors.Muted, lucide.CircleDashed, "等待前置"
+	return pendingColor(colors), lucide.CircleDashed, "等待前置"
 }
 
 // diagram 是一次绘图：父 issue、任务节点与有向边。边一律由前置指向
@@ -233,12 +244,12 @@ func (d diagram) flowData(look *liveGraph) uiflow.Data {
 	}
 	data := uiflow.Data{Edges: d.edges}
 	data.Nodes = append(data.Nodes, uiflow.Node{
-		ID: flowNodeID(d.spec), Label: "spec " + d.title, Width: cardWidth, Height: cardHeight,
+		ID: flowNodeID(d.spec), Label: displayTitle(d.spec, d.spec, d.title), Width: cardWidth, Height: cardHeight,
 		Content: nodeCard{look: look, key: d.spec, spec: d.spec, title: d.title, specCard: true},
 	})
 	for _, n := range d.nodes {
 		data.Nodes = append(data.Nodes, uiflow.Node{
-			ID: flowNodeID(n.Key), Label: n.Title, Width: cardWidth, Height: cardHeight,
+			ID: flowNodeID(n.Key), Label: displayTitle(d.spec, n.Key, n.Title), Width: cardWidth, Height: cardHeight,
 			Content: nodeCard{look: look, key: n.Key, spec: d.spec, node: n},
 		})
 	}
@@ -328,6 +339,7 @@ func (c nodeCard) readLive() nodeLive {
 		}
 	}
 	if c.specCard {
+		out.node.Key = c.key
 		out.node.Title = c.title
 	}
 	return out
@@ -389,9 +401,9 @@ func (c nodeCard) render(cx *core.Scope, current nodeLive, live *core.Memo[nodeL
 			return lines[0]
 		}}
 	body := core.Group{
-		core.Text{Content: node.Title, MaxLines: 2, Style: ui.TypeBody.Merge(core.Style{FontWeight: ui.Semibold}),
+		core.Text{Content: displayTitle(c.spec, c.key, node.Title), MaxLines: 2, Style: ui.TypeBody.Merge(core.Style{FontWeight: ui.Semibold}),
 			StyleFunc: ui.Colored(colors.Text)},
-		core.Text{Content: displayKey(c.spec, node.Key) + " · " + kind, MaxLines: 1,
+		core.Text{Content: kind, MaxLines: 1,
 			Style: core.Style{FontSize: 11, LineHeight: 15}, StyleFunc: ui.Colored(colors.Muted)},
 	}
 	if !rt.StartedAt.IsZero() {

@@ -153,6 +153,33 @@ func TestDisplayKey(t *testing.T) {
 	}
 }
 
+func TestDisplayTitleIncludesIssueNumber(t *testing.T) {
+	spec := graph.Key{ProjectID: 1, IID: 8}
+	if got := displayTitle(spec, graph.Key{ProjectID: 1, IID: 9}, "task A"); got != "#9 task A" {
+		t.Errorf("displayTitle(same project) = %q, want %q", got, "#9 task A")
+	}
+	if got := displayTitle(spec, graph.Key{ProjectID: 2, IID: 3}, "blocker"); got != "2!3 blocker" {
+		t.Errorf("displayTitle(cross project) = %q, want %q", got, "2!3 blocker")
+	}
+}
+
+func TestFlowLabelsIncludeIssueNumber(t *testing.T) {
+	data := buildDiagram(specSnapshot()).flowData(nil)
+	labels := map[string]string{}
+	for _, n := range data.Nodes {
+		labels[n.ID] = n.Label
+	}
+	for id, want := range map[string]string{
+		"1!8": "#8 spec title",
+		"1!9": "#9 task A",
+		"2!3": "2!3 cross repo blocker",
+	} {
+		if got := labels[id]; got != want {
+			t.Errorf("flow label %s = %q, want %q", id, got, want)
+		}
+	}
+}
+
 func TestProgressMessageNamesPhases(t *testing.T) {
 	for _, tc := range []struct {
 		p    graph.BuildProgress
