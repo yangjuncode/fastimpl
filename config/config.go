@@ -336,7 +336,7 @@ func Load(workDir, path string) (Config, error) {
 		RequireReview:     false,
 		Reviewer:          DefaultReviewer,
 		ResumeBudget:      DefaultResumeBudget,
-		TerminalRetention: "0s",
+		TerminalRetention: "60s",
 	}
 	applyRaw(&cfg, base)
 	applyRaw(&cfg, over)
