@@ -5,8 +5,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/yangjuncode/fastimpl/config"
 )
 
 // runGit 在 dir 里跑一条 git 命令，失败即结束测试。
@@ -110,6 +113,83 @@ func TestPreviewPathsUsesExistingWorktreeParent(t *testing.T) {
 	}
 	if !p.Ready() {
 		t.Errorf("preview = %+v, want ready", p)
+	}
+}
+
+// 工作目录附近检测到多个 Git 仓库时，PreviewPaths 把候选列表结构化返回，
+// 方便 GUI 直接展示供用户选择。
+func TestPreviewPathsListsMultipleRepoCandidates(t *testing.T) {
+	work := t.TempDir()
+	repoA := filepath.Join(work, "repo-a")
+	repoB := filepath.Join(work, "repo-b")
+	for _, r := range []string{repoA, repoB} {
+		if err := os.MkdirAll(r, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, r, "init", "-b", "main")
+	}
+
+	p, err := PreviewPaths(context.Background(), Options{WorkDir: work})
+	if err != nil {
+		t.Fatalf("PreviewPaths = %v", err)
+	}
+	if p.RepoErr == nil {
+		t.Fatal("RepoErr = nil, want ambiguity error")
+	}
+	want := []string{repoA, repoB}
+	if !slices.Equal(p.RepoCandidates, want) {
+		t.Fatalf("RepoCandidates = %v, want %v", p.RepoCandidates, want)
+	}
+}
+
+// 仓库既有 worktree 分散在多个父目录时，PreviewPaths 返回 TreeCandidates 列表。
+func TestPreviewPathsListsMultipleTreeCandidates(t *testing.T) {
+	repo := gitRepo(t)
+	base := t.TempDir()
+	treeA := filepath.Join(base, "trees-a")
+	treeB := filepath.Join(base, "trees-b")
+	runGit(t, repo, "worktree", "add", "-b", "wt-a", filepath.Join(treeA, "wt-a"))
+	runGit(t, repo, "worktree", "add", "-b", "wt-b", filepath.Join(treeB, "wt-b"))
+
+	p, err := PreviewPaths(context.Background(), Options{WorkDir: repo, RepoDir: repo})
+	if err != nil {
+		t.Fatalf("PreviewPaths = %v", err)
+	}
+	if p.TreeErr == nil {
+		t.Fatal("TreeErr = nil, want multiple worktree parent error")
+	}
+	want := []string{treeA, treeB}
+	if !slices.Equal(p.TreeCandidates, want) {
+		t.Fatalf("TreeCandidates = %v, want %v", p.TreeCandidates, want)
+	}
+}
+
+// 工作目录配置里已经记了 repoA 与 treeA，用户显式切换到 repoB 时必须按 repoB 重新推断
+// Worktree 目录，不能把 repoA 的 tree_dir 套用到 repoB。
+func TestPreviewPathsReinfersTreeDirWhenSwitchingRepo(t *testing.T) {
+	work := t.TempDir()
+	repoA := gitRepo(t)
+	repoB := gitRepo(t)
+	treeA := filepath.Join(t.TempDir(), "trees-a")
+	treeB := filepath.Join(t.TempDir(), "trees-b")
+	runGit(t, repoB, "worktree", "add", "-b", "wt-b", filepath.Join(treeB, "wt-b"))
+
+	if _, err := config.SaveWorkDirPaths(work, repoA, treeA); err != nil {
+		t.Fatalf("SaveWorkDirPaths = %v", err)
+	}
+
+	p, err := PreviewPaths(context.Background(), Options{WorkDir: work, RepoDir: repoB})
+	if err != nil {
+		t.Fatalf("PreviewPaths = %v", err)
+	}
+	if !p.Ready() {
+		t.Fatalf("preview = %+v, want ready", p)
+	}
+	if p.Paths.RepoDir != repoB {
+		t.Errorf("RepoDir = %q, want %q", p.Paths.RepoDir, repoB)
+	}
+	if p.Paths.TreeDir != treeB {
+		t.Errorf("TreeDir = %q, want re-inferred %q (not stale %q)", p.Paths.TreeDir, treeB, treeA)
 	}
 }
 

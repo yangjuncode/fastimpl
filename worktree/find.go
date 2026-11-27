@@ -13,11 +13,34 @@ import (
 // MaxSearchDepth 是向上/向下搜索仓库根的最大层数。
 const MaxSearchDepth = 8
 
+// MultipleReposError 表示在搜索范围内找到了多个 Git 仓库根，
+// 需要调用方从中挑选一个。Repos 已按字典序排序，均为绝对路径。
+type MultipleReposError struct {
+	Start string
+	Repos []string
+}
+
+func (e *MultipleReposError) Error() string {
+	return fmt.Sprintf("multiple git repositories found near %s: %s; use -repo-dir to pick one",
+		e.Start, strings.Join(e.Repos, ", "))
+}
+
+// MultipleTreeDirsError 表示仓库既有 worktree 分散在多个父目录下，
+// 需要调用方从中挑选一个。Dirs 已按字典序排序，均为绝对路径。
+type MultipleTreeDirsError struct {
+	Dirs []string
+}
+
+func (e *MultipleTreeDirsError) Error() string {
+	return fmt.Sprintf("existing worktrees have no uniform parent directory: %s; use -tree-dir to pick one",
+		strings.Join(e.Dirs, ", "))
+}
+
 // FindRoot 从 start 出发定位 Git 仓库根目录：
 //  1. start 本身是仓库根 → 直接返回（默认就是当前目录）；
 //  2. 否则向上（父目录链）与向下（子目录树）各搜至多 MaxSearchDepth 级；
 //  3. 恰命中一个仓库根 → 返回它；零个报未找到；多个报歧义，
-//     提示用 -repo-dir 显式指定。
+//     提示用 -repo-dir 显式指定（并经 MultipleReposError 返回完整候选列表）。
 //
 // 仓库根的判定是该目录下存在 .git 目录；.git 文件的是 linked
 // worktree/submodule，不当作可管理的主仓库根。向下搜索不进入
@@ -28,7 +51,7 @@ func FindRoot(start string) (string, error) {
 		return "", fmt.Errorf("resolve %s: %w", start, err)
 	}
 	abs = filepath.Clean(abs)
-	if isRepoRoot(abs) {
+	if IsRepoRoot(abs) {
 		return abs, nil
 	}
 	found := map[string]bool{}
@@ -40,7 +63,7 @@ func FindRoot(start string) (string, error) {
 			break
 		}
 		dir = parent
-		if isRepoRoot(dir) {
+		if IsRepoRoot(dir) {
 			found[dir] = true
 		}
 	}
@@ -67,7 +90,7 @@ func FindRoot(start string) (string, error) {
 				continue
 			}
 			child := filepath.Join(e.dir, it.Name())
-			if isRepoRoot(child) {
+			if IsRepoRoot(child) {
 				found[child] = true
 				continue // 不进入仓库内部
 			}
@@ -81,13 +104,18 @@ func FindRoot(start string) (string, error) {
 	case 1:
 		return slices.Collect(maps.Keys(found))[0], nil
 	default:
-		return "", fmt.Errorf("multiple git repositories found near %s: %s; use -repo-dir to pick one",
-			abs, strings.Join(slices.Sorted(maps.Keys(found)), ", "))
+		return "", &MultipleReposError{
+			Start: abs,
+			Repos: slices.Sorted(maps.Keys(found)),
+		}
 	}
 }
 
-// isRepoRoot 报告 dir 是否是仓库顶层：存在 .git 目录。
-func isRepoRoot(dir string) bool {
+// IsRepoRoot 报告 dir 是否是仓库顶层：存在 .git 目录。
+func IsRepoRoot(dir string) bool {
+	if dir == "" {
+		return false
+	}
 	info, err := os.Stat(filepath.Join(dir, ".git"))
 	return err == nil && info.IsDir()
 }
@@ -115,8 +143,8 @@ func DefaultTreeDir(repoDir string) string {
 // ResolveTreeDir 解析 worktree 父目录：
 //  1. explicit 非空（-tree-dir / 配置 tree_dir）→ 原样返回；
 //  2. 仓库既有 worktree（git worktree list，排除主 checkout）的父目录
-//     统一 → 用该统一目录；分散在多个目录 → 报错列出各父目录，
-//     提示 -tree-dir；
+//     统一 → 用该统一目录；分散在多个目录 → 返回 MultipleTreeDirsError
+//     列出各父目录，提示 -tree-dir；
 //  3. 无既有 worktree → DefaultTreeDir(repoDir)。
 func ResolveTreeDir(ctx context.Context, repoDir, explicit string) (string, error) {
 	if explicit != "" {
@@ -148,6 +176,7 @@ func ResolveTreeDir(ctx context.Context, repoDir, explicit string) (string, erro
 			return parent, nil
 		}
 	}
-	return "", fmt.Errorf("existing worktrees have no uniform parent directory: %s; use -tree-dir to pick one",
-		strings.Join(slices.Sorted(maps.Keys(parents)), ", "))
+	return "", &MultipleTreeDirsError{
+		Dirs: slices.Sorted(maps.Keys(parents)),
+	}
 }

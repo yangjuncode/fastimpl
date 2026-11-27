@@ -818,7 +818,7 @@ func (c *Client) Note(ctx context.Context, projectID, iid int, message string) e
 // EnsureMR 确保 sourceBranch → targetBranch 的 MR 存在：
 // 已有 opened MR 返回其 web_url；否则经 REST 创建并返回 web_url。
 // 集成分支在建好后立即调用一次，此后每次集成 push 都会更新该 MR。
-func (c *Client) EnsureMR(ctx context.Context, projectID int, sourceBranch, targetBranch, title string) (string, error) {
+func (c *Client) EnsureMR(ctx context.Context, projectID int, sourceBranch, targetBranch, title, description string) (string, error) {
 	scope := c.projectScope(projectID)
 	raw, err := c.api(ctx, fmt.Sprintf("projects/%s/merge_requests?state=opened&source_branch=%s",
 		scope, url.QueryEscape(sourceBranch)))
@@ -841,7 +841,8 @@ func (c *Client) EnsureMR(ctx context.Context, projectID int, sourceBranch, targ
 		raw, cerr = c.api(ctx, "-X", "POST", "projects/"+scope+"/merge_requests",
 			"-f", "source_branch="+sourceBranch,
 			"-f", "target_branch="+targetBranch,
-			"-f", "title="+title)
+			"-f", "title="+title,
+			"-f", "description="+description)
 		if cerr == nil {
 			break
 		}

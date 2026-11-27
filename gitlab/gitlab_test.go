@@ -45,6 +45,20 @@ func newTestClient(r Runner) *Client {
 	}
 }
 
+func TestEnsureMRIncludesDescription(t *testing.T) {
+	r := &fakeRunner{out: map[string][]byte{
+		"api --hostname gitlab.example.com projects/group%2Fproj/merge_requests?state=opened&source_branch=integration": []byte("[]"),
+		"api --hostname gitlab.example.com -X POST projects/group%2Fproj/merge_requests":                                []byte(`{"web_url":"https://gitlab.example.com/group/proj/-/merge_requests/1"}`),
+	}}
+	if _, err := newTestClient(r).EnsureMR(context.Background(), 42, "integration", "main", "spec #25 integration", "Close #25"); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(r.calls[1], " ")
+	if !strings.Contains(got, "-f description=Close #25") {
+		t.Fatalf("create MR call = %q, want description", got)
+	}
+}
+
 // TestIssueCommentsPaginated 评论读取：--paginate 连续多个数组都要收，
 // author.id 与 created_at 逐条解析。
 func TestIssueCommentsPaginated(t *testing.T) {

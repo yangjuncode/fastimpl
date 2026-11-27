@@ -48,6 +48,20 @@ func newTestClient(r Runner) *Client {
 	}
 }
 
+func TestEnsureMRIncludesDescription(t *testing.T) {
+	r := &fakeRunner{out: map[string][]byte{
+		"api --hostname github.example.com repos/owner/name/pulls?state=open&head=owner:integration": []byte("[]"),
+		"api --hostname github.example.com -X POST repos/owner/name/pulls":                           []byte(`{"html_url":"https://github.example.com/owner/name/pull/1"}`),
+	}}
+	if _, err := newTestClient(r).EnsureMR(context.Background(), 7, "integration", "main", "spec #25 integration", "Close #25"); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(r.calls[1], " ")
+	if !strings.Contains(got, "-f body=Close #25") {
+		t.Fatalf("create PR call = %q, want body description", got)
+	}
+}
+
 // TestIssueCommentsPaginated 评论读取：--paginate 连续多个数组都要收，
 // user.id 与 created_at 逐条解析。
 func TestIssueCommentsPaginated(t *testing.T) {

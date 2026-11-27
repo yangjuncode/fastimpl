@@ -101,6 +101,7 @@ func TestNodeState(t *testing.T) {
 		want viewState
 	}{
 		{graph.Node{Closed: true, State: graph.Running}, viewClosed},
+		{graph.Node{Closed: true, State: graph.Integrated}, viewClosed},
 		{graph.Node{State: graph.Integrated}, viewIntegrated},
 		{graph.Node{State: graph.Finalizing}, viewFinalizing},
 		{graph.Node{State: graph.Running}, viewRunning},

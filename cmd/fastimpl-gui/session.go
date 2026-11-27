@@ -128,11 +128,15 @@ type snapshot struct {
 	Running bool
 	// Paths 是三个目录的预览结果：能解析的都填好，失败的那一项在
 	// RepoPathErr/TreePathErr 里说明。全部就绪时 PathsReady 为真。
-	Paths      app.Paths
-	PathsReady bool
+	Paths       app.Paths
+	PathsReady  bool
+	DiscoverSeq uint64
 	// PathErr 是工作目录或配置本身不可用（普通失败，不是仓库提示）。
 	PathErr                  error
 	RepoPathErr, TreePathErr error
+	// RepoCandidates 与 TreeCandidates 是多候选歧义时检测到的候选目录列表。
+	RepoCandidates []string
+	TreeCandidates []string
 	// AutoStarted 表示带 issue 启动的那次自动开始已经发生，不会重复。
 	AutoStarted bool
 	// ActiveRuns 是目录预览时扫描到的本仓库 active worker metadata。
@@ -183,7 +187,12 @@ type session struct {
 	pathsReady               bool
 	pathErr                  error
 	repoPathErr, treePathErr error
+	repoCandidates           []string
+	treeCandidates           []string
 	discovering              bool
+	discoverSeq              uint64
+	discoveredSeq            uint64
+	discoverCancel           context.CancelFunc
 	// autoStarted 表示带 issue 启动时的那次自动开始已经发生。
 	autoStarted bool
 	// activeRuns 是启动扫描发现的 metadata；observing 为真时本进程
@@ -220,47 +229,54 @@ func (s *session) Snapshot() snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return snapshot{
-		Revision:      s.rev,
-		Phase:         s.phase,
-		Issue:         s.opts.SpecIID,
-		Progress:      s.prog,
-		Message:       s.message,
-		Err:           s.err,
-		RepoError:     s.repoErr,
-		Spec:          s.spec,
-		Nodes:         append([]graph.Node(nil), s.nodes...),
-		Status:        append([]scheduler.TaskRuntime(nil), s.status...),
-		Log:           append([]string(nil), s.log...),
-		GraphReady:    s.g != nil,
-		Ready:         append([]graph.Key(nil), s.ready...),
-		WaitingStart:  s.waitingStart,
-		Running:       s.running,
-		Paths:         s.paths,
-		PathsReady:    s.pathsReady,
-		PathErr:       s.pathErr,
-		RepoPathErr:   s.repoPathErr,
-		TreePathErr:   s.treePathErr,
-		AutoStarted:   s.autoStarted,
-		ActiveRuns:    append([]scheduler.ActiveTaskMeta(nil), s.activeRuns...),
-		ActiveScanErr: s.activeScanErr,
-		Observing:     s.observing,
+		Revision:       s.rev,
+		Phase:          s.phase,
+		Issue:          s.opts.SpecIID,
+		Progress:       s.prog,
+		Message:        s.message,
+		Err:            s.err,
+		RepoError:      s.repoErr,
+		Spec:           s.spec,
+		Nodes:          append([]graph.Node(nil), s.nodes...),
+		Status:         append([]scheduler.TaskRuntime(nil), s.status...),
+		Log:            append([]string(nil), s.log...),
+		GraphReady:     s.g != nil,
+		Ready:          append([]graph.Key(nil), s.ready...),
+		WaitingStart:   s.waitingStart,
+		Running:        s.running,
+		Paths:          s.paths,
+		PathsReady:     s.pathsReady,
+		DiscoverSeq:    s.discoveredSeq,
+		PathErr:        s.pathErr,
+		RepoPathErr:    s.repoPathErr,
+		TreePathErr:    s.treePathErr,
+		RepoCandidates: append([]string(nil), s.repoCandidates...),
+		TreeCandidates: append([]string(nil), s.treeCandidates...),
+		AutoStarted:    s.autoStarted,
+		ActiveRuns:     append([]scheduler.ActiveTaskMeta(nil), s.activeRuns...),
+		ActiveScanErr:  s.activeScanErr,
+		Observing:      s.observing,
 	}
 }
 
 // Discover 解析三个目录（工作目录、仓库目录、worktree 目录），只读本地
 // 文件系统与 git，不发任何网络请求、不写配置。能解析的都填好，缺的那
-// 一项由界面补填。OnDone 在解析完成（状态已更新）后调用。
-func (s *session) Discover(opts app.Options) {
+// 一项由界面补填。重复调用会取消前一次未完成的预览并按序号丢弃过期结果，
+// 返回本次预览的递增序号，供界面区分自动启动预览与用户切仓库后的重新查找。
+func (s *session) Discover(opts app.Options) uint64 {
 	s.mu.Lock()
-	if s.discovering {
-		s.mu.Unlock()
-		return
+	if s.discoverCancel != nil {
+		s.discoverCancel()
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.discoverCancel = cancel
+	s.discoverSeq++
+	seq := s.discoverSeq
 	s.discovering = true
 	s.opts = opts
 	s.mu.Unlock()
 	go func() {
-		ctx := context.Background()
+		defer cancel()
 		preview, err := s.preview(ctx, opts)
 		var active []scheduler.ActiveTaskMeta
 		var activeScanErr error
@@ -279,11 +295,19 @@ func (s *session) Discover(opts app.Options) {
 			}
 		}
 		s.mu.Lock()
+		if seq != s.discoverSeq {
+			s.mu.Unlock()
+			return
+		}
+		s.discoverCancel = nil
 		s.discovering = false
+		s.discoveredSeq = seq
 		s.paths, s.pathErr = preview.Paths, err
 		s.activeRuns = active
 		s.activeScanErr = activeScanErr
 		s.repoPathErr, s.treePathErr = preview.RepoErr, preview.TreeErr
+		s.repoCandidates = append([]string(nil), preview.RepoCandidates...)
+		s.treeCandidates = append([]string(nil), preview.TreeCandidates...)
 		s.pathsReady = err == nil && preview.Ready()
 		onChange := s.onChange
 		s.rev++
@@ -292,6 +316,7 @@ func (s *session) Discover(opts app.Options) {
 			onChange()
 		}
 	}()
+	return seq
 }
 
 // preview 跑目录预览，测试可替换。
@@ -1024,7 +1049,7 @@ func (w *lineWriter) lines() []string {
 	return append([]string(nil), w.out...)
 }
 
-// readLogTail 只读文件尾部 maxBytes 字节，再从其中取最后 maxLines 个
+// readLogTail 只读文件尾部 maxBytes 字节，再从中取最后 maxLines 个
 // 非空行。第一行若在窗口中间被截断则丢弃，避免把半行当完整日志展示。
 func readLogTail(path string, maxLines int, maxBytes int64) ([]string, error) {
 	f, err := os.Open(path)

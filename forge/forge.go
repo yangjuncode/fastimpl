@@ -58,5 +58,5 @@ type Forge interface {
 	// Note 在 issue 上追加一条评论。
 	Note(ctx context.Context, projectID, iid int, message string) error
 	// EnsureMR 确保集成分支到目标分支的 MR/PR 存在，返回其 URL。
-	EnsureMR(ctx context.Context, projectID int, sourceBranch, targetBranch, title string) (string, error)
+	EnsureMR(ctx context.Context, projectID int, sourceBranch, targetBranch, title, description string) (string, error)
 }

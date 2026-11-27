@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,7 +12,9 @@ import (
 	"testing"
 
 	"github.com/yangjuncode/fastimpl/config"
+	"github.com/yangjuncode/fastimpl/forge"
 	"github.com/yangjuncode/fastimpl/graph"
+	"github.com/yangjuncode/fastimpl/issuecontext"
 )
 
 // gitRepo 建一个临时 git 仓库并返回其顶层目录。
@@ -151,5 +154,114 @@ func TestRunObservedReportsLoadedConfigBeforeRepoResolution(t *testing.T) {
 	}
 	if got.WorkDir != work || got.LogFile != "run.log" || got.SpecIID != 8 {
 		t.Fatalf("ConfigLoaded = %+v, want the effective workdir/log_file/spec", got)
+	}
+}
+
+// unexpectedForge 只用于把运行管线推进到调度门禁；正确的门禁后路径
+// 在配置重载失败时不会进入任何 forge 写操作。
+type unexpectedForge struct{}
+
+func (unexpectedForge) IssueState(context.Context, int, int) (forge.IssueInfo, error) {
+	return forge.IssueInfo{}, errors.New("unexpected forge use")
+}
+func (unexpectedForge) IssueComments(context.Context, int, int) ([]forge.IssueComment, error) {
+	return nil, errors.New("unexpected forge use")
+}
+func (unexpectedForge) Claim(context.Context, int, int) error {
+	return errors.New("unexpected forge use")
+}
+func (unexpectedForge) MarkInProgress(context.Context, int, int) error {
+	return errors.New("unexpected forge use")
+}
+func (unexpectedForge) MarkDone(context.Context, int, int) error {
+	return errors.New("unexpected forge use")
+}
+func (unexpectedForge) Close(context.Context, int, int) error {
+	return errors.New("unexpected forge use")
+}
+func (unexpectedForge) Note(context.Context, int, int, string) error {
+	return errors.New("unexpected forge use")
+}
+func (unexpectedForge) EnsureMR(context.Context, int, string, string, string, string) (string, error) {
+	return "", errors.New("unexpected forge use")
+}
+
+// 门禁等待期间保存的新配置必须在真正调度前重新生效。这里在
+// BeforeSchedule 中把合法配置改成非法配置：若管线使用门禁前缓存的
+// Config，它会继续走到 prompt.Load 并报告缺失模板；若正确重载，它会
+// 先报告新配置里的 parallelism 校验错误。
+func TestRunObservedReloadsConfigAfterScheduleGate(t *testing.T) {
+	repoDir := gitRepo(t)
+	work := t.TempDir()
+	configPath := filepath.Join(work, config.DefaultFile)
+	if err := os.WriteFile(configPath, []byte("parallelism = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldBuildGraph := buildGraphFn
+	defer func() { buildGraphFn = oldBuildGraph }()
+	buildGraphFn = func(ctx context.Context, kind, dir, host, projectPath string, specIID int, log *slog.Logger, progress func(graph.BuildProgress), prefetch bool) (forge.Forge, *graph.Graph, *issuecontext.Store, error) {
+		g := graph.New(graph.Key{ProjectID: 1, IID: specIID})
+		return unexpectedForge{}, g, nil, nil
+	}
+
+	missingTemplate := filepath.Join(work, "missing.prompt")
+	err := RunObserved(context.Background(), Options{
+		WorkDir:      work,
+		RepoDir:      repoDir,
+		SpecIID:      8,
+		TemplatePath: missingTemplate,
+	}, io.Discard, io.Discard, Observer{
+		BeforeSchedule: func(context.Context) error {
+			return os.WriteFile(configPath, []byte("parallelism = 0\n"), 0o644)
+		},
+	})
+	if err == nil {
+		t.Fatal("RunObserved succeeded with an invalid config written during the schedule gate")
+	}
+	if !strings.Contains(err.Error(), "parallelism must be at least 1") {
+		t.Fatalf("err = %q, want the reloaded config validation error; the stale pre-gate config was used", err)
+	}
+}
+
+// runtimeSettingsLoader 是 GUI 保存与已经开始的调度之间的桥：每次调用
+// 都必须重读 work-dir 里的配置与提示词，不能只转发 New 时的静态快照。
+func TestRuntimeSettingsLoaderReadsLatestWorkDirFiles(t *testing.T) {
+	work := t.TempDir()
+	write := func(configText, promptText string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(work, config.DefaultFile), []byte(configText), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(work, "fastimpl.prompt.md"), []byte(promptText), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("parallelism = 2\nretries = 1\nagent_cmd = 'old-agent --safe'\nrequire_review = false\nreviewer = 'gpt-reviewer'\nterminal_retention = '0s'\n", "old prompt {{.IssueNo}}\n")
+	loader := runtimeSettingsLoader(work, Options{WorkDir: work, SpecIID: 8})
+	first, err := loader(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(first.AgentArgv, " "); got != "old-agent --safe" {
+		t.Fatalf("first agent argv = %q", got)
+	}
+	if first.Template != "old prompt {{.IssueNo}}\n" || first.RequireReview {
+		t.Fatalf("first settings = %+v, want the initial files", first)
+	}
+
+	write("parallelism = 3\nretries = 4\nagent_cmd = 'new-agent --latest'\nrequire_review = true\nreviewer = 'swe-reviewer'\nterminal_retention = 'never'\n", "new prompt {{.Reviewer}}\n")
+	second, err := loader(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(second.AgentArgv, " "); got != "new-agent --latest" {
+		t.Fatalf("second agent argv = %q, want the latest saved config", got)
+	}
+	if second.Parallelism != 3 || second.Retries != 4 || !second.RequireReview || second.Reviewer != "swe-reviewer" || second.TerminalRetention != "never" {
+		t.Fatalf("second settings = %+v, want the latest saved config", second)
+	}
+	if second.Template != "new prompt {{.Reviewer}}\n" {
+		t.Fatalf("second template = %q, want the latest saved prompt", second.Template)
 	}
 }

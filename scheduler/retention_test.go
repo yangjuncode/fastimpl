@@ -165,7 +165,7 @@ func TestRetainedTerminalReconcileAndReuse(t *testing.T) {
 	if !rt.StartedAt.Equal(started) || !rt.FinishedAt.Equal(completed) {
 		t.Fatalf("restored retained times = %v .. %v, want %v .. %v", rt.StartedAt, rt.FinishedAt, started, completed)
 	}
-	got, reused, err := s.claimRetainedTerminal(context.Background(), key, 9, false, termName, repoDir)
+	got, reused, err := s.claimRetainedTerminal(context.Background(), key, 9, false, termName, repoDir, []string{"devin"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestClaimExpiredRetainedTerminalCleansBeforeStart(t *testing.T) {
 	if err := writeRetainedMeta(path, meta); err != nil {
 		t.Fatal(err)
 	}
-	got, reused, err := s.claimRetainedTerminal(context.Background(), key, 9, false, termName, repoDir)
+	got, reused, err := s.claimRetainedTerminal(context.Background(), key, 9, false, termName, repoDir, []string{"devin"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestClaimRetainedTerminalRejectsProcessIdentityMismatch(t *testing.T) {
 	if err := writeRetainedMeta(path, meta); err != nil {
 		t.Fatal(err)
 	}
-	got, reused, err := s.claimRetainedTerminal(context.Background(), key, 9, false, termName, repoDir)
+	got, reused, err := s.claimRetainedTerminal(context.Background(), key, 9, false, termName, repoDir, []string{"devin"})
 	if err == nil || reused || got != "" {
 		t.Fatalf("claimRetainedTerminal = %q,%v,%v, want process identity mismatch rejected", got, reused, err)
 	}

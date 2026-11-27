@@ -295,7 +295,7 @@ func SaveWorkDirCopy(workDir string, cfg Config) (string, error) {
 		return "", err
 	}
 	path := filepath.Join(abs, DefaultFile)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := files.WriteFileAtomic(path, data, 0o644); err != nil {
 		return "", fmt.Errorf("write config %s: %w", path, err)
 	}
 	return path, nil

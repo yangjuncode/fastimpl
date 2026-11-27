@@ -93,7 +93,7 @@ func agentArgvHash(argv []string) string {
 }
 
 func (s *Scheduler) retentionPolicy() (time.Duration, bool) {
-	delay, never, err := config.ParseTerminalRetention(s.cfg.TerminalRetention)
+	delay, never, err := config.ParseTerminalRetention(s.currentRuntimeSettings(context.Background()).TerminalRetention)
 	if err != nil {
 		return 0, false
 	}
@@ -193,7 +193,7 @@ func (s *Scheduler) cleanupRetained(id terminalID) {
 }
 
 // retainTerminal 在任务成功完成后按 terminal_retention 保留终端。
-func (s *Scheduler) retainTerminal(key graph.Key, issueIID int, integration bool, addr, termName, cwd, branch, commit string) {
+func (s *Scheduler) retainTerminal(key graph.Key, issueIID int, integration bool, addr, termName, cwd, branch, commit string, agentArgv []string) {
 	delay, never := s.retentionPolicy()
 	if delay == 0 && !never {
 		return
@@ -221,7 +221,7 @@ func (s *Scheduler) retainTerminal(key graph.Key, issueIID int, integration bool
 		Cwd:          CanonicalRepoPath(cwd),
 		Branch:       branch,
 		Commit:       commit,
-		AgentHash:    agentArgvHash(s.agentArgv),
+		AgentHash:    agentArgvHash(agentArgv),
 		StartedAt:    startedAt,
 		CompletedAt:  completedAt,
 		CleanupAt:    cleanupAt,
@@ -292,7 +292,7 @@ func (s *Scheduler) reconcileRetained(ctx context.Context) {
 	}
 }
 
-func (s *Scheduler) staticRetainedMatch(meta retainedTerminalMeta, issueIID int, integration bool, termName, cwd string) bool {
+func (s *Scheduler) staticRetainedMatch(meta retainedTerminalMeta, issueIID int, integration bool, termName, cwd string, agentArgv []string) bool {
 	return meta.Version == 1 &&
 		meta.RepoDir == CanonicalRepoPath(s.repo.Root) &&
 		meta.SpecIID == s.specIID &&
@@ -300,12 +300,12 @@ func (s *Scheduler) staticRetainedMatch(meta retainedTerminalMeta, issueIID int,
 		meta.Integration == integration &&
 		meta.TerminalName == termName &&
 		meta.Cwd == CanonicalRepoPath(cwd) &&
-		meta.AgentHash == agentArgvHash(s.agentArgv)
+		meta.AgentHash == agentArgvHash(agentArgv)
 }
 
 // claimRetainedTerminal 尝试把上一轮成功完成时保留的同 issue 终端转成
 // 本轮 active worker。默认复用；身份不匹配或已过期时不静默误用。
-func (s *Scheduler) claimRetainedTerminal(ctx context.Context, key graph.Key, issueIID int, integration bool, termName, cwd string) (string, bool, error) {
+func (s *Scheduler) claimRetainedTerminal(ctx context.Context, key graph.Key, issueIID int, integration bool, termName, cwd string, agentArgv []string) (string, bool, error) {
 	path := retainedMetaPath(s.repo.Root, s.specIID, issueIID, integration)
 	meta, err := readRetainedMeta(path)
 	if err != nil {
@@ -331,7 +331,7 @@ func (s *Scheduler) claimRetainedTerminal(ctx context.Context, key graph.Key, is
 		s.runtime.clearAddr(key)
 		return "", false, nil
 	}
-	if !s.staticRetainedMatch(meta, issueIID, integration, termName, cwd) {
+	if !s.staticRetainedMatch(meta, issueIID, integration, termName, cwd, agentArgv) {
 		return "", false, fmt.Errorf("retained terminal %s cannot be reused after agent/cwd/name change; inspect it with hc attach %s", meta.TerminalName, meta.TerminalName)
 	}
 	s.cancelRetained(id)

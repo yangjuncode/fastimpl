@@ -578,7 +578,7 @@ func (c *Client) Note(ctx context.Context, repoID, num int, message string) erro
 
 // EnsureMR 确保 sourceBranch → targetBranch 的 PR 存在：
 // 已有 open PR 返回其 html_url；否则经 REST 创建并返回 html_url。
-func (c *Client) EnsureMR(ctx context.Context, repoID int, sourceBranch, targetBranch, title string) (string, error) {
+func (c *Client) EnsureMR(ctx context.Context, repoID int, sourceBranch, targetBranch, title, description string) (string, error) {
 	path, err := c.repoPath(ctx, repoID)
 	if err != nil {
 		return "", err
@@ -600,7 +600,8 @@ func (c *Client) EnsureMR(ctx context.Context, repoID int, sourceBranch, targetB
 	raw, err = c.api(ctx, "-X", "POST", "repos/"+path+"/pulls",
 		"-f", "head="+sourceBranch,
 		"-f", "base="+targetBranch,
-		"-f", "title="+title)
+		"-f", "title="+title,
+		"-f", "body="+description)
 	if err != nil {
 		return "", fmt.Errorf("create pull request %s -> %s: %w", sourceBranch, targetBranch, err)
 	}

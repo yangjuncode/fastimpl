@@ -80,7 +80,7 @@ func SaveWorkDirCopy(workDir, text string) (string, error) {
 		return "", fmt.Errorf("resolve work-dir %s: %w", workDir, err)
 	}
 	path := filepath.Join(abs, DefaultFile)
-	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+	if err := files.WriteFileAtomic(path, []byte(text), 0o644); err != nil {
 		return "", fmt.Errorf("write prompt template %s: %w", path, err)
 	}
 	return path, nil

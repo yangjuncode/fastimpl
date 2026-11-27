@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -201,7 +203,7 @@ func (f *fakeForge) Note(ctx context.Context, projectID, iid int, message string
 	return nil
 }
 
-func (f *fakeForge) EnsureMR(ctx context.Context, projectID int, sourceBranch, targetBranch, title string) (string, error) {
+func (f *fakeForge) EnsureMR(ctx context.Context, projectID int, sourceBranch, targetBranch, title, description string) (string, error) {
 	return "http://mr/1", nil
 }
 
@@ -410,6 +412,17 @@ func TestSchedulerRun(t *testing.T) {
 	sessions.mu.Unlock()
 	if started != 2 {
 		t.Fatalf("workers started = %d, want 2 (#11 must not start)", started)
+	}
+	// 集成并关闭远端 issue 后，内存图应立刻同步 Closed=true，
+	// 无需等待周期性 refreshStates（尤其是最后一个任务）。
+	for _, iid := range []int{9, 10} {
+		n, ok := g.Lookup(graph.Key{ProjectID: 1, IID: iid})
+		if !ok {
+			t.Fatalf("node #%d missing from graph", iid)
+		}
+		if n.State != graph.Integrated || !n.Closed {
+			t.Errorf("node #%d = {State:%v Closed:%v}, want {State:integrated Closed:true}", iid, n.State, n.Closed)
+		}
 	}
 	// 集成 worktree 应包含两个任务的合并提交与文件。
 	for _, f := range []string{"task9.txt", "task10.txt"} {
@@ -882,5 +895,164 @@ func TestWorkerPromptIncludesPrefetchedIssueContext(t *testing.T) {
 	}
 	if strings.Contains(text, "读取任务正文和评论") {
 		t.Errorf("worker prompt still tells the agent to read body/comments from forge")
+	}
+}
+
+// loader 返回的新 agent 命令、模板与审核配置必须用于之后启动的 worker，
+// 而不是 New 时那份静态快照。
+func TestSchedulerHotReloadsSettingsForNewWorker(t *testing.T) {
+	taskLockDir(t)
+	base := &fakeSessions{}
+	sessions := &commitSessions{fakeSessions: base, t: t}
+	s, _, _ := runnableTask(t, &fakeForge{}, sessions, nil)
+	s.SetRuntimeSettingsLoader(func(context.Context) (RuntimeSettings, error) {
+		return RuntimeSettings{
+			Parallelism:       1,
+			Retries:           2,
+			AgentArgv:         []string{"hot-agent", "--latest"},
+			RequireReview:     true,
+			Reviewer:          "swe-reviewer",
+			TerminalRetention: "0s",
+			Template:          "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}| reviewer={{.Reviewer}} review={{.RequireReview}}",
+		}, nil
+	})
+	if err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	base.mu.Lock()
+	started := append([]worker.Params(nil), base.started...)
+	var prompts []string
+	for _, got := range base.prompts {
+		prompts = append(prompts, got...)
+	}
+	base.mu.Unlock()
+	if len(started) != 1 {
+		t.Fatalf("workers started = %d, want 1", len(started))
+	}
+	if got := strings.Join(started[0].Argv, " "); got != "hot-agent --latest" {
+		t.Fatalf("worker argv = %q, want the hot-reloaded agent command", got)
+	}
+	if len(prompts) == 0 {
+		t.Fatal("worker received no prompt")
+	}
+	for _, want := range []string{"reviewer=swe-reviewer", "review=true"} {
+		if !strings.Contains(prompts[0], want) {
+			t.Errorf("hot-reloaded prompt lacks %q:\n%s", want, prompts[0])
+		}
+	}
+}
+
+// delayedReportSessions 第一次检查时没有报告标记；收到续写提示词后
+// 才把该令牌写到屏幕上，用来验证续写 prompt 的热更新内容。
+type delayedReportSessions struct {
+	*commitSessions
+	onFirstPrompt func()
+	once          sync.Once
+}
+
+func (d *delayedReportSessions) Prompt(ctx context.Context, addr, text string) (uint64, error) {
+	turn, err := d.commitSessions.fakeSessions.Prompt(ctx, addr, text)
+	if err == nil {
+		d.once.Do(d.onFirstPrompt)
+	}
+	return turn, err
+}
+
+func (d *delayedReportSessions) ReadScreen(ctx context.Context, addr string, lines int) (string, bool, error) {
+	d.commitSessions.fakeSessions.mu.Lock()
+	promptCount := len(d.commitSessions.fakeSessions.prompts[addr])
+	token := d.commitSessions.fakeSessions.tokens[addr]
+	d.commitSessions.fakeSessions.mu.Unlock()
+	if promptCount < 2 {
+		return "worker is still implementing\n", true, nil
+	}
+	return fmt.Sprintf("done\n%s %s\nverified\n", worker.ReadyMarker, token), true, nil
+}
+
+// 续写重试也读取最新设置：首轮 prompt 之后把 require_review 改为 true，
+// 第一次续写就必须包含“两轮审核”，而不是沿用调度开始时的 false。
+func TestSchedulerHotReloadsRequireReviewForContinuePrompt(t *testing.T) {
+	taskLockDir(t)
+	base := &fakeSessions{}
+	commits := &commitSessions{fakeSessions: base, t: t}
+	var requireReview atomic.Bool
+	sessions := &delayedReportSessions{
+		commitSessions: commits,
+		onFirstPrompt:  func() { requireReview.Store(true) },
+	}
+	s, _, _ := runnableTask(t, &fakeForge{}, sessions, nil)
+	s.SetRuntimeSettingsLoader(func(context.Context) (RuntimeSettings, error) {
+		return RuntimeSettings{
+			Parallelism:       1,
+			Retries:           2,
+			AgentArgv:         []string{"devin"},
+			RequireReview:     requireReview.Load(),
+			Reviewer:          "gpt-reviewer",
+			TerminalRetention: "0s",
+			Template:          "{{.IssueNo}}|{{.Token}}|{{.SpecNo}}",
+		}, nil
+	})
+	if err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	base.mu.Lock()
+	var prompts []string
+	for _, got := range base.prompts {
+		prompts = append(prompts, got...)
+	}
+	base.mu.Unlock()
+	if len(prompts) < 2 {
+		t.Fatalf("prompt count = %d, want the initial prompt plus one continue prompt", len(prompts))
+	}
+	if strings.Contains(prompts[0], "两轮审核") {
+		t.Fatalf("initial prompt unexpectedly contains the review requirement:\n%s", prompts[0])
+	}
+	if !strings.Contains(prompts[1], "两轮审核") {
+		t.Fatalf("continue prompt did not use the hot-reloaded require_review:\n%s", prompts[1])
+	}
+}
+
+// 运行中读到一份非法配置或文件暂时不可读时，不能让已经在跑的任务
+// 立刻失败；scheduler 必须继续用最后一次成功加载的快照。
+func TestRuntimeSettingsLoaderFallsBackToLastGoodSnapshot(t *testing.T) {
+	taskLockDir(t)
+	s, _, _ := runnableTask(t, &fakeForge{}, &fakeSessions{}, nil)
+	valid := RuntimeSettings{
+		Parallelism:       3,
+		Retries:           2,
+		AgentArgv:         []string{"hot-agent", "--latest"},
+		RequireReview:     true,
+		Reviewer:          "swe-reviewer",
+		TerminalRetention: "0s",
+		Template:          "hot template",
+	}
+	var step atomic.Int32
+	s.SetRuntimeSettingsLoader(func(context.Context) (RuntimeSettings, error) {
+		switch step.Load() {
+		case 0:
+			return valid, nil
+		case 1:
+			bad := valid
+			bad.Parallelism = 0
+			return bad, nil
+		default:
+			return RuntimeSettings{}, errors.New("config temporarily unreadable")
+		}
+	})
+
+	if got := s.currentRuntimeSettings(context.Background()); got.Parallelism != 3 || got.Template != "hot template" {
+		t.Fatalf("first runtime settings = %+v, want the valid hot snapshot", got)
+	}
+	step.Store(1)
+	got := s.currentRuntimeSettings(context.Background())
+	if got.Parallelism != 3 || got.Template != "hot template" || strings.Join(got.AgentArgv, " ") != "hot-agent --latest" {
+		t.Fatalf("invalid settings did not fall back to the last good snapshot: %+v", got)
+	}
+	step.Store(2)
+	got = s.currentRuntimeSettings(context.Background())
+	if got.Parallelism != 3 || got.Template != "hot template" || strings.Join(got.AgentArgv, " ") != "hot-agent --latest" {
+		t.Fatalf("loader error did not fall back to the last good snapshot: %+v", got)
 	}
 }

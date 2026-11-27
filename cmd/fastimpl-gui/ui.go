@@ -25,9 +25,10 @@ import (
 type model struct {
 	cx      *core.Scope
 	session *session
-	// opts 是这次运行从命令行得到的选项；界面上的仓库目录覆盖只写进
-	// 这里的新副本，绝不持久化。
-	opts app.Options
+	// opts 是本次运行使用的选项；initialOpts 保留命令行初始入参，用于区分
+	// 命令行一次性 -repo-dir 覆盖与用户在界面中的选择。
+	opts        app.Options
+	initialOpts app.Options
 
 	mu   sync.Mutex
 	snap snapshot
@@ -51,9 +52,31 @@ type model struct {
 	// issueText 是录入的 issue 编号。
 	issueText *core.Signal[string]
 	// workText、repoText、treeText 是三个目录：工作目录、仓库目录、
-	// worktree 目录。自动解析成功的值会预填进来；用户改过的值只用于
-	// 本次运行，绝不写回配置。
+	// worktree 目录。自动解析成功的值会预填进来；当工作目录与仓库目录
+	// 不一致且用户在界面选定仓库后，会重新查找 worktree 并保存到
+	// <work-dir>/fastimpl.toml，方便下次打开直接复用。
 	workText, repoText, treeText *core.Signal[string]
+	// repoCandidates / treeCandidates 是自动搜索在工作目录或仓库下发现的
+	// 多个候选目录，供用户在启动表单直接点击选择；candidatesRev 在列表变化时递增。
+	candidatesRev         *core.Signal[int]
+	repoCandidates        []string
+	repoCandidatesWorkDir string
+	treeCandidates        []string
+	treeCandidatesRepoDir string
+	// pathSaveHint 展示跨目录配置自动写回 <work-dir>/fastimpl.toml 的结果。
+	pathSaveHint *core.Signal[string]
+	// persistSeq / persistedSeq 跟踪用户主动触发的路径预览，确保预览落定后
+	// 最多写盘一次；lastDiscovered* 避免输入框无改动失焦时重复发现；
+	// lastSaved* 避免同一组目录重复写盘。
+	persistSeq         uint64
+	persistedSeq       uint64
+	persistTreeOnly    bool
+	lastDiscoveredWork string
+	lastDiscoveredRepo string
+	lastDiscoveredTree string
+	lastSavedWork      string
+	lastSavedRepo      string
+	lastSavedTree      string
 	// settingsOpen 控制设置对话框；settings 持有配置与提示词编辑状态。
 	settingsOpen *core.Signal[bool]
 	settings     *settingsModel
@@ -95,24 +118,26 @@ const (
 // newModel 组装界面模型：它接管会话的事件，并在界面线程上合并刷新。
 func newModel(cx *core.Scope, s *session, opts app.Options) *model {
 	m := &model{
-		cx: cx, session: s, opts: opts,
-		rev:          core.NewSignal(cx, 0),
-		structureRev: core.NewSignal(cx, 0),
-		termsRev:     core.NewSignal(cx, 0),
-		issueText:    core.NewSignal(cx, ""),
-		workText:     core.NewSignal(cx, ""),
-		repoText:     core.NewSignal(cx, ""),
-		treeText:     core.NewSignal(cx, ""),
-		settingsOpen: core.NewSignal(cx, false),
-		tab:          core.NewSignal(cx, pageGraph),
-		selected:     core.NewSignal(cx, ""),
-		cam:          &camera.State{},
-		flowState:    &uiflow.State{},
-		now:          core.NewSignal(cx, cx.WallTime()),
-		logScroll:    &core.Ref{},
-		logFollowing: core.NewSignal(cx, true),
-		logCopied:    core.NewSignal(cx, false),
-		termCopied:   core.NewSignal(cx, false),
+		cx: cx, session: s, opts: opts, initialOpts: opts,
+		rev:           core.NewSignal(cx, 0),
+		structureRev:  core.NewSignal(cx, 0),
+		termsRev:      core.NewSignal(cx, 0),
+		candidatesRev: core.NewSignal(cx, 0),
+		issueText:     core.NewSignal(cx, ""),
+		workText:      core.NewSignal(cx, ""),
+		repoText:      core.NewSignal(cx, ""),
+		treeText:      core.NewSignal(cx, ""),
+		pathSaveHint:  core.NewSignal(cx, ""),
+		settingsOpen:  core.NewSignal(cx, false),
+		tab:           core.NewSignal(cx, pageGraph),
+		selected:      core.NewSignal(cx, ""),
+		cam:           &camera.State{},
+		flowState:     &uiflow.State{},
+		now:           core.NewSignal(cx, cx.WallTime()),
+		logScroll:     &core.Ref{},
+		logFollowing:  core.NewSignal(cx, true),
+		logCopied:     core.NewSignal(cx, false),
+		termCopied:    core.NewSignal(cx, false),
 	}
 	m.post = cx.Post
 	// 轻量界面时钟只更新一个信号；tooltip 通过它重算工作时长。root scope
@@ -219,6 +244,7 @@ func (m *model) sync() {
 	if snap.Paths.TreeDir != "" && m.treeText.GetUntracked() == "" {
 		m.treeText.Set(snap.Paths.TreeDir)
 	}
+	m.syncPathDiscovery(snap)
 	if snap.RepoError != nil && !m.settingsOpen.GetUntracked() {
 		if repo := snap.RepoError.Dir; repo != "" && m.repoText.GetUntracked() == "" {
 			m.repoText.Set(repo)
@@ -234,7 +260,7 @@ func (m *model) sync() {
 	}
 	// 空 issue 启动时优先恢复本仓库 active worker：死 supervisor 的可接管
 	// 现场自动继续；活 supervisor 只读观察；心跳卡住/阶段不明则保守提示。
-	// 显式输入/传入 spec 时只看同一 spec 的 active run：无关 spec 仍在跑
+	// 显式输入/传入 spec 时只看同一个 spec 的 active run：无关 spec 仍在跑
 	// 不应劫持这次明确启动。
 	activeRuns := snap.ActiveRuns
 	if text := strings.TrimSpace(m.issueText.GetUntracked()); text != "" {
@@ -329,6 +355,7 @@ func (m *model) start() {
 	opts.WorkDir = strings.TrimSpace(m.workText.GetUntracked())
 	opts.RepoDir = strings.TrimSpace(m.repoText.GetUntracked())
 	opts.TreeDir = strings.TrimSpace(m.treeText.GetUntracked())
+	m.persistStartPaths(opts)
 	if err := m.session.Start(opts); err != nil {
 		m.session.failLocal(err)
 		m.notify()
@@ -496,8 +523,7 @@ func (m *model) statusText() core.Node {
 		}}
 }
 
-// pickDir 打开系统的目录选择器，把选中的目录写进对应的输入框。三个
-// 目录各有自己的按钮；写入只影响本次运行。
+// pickDir 打开系统的目录选择器，把选中的目录交给 set 处理。
 func (m *model) pickDir(title string, start func() string, set func(string)) {
 	m.cx.PickDirectories(core.PickDirectoriesOptions{Title: title, Start: start()},
 		func(dirs []core.Directory, err error) {
@@ -510,19 +536,23 @@ func (m *model) pickDir(title string, start func() string, set func(string)) {
 		})
 }
 
-// pickRepo 选仓库主 checkout（必须是仓库顶层）。
+// pickRepo 选仓库主 checkout（必须是仓库顶层），选定后重新查找 Work Tree 目录并按需保存配置。
 func (m *model) pickRepo() {
-	m.pickDir("选择仓库顶层目录", m.repoText.GetUntracked, m.repoText.Set)
+	m.pickDir("选择仓库顶层目录",
+		func() string { return pickStartDir(m.repoText.GetUntracked(), m.workText.GetUntracked()) },
+		m.selectRepo)
 }
 
-// pickTree 选 worktree 父目录。
+// pickTree 选 worktree 父目录，选定后重新校验并按需保存配置。
 func (m *model) pickTree() {
-	m.pickDir("选择 Work Tree 目录", m.treeText.GetUntracked, m.treeText.Set)
+	m.pickDir("选择 Work Tree 目录",
+		func() string { return pickStartDir(m.treeText.GetUntracked(), m.repoText.GetUntracked()) },
+		m.selectTree)
 }
 
-// pickWork 选 fastimpl 工作目录。
+// pickWork 选 fastimpl 工作目录，选定后按新工作目录重新发现。
 func (m *model) pickWork() {
-	m.pickDir("选择工作目录", m.workText.GetUntracked, m.workText.Set)
+	m.pickDir("选择工作目录", m.workText.GetUntracked, m.selectWork)
 }
 
 // tabs 是图页与终端页的切换条。
@@ -642,7 +672,7 @@ func (m *model) terminalTooltipSummary(tab *termTab) string {
 }
 
 // terminalTooltip 组出一个终端的详细信息。所有字段都来自快照副本；
-// 运行中时长时间读取界面时钟信号，因此 tooltip 打开时也会每秒更新。
+// 运行中时长读取界面时钟信号，因此 tooltip 打开时也会每秒更新。
 func (m *model) terminalTooltip(tab *termTab) string {
 	now := m.now.Get()
 	m.rev.Get()
@@ -999,8 +1029,12 @@ func (m *model) emptyState() core.Node {
 		switch {
 		case s.PathErr != nil:
 			return "无法读取工作目录或配置：" + attentionSummary(s.PathErr.Error())
+		case s.RepoPathErr != nil && len(s.RepoCandidates) > 0:
+			return "工作目录附近检测到多个仓库，请在上方列表中选择一个仓库目录"
 		case s.RepoPathErr != nil:
 			return "仓库目录无法自动解析，请填写或选择仓库顶层目录"
+		case s.TreePathErr != nil && len(s.TreeCandidates) > 0:
+			return "检测到多个 Work Tree 目录，请在上方列表中选择一个"
 		case s.TreePathErr != nil:
 			return "Work Tree 目录无法自动解析，请填写或选择"
 		case s.PathsReady:
@@ -1022,28 +1056,36 @@ func (m *model) emptyState() core.Node {
 						core.Text{Content: "输入 spec issue 编号与三个目录，先构建依赖图", MaxLines: 2,
 							Style: ui.TypeTitle, StyleFunc: ui.Colored(colors.Text)},
 					}},
-					m.formRow("issue", "spec issue 编号", m.issueText.Get, m.issueText.Set, nil, nil, "form-issue"),
-					m.formRow("工作目录", "fastimpl 运行目录", m.workText.Get, m.workText.Set, m.pickWork, nil, "form-work"),
-					m.formRow("仓库目录", "目标仓库顶层目录", m.repoText.Get, m.repoText.Set, m.pickRepo, m.repoPathErrText, "form-repo"),
-					m.formRow("Work Tree 目录", "worktree 父目录", m.treeText.Get, m.treeText.Set, m.pickTree, m.treePathErrText, "form-tree"),
+					m.formRow("issue", "spec issue 编号", m.issueText.Get, m.issueText.Set, nil, nil, nil, "form-issue"),
+					m.formRow("工作目录", "fastimpl 运行目录", m.workText.Get, m.workText.Set, m.commitWorkInput, m.pickWork, nil, "form-work"),
+					m.formRow("仓库目录", "目标仓库顶层目录", m.repoText.Get, m.repoText.Set, m.commitRepoInput, m.pickRepo, m.repoPathErrText, "form-repo"),
+					m.repoCandidatesSection(),
+					m.formRow("Work Tree 目录", "worktree 父目录", m.treeText.Get, m.treeText.Set, m.commitTreeInput, m.pickTree, m.treePathErrText, "form-tree"),
+					m.treeCandidatesSection(),
 					core.View{Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: 10}, Children: []core.Node{
 						ui.Spacer{},
 						ui.Button{Text: "构建依赖图", Variant: ui.ButtonPrimary, Icon: lucide.Workflow, OnPress: m.start, TestID: "empty-start"},
 					}},
 					core.Text{ContentFunc: hint, MaxLines: 3, Style: ui.TypeCaption.Merge(core.Style{TextAlign: core.TextAlignCenter}),
 						StyleFunc: ui.Colored(colors.Muted), TestID: "form-hint"},
+					m.pathSaveHintSection(),
 				}},
 		}}
 }
 
 // formRow 是启动表单里的一行：标签、输入框，可选的目录选择按钮，以及
-// 该行自己的错误说明。pick 为 nil 时没有选择按钮（issue 编号用）。
-func (m *model) formRow(label, placeholder string, value func() string, set func(string), pick func(), errText func() string, testID string) core.Node {
+// 该行自己的错误说明。pick 为 nil 时没有选择按钮（issue 编号用）；
+// onCommit 在回车或失焦时触发，用于手输路径后重新查找。
+func (m *model) formRow(label, placeholder string, value func() string, set func(string), onCommit func(), pick func(), errText func() string, testID string) core.Node {
 	colors := ui.ColorsOf(m.cx)
+	input := ui.Input{Value: value, OnChange: set, Placeholder: placeholder, TestID: testID}
+	if onCommit != nil {
+		input.OnSubmit = func(string) { onCommit() }
+		input.OnBlur = onCommit
+	}
 	children := []core.Node{
 		ui.Text(label, 11, ui.Medium, colors.Muted),
-		core.View{Style: core.Style{FlexGrow: 1, MinWidth: core.Pt(0)}, Children: []core.Node{
-			ui.Input{Value: value, OnChange: set, Placeholder: placeholder, TestID: testID}}},
+		core.View{Style: core.Style{FlexGrow: 1, MinWidth: core.Pt(0)}, Children: []core.Node{input}},
 	}
 	if pick != nil {
 		children = append(children, ui.Button{Variant: ui.ButtonSecondary, Text: "选择", Icon: lucide.FolderOpen,
@@ -1060,17 +1102,18 @@ func (m *model) formRow(label, placeholder string, value func() string, set func
 	return core.Group(rows)
 }
 
-// repoPathErrText 是仓库目录那一行的错误说明。
+// repoPathErrText 是仓库目录那一行的错误说明；多仓库歧义时下方已有候选列表，
+// 这里不重复倾倒冗长的逗号分隔路径报错。
 func (m *model) repoPathErrText() string {
-	if s := m.snapshot(); s.RepoPathErr != nil && s.Paths.RepoDir == "" {
+	if s := m.snapshot(); s.RepoPathErr != nil && s.Paths.RepoDir == "" && len(s.RepoCandidates) == 0 {
 		return attentionSummary(s.RepoPathErr.Error())
 	}
 	return ""
 }
 
-// treePathErrText 是 Work Tree 目录那一行的错误说明。
+// treePathErrText 是 Work Tree 目录那一行的错误说明；多候选时下方已有选择列表。
 func (m *model) treePathErrText() string {
-	if s := m.snapshot(); s.TreePathErr != nil {
+	if s := m.snapshot(); s.TreePathErr != nil && len(s.TreeCandidates) == 0 {
 		return attentionSummary(s.TreePathErr.Error())
 	}
 	return ""

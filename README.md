@@ -342,6 +342,13 @@ usage: fastimpl-gui [-version] [-j N] [-config path] [-template path]
   TOML 参数（`instance_id` 只读，因为它是本机全局标识）；关闭对话框时
   自动把当前生效的完整配置与提示词副本保存到当前工作目录的
   `fastimpl.toml` / `fastimpl.prompt.md`，输入非法时提示且不保存。
+  保存采用原子替换；等待"开始调度"期间保存的内容会在真正开工前重读，
+  已经开始的调度也会在派发后续 worker、发送首次 prompt、续写重试与
+  终端收尾前重读可安全热更新的项（`parallelism`、`retries`、`agent_cmd`、
+  `require_review`、`reviewer`、`terminal_retention` 与提示词模板）。
+  `repo_dir`/`forge` 影响已构建的依赖图，修改后需要重新开始一轮；
+  `tree_dir`/`integration`/`hc_*` 在调度启动时定型，`instance_id`
+  是本轮恢复身份；已经启动的终端进程本身也不会替换成新的 agent 命令。
 - 仓库无法解析或 origin 不可用时弹出同一设置对话框，修正 `repo_dir`
   后可直接用它重试；其余配置/forge/API 错误只在状态栏提示。
 - 依赖图用 `ui/flow` 绘制：箭头从**前置**指向**被阻塞**的 issue，卡片

@@ -73,6 +73,10 @@ func RunObserved(ctx context.Context, opts Options, stdout, stderr io.Writer, ob
 	return run(ctx, opts, stdout, stderr, observer)
 }
 
+// buildGraphFn 是可测试的接缝：生产环境始终使用 buildGraph，测试可以
+// 替换它来把运行管线推进到调度门禁，而不访问真实 forge。
+var buildGraphFn = buildGraph
+
 // run 是 Run 与 RunObserved 共用的运行管线。
 func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer Observer) error {
 	workDir, err := resolveWorkDir(opts.WorkDir)
@@ -90,14 +94,10 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 			return err
 		}
 	}
-	cfg, err := config.Load(workDir, opts.ConfigPath)
+	cfg, err := loadRunConfig(workDir, opts)
 	if err != nil {
 		return err
 	}
-	if opts.Parallelism > 0 {
-		cfg.Parallelism = opts.Parallelism
-	}
-	cfg.SpecIID = opts.SpecIID
 	if observer.ConfigLoaded != nil {
 		observer.ConfigLoaded(cfg)
 	}
@@ -138,7 +138,7 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	forge := resolveForge(ctx, cfg.Forge, host, repoDir)
 	log.Info("building dependency graph", "forge", forge, "origin", host+"/"+projectPath, "spec", opts.SpecIID)
 	buildStart := time.Now()
-	fc, g, contexts, err := buildGraph(ctx, forge, repoDir, host, projectPath, opts.SpecIID, log, observer.Progress, !opts.Print)
+	fc, g, contexts, err := buildGraphFn(ctx, forge, repoDir, host, projectPath, opts.SpecIID, log, observer.Progress, !opts.Print)
 	if err != nil {
 		return err
 	}
@@ -195,6 +195,13 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	if err := checkActiveSpecBeforeWrites(repoDir, opts.SpecIID, time.Now()); err != nil {
 		return err
 	}
+	// GUI 的确认门禁可能敞开很久；等待期间用户在设置页保存的配置
+	// 只落在磁盘上，门禁前那份 cfg 不会自动更新。真正准备集成、连接
+	// hc 或组装 scheduler 前必须重读，确保开工使用的是最新生效配置。
+	cfg, err = loadRunConfig(workDir, opts)
+	if err != nil {
+		return fmt.Errorf("reload config before scheduling: %w", err)
+	}
 	tmpl, err := prompt.Load(workDir, opts.TemplatePath)
 	if err != nil {
 		return err
@@ -222,7 +229,8 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 		return fmt.Errorf("push integration branch %s: %w", branch, err)
 	}
 	mrURL, err := fc.EnsureMR(ctx, g.Spec().ProjectID, branch, baseName,
-		fmt.Sprintf("spec #%d integration", opts.SpecIID))
+		fmt.Sprintf("spec #%d integration", opts.SpecIID),
+		fmt.Sprintf("Close #%d", opts.SpecIID))
 	if err != nil {
 		return fmt.Errorf("ensure merge request: %w", err)
 	}
@@ -244,6 +252,7 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	log.Info("integration ready", "branch", branch, "mr", mrURL)
 	log.Info("scheduler started", "parallelism", cfg.Parallelism, "agent", agentArgv)
 	sched := scheduler.New(cfg, repo, fc, forge, g, runner, tmpl, workDir, intDir, branch, baseName, agentArgv, log)
+	sched.SetRuntimeSettingsLoader(runtimeSettingsLoader(workDir, opts))
 	if observer.SchedulerReady != nil {
 		// 调度尚未启动：GUI 此时才能拿到 scheduler，并且在第一个 worker
 		// 起来之前就装上自己的刷新循环与终端连接方式。
@@ -327,6 +336,52 @@ func initFiles(workDir string, out io.Writer) error {
 		fmt.Fprintf(out, "wrote %s\n", dst)
 	}
 	return nil
+}
+
+// loadRunConfig 读取一次运行当前生效的配置，并叠加命令行覆盖。
+// 初次加载与调度门禁后的重读必须走同一个入口，否则 -j 或恢复出的
+// spec IID 会在重读时丢失。
+func loadRunConfig(workDir string, opts Options) (config.Config, error) {
+	cfg, err := config.Load(workDir, opts.ConfigPath)
+	if err != nil {
+		return config.Config{}, err
+	}
+	if opts.Parallelism > 0 {
+		cfg.Parallelism = opts.Parallelism
+	}
+	cfg.SpecIID = opts.SpecIID
+	return cfg, nil
+}
+
+// runtimeSettingsLoader 给 scheduler 提供可安全热更新的任务设置。
+// 每次调用都重新读 work-dir 配置与提示词，因此 GUI 设置页保存后，
+// 后续新 worker、首次 prompt、续写重试与终端收尾会使用最新值。
+// repo/forge/hc/instance/integration 不在快照里：它们已经在本轮的
+// 构图、连接或恢复身份中消费，不能热切换。
+func runtimeSettingsLoader(workDir string, opts Options) scheduler.RuntimeSettingsLoader {
+	return func(context.Context) (scheduler.RuntimeSettings, error) {
+		cfg, err := loadRunConfig(workDir, opts)
+		if err != nil {
+			return scheduler.RuntimeSettings{}, err
+		}
+		tmpl, err := prompt.Load(workDir, opts.TemplatePath)
+		if err != nil {
+			return scheduler.RuntimeSettings{}, err
+		}
+		agentArgv, err := cfg.AgentArgv()
+		if err != nil {
+			return scheduler.RuntimeSettings{}, err
+		}
+		return scheduler.RuntimeSettings{
+			Parallelism:       cfg.Parallelism,
+			Retries:           cfg.Retries,
+			AgentArgv:         agentArgv,
+			RequireReview:     cfg.RequireReview,
+			Reviewer:          cfg.ReviewerName(),
+			TerminalRetention: cfg.TerminalRetention,
+			Template:          tmpl,
+		}, nil
+	}
 }
 
 // resolveWorkDir 解析工作目录：空取当前目录，结果转绝对路径。

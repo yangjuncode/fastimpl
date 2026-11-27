@@ -173,7 +173,7 @@ func (g *Graph) SetState(k Key, s State) {
 	}
 }
 
-// SetClosed 标记节点在 forge 上的开关状态（周期性刷新的结果）。
+// SetClosed 标记节点在 forge 上的开关状态（集成关闭或周期性刷新的结果）。
 func (g *Graph) SetClosed(k Key, closed bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

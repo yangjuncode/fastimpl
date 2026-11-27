@@ -48,6 +48,30 @@ type Sessions interface {
 	WaitTurn(ctx context.Context, addr string, baseline uint64, budget time.Duration) (worker.Record, error)
 }
 
+// RuntimeSettings 是一轮运行中可以安全热更新的任务参数快照。
+// 它不含 repo/forge/hc/instance/integration 这类已经在构图、连接或
+// 恢复身份里消费的字段；这些字段在一轮运行中保持固定。
+type RuntimeSettings struct {
+	// Parallelism 是后续派发 worker 的并发上限；已经在跑的任务不受影响。
+	Parallelism int
+	// Retries 是首次尝试之外的续写/冲突重试次数。
+	Retries int
+	// AgentArgv 是之后新启动 worker/integration agent 的命令行。
+	AgentArgv []string
+	// RequireReview 控制首次 prompt 与续写 prompt 是否要求双审。
+	RequireReview bool
+	// Reviewer 是首次 prompt 模板里的第三方 reviewer（已解析默认值）。
+	Reviewer string
+	// TerminalRetention 是任务收尾时的终端保留策略。
+	TerminalRetention string
+	// Template 是之后首次 worker prompt 使用的模板文本。
+	Template string
+}
+
+// RuntimeSettingsLoader 读取一份新的热更新快照。实现方应只读本地
+// 文件/内存并快速返回；调度器会在派发、prompt 与重试边界调用它。
+type RuntimeSettingsLoader func(context.Context) (RuntimeSettings, error)
+
 // TaskRuntime 是调度器维护的每个任务的运行数据。
 type TaskRuntime struct {
 	// Key 是任务身份；集成专用 agent 用 spec 的 Key。
@@ -91,8 +115,9 @@ type Scheduler struct {
 	integrate sync.Mutex         // 集成分支上的 merge/push 串行化
 	// 以下两个字段只在 integrate 锁内读写（stopIntegrationAgent 在
 	// Run 结束后、所有任务 goroutine 退出后读取，无竞争）。
-	intAddr   string // 集成专属 agent 终端地址；空表示未启动
-	baseStuck bool   // base 冲突 agent 也未能解决，跳过后续同步
+	intAddr      string   // 集成专属 agent 终端地址；空表示未启动
+	intAgentArgv []string // 集成专属终端的实际 agent argv，供保留 metadata 精确记录
+	baseStuck    bool     // base 冲突 agent 也未能解决，跳过后续同步
 	// claimWait 是发 claim 标记后的短等待，claimRecheck 是运行期复查
 	// 评论的间隔；测试注入 0/短间隔。
 	claimWait    time.Duration
@@ -105,6 +130,13 @@ type Scheduler struct {
 	retained         map[terminalID]*retainedTerminal
 	retentionMu      sync.Mutex
 	retentionChanged chan struct{}
+	// runtimeSettingsValue/loader 保存热更新设置。loader 为空时使用
+	// New 收到的静态 cfg/template/agentArgv；loader 失败时回退到最后
+	// 一份成功加载的快照，避免一次手动写坏文件就打爆已经在跑的任务。
+	runtimeSettingsMu     sync.Mutex
+	runtimeSettingsValue  RuntimeSettings
+	runtimeSettingsLoader RuntimeSettingsLoader
+	runtimeSettingsErr    string
 	// activeHeartbeat 是测试可缩短的 active metadata heartbeat 间隔。
 	activeHeartbeat time.Duration
 }
@@ -117,27 +149,98 @@ func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, forgeName string
 		log = slog.Default()
 	}
 	return &Scheduler{
-		cfg:              cfg,
-		repo:             repo,
-		forge:            f,
-		forgeName:        forgeName,
-		g:                g,
-		sessions:         sessions,
-		template:         template,
-		workDir:          workDir,
-		intDir:           intDir,
-		log:              log,
-		specIID:          g.Spec().IID,
-		branch:           intBranch,
-		baseName:         baseName,
-		agentArgv:        agentArgv,
-		warned:           make(map[graph.Key]bool),
-		claimWait:        DefaultClaimWait,
-		claimRecheck:     DefaultClaimRecheck,
-		retained:         make(map[terminalID]*retainedTerminal),
-		retentionChanged: make(chan struct{}),
-		activeHeartbeat:  ActiveHeartbeatInterval,
+		cfg:                  cfg,
+		repo:                 repo,
+		forge:                f,
+		forgeName:            forgeName,
+		g:                    g,
+		sessions:             sessions,
+		template:             template,
+		workDir:              workDir,
+		intDir:               intDir,
+		log:                  log,
+		specIID:              g.Spec().IID,
+		branch:               intBranch,
+		baseName:             baseName,
+		agentArgv:            agentArgv,
+		warned:               make(map[graph.Key]bool),
+		claimWait:            DefaultClaimWait,
+		claimRecheck:         DefaultClaimRecheck,
+		retained:             make(map[terminalID]*retainedTerminal),
+		retentionChanged:     make(chan struct{}),
+		runtimeSettingsValue: runtimeSettingsFromConfig(cfg, template, agentArgv),
+		activeHeartbeat:      ActiveHeartbeatInterval,
 	}
+}
+
+func runtimeSettingsFromConfig(cfg config.Config, template string, agentArgv []string) RuntimeSettings {
+	return RuntimeSettings{
+		Parallelism:       cfg.Parallelism,
+		Retries:           cfg.Retries,
+		AgentArgv:         append([]string(nil), agentArgv...),
+		RequireReview:     cfg.RequireReview,
+		Reviewer:          cfg.ReviewerName(),
+		TerminalRetention: cfg.TerminalRetention,
+		Template:          template,
+	}
+}
+
+func copyRuntimeSettings(in RuntimeSettings) RuntimeSettings {
+	out := in
+	out.AgentArgv = append([]string(nil), in.AgentArgv...)
+	return out
+}
+
+func validateRuntimeSettings(settings RuntimeSettings) error {
+	if settings.Parallelism < 1 {
+		return fmt.Errorf("parallelism must be at least 1, got %d", settings.Parallelism)
+	}
+	if settings.Retries < 0 {
+		return fmt.Errorf("retries must not be negative, got %d", settings.Retries)
+	}
+	if len(settings.AgentArgv) == 0 {
+		return fmt.Errorf("agent command is empty")
+	}
+	if _, _, err := config.ParseTerminalRetention(settings.TerminalRetention); err != nil {
+		return err
+	}
+	return nil
+}
+
+// SetRuntimeSettingsLoader 安装热更新读取器。app 层用它把 GUI 保存到
+// 工作目录的配置/提示词带进已经开始的调度；测试不传 loader 时保持
+// New 收到的静态行为。
+func (s *Scheduler) SetRuntimeSettingsLoader(loader RuntimeSettingsLoader) {
+	s.runtimeSettingsMu.Lock()
+	s.runtimeSettingsLoader = loader
+	s.runtimeSettingsMu.Unlock()
+}
+
+// currentRuntimeSettings 返回一份可安全使用的热更新快照。读取失败时
+// 回退到最后一份成功快照并记录 warn：已经在跑的任务不能因为一次
+// 手动编辑中的非法文件而全部失败。
+func (s *Scheduler) currentRuntimeSettings(ctx context.Context) RuntimeSettings {
+	s.runtimeSettingsMu.Lock()
+	defer s.runtimeSettingsMu.Unlock()
+	if s.runtimeSettingsLoader == nil {
+		return copyRuntimeSettings(runtimeSettingsFromConfig(s.cfg, s.template, s.agentArgv))
+	}
+	settings, err := s.runtimeSettingsLoader(ctx)
+	if err == nil {
+		err = validateRuntimeSettings(settings)
+	}
+	if err != nil {
+		msg := err.Error()
+		if s.runtimeSettingsErr != msg {
+			s.log.Warn("reload runtime settings failed; using the last good snapshot", "err", err)
+		}
+		s.runtimeSettingsErr = msg
+		return copyRuntimeSettings(s.runtimeSettingsValue)
+	}
+	settings.AgentArgv = append([]string(nil), settings.AgentArgv...)
+	s.runtimeSettingsValue = copyRuntimeSettings(settings)
+	s.runtimeSettingsErr = ""
+	return copyRuntimeSettings(settings)
 }
 
 // issuePromptContext 读取 graph build 阶段物化的本地 issue 快照，并包装成
@@ -197,8 +300,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			return s.drain(ctx, running, results)
 		}
 		ready := s.g.Ready()
+		runtimeSettings := s.currentRuntimeSettings(ctx)
 		for _, n := range ready {
-			if len(running) >= s.cfg.Parallelism {
+			if len(running) >= runtimeSettings.Parallelism {
 				break
 			}
 			if running[n.Key] {
@@ -262,6 +366,10 @@ func (s *Scheduler) record(res taskResult) {
 	switch {
 	case res.integrated:
 		s.g.SetState(res.key, graph.Integrated)
+		// 集成成功路径已经调用 forge.Close 关闭了远端 issue，
+		// 立刻同步内存图的 Closed 状态，避免依赖 10 分钟后的 refreshStates
+		// 才翻成已关闭，导致最后一个任务停留在未关闭状态。
+		s.g.SetClosed(res.key, true)
 		s.runtime.setAccepted(res.key, res.commit)
 		s.runtime.setAttention(res.key, "")
 		s.log.Info("task integrated", "key", res.key, "commit", res.commit)
@@ -518,7 +626,8 @@ func (s *Scheduler) resolveBaseConflict(ctx context.Context, files []string, pro
 		} else {
 			var reused bool
 			var err error
-			addr, reused, err = s.claimRetainedTerminal(ctx, s.g.Spec(), s.specIID, true, termName, s.intDir)
+			integrationSettings := s.currentRuntimeSettings(ctx)
+			addr, reused, err = s.claimRetainedTerminal(ctx, s.g.Spec(), s.specIID, true, termName, s.intDir, integrationSettings.AgentArgv)
 			if err != nil {
 				return err
 			}
@@ -528,7 +637,7 @@ func (s *Scheduler) resolveBaseConflict(ctx context.Context, files []string, pro
 					IssueIID: s.specIID,
 					Name:     termName,
 					Worktree: s.intDir,
-					Argv:     s.agentArgv,
+					Argv:     integrationSettings.AgentArgv,
 				})
 				if err != nil {
 					return fmt.Errorf("start integration worker: %w", err)
@@ -570,6 +679,7 @@ func (s *Scheduler) resolveBaseConflict(ctx context.Context, files []string, pro
 	if intCwd == "" || intPID <= 0 || len(intArgv) == 0 {
 		return fmt.Errorf("integration worker %s does not expose verifiable cwd/pid/argv", termName)
 	}
+	s.intAgentArgv = append([]string(nil), intArgv...)
 	// 先落 terminal/token/phase，再发送 prompt；prompt 成功后再落
 	// prompt_sent+baseline。中间崩溃会让恢复方保守阻塞，而不是猜。
 	if err := updateMergeProgress(progress, func(m *ActiveTaskMeta) {
@@ -613,7 +723,7 @@ func (s *Scheduler) resolveBaseConflict(ctx context.Context, files []string, pro
 				return nil
 			}
 		}
-		if attempts >= s.cfg.Retries {
+		if attempts >= s.currentRuntimeSettings(ctx).Retries {
 			return fmt.Errorf("base merge conflict unresolved after %d retries", attempts)
 		}
 		attempts++
@@ -649,7 +759,11 @@ func (s *Scheduler) stopIntegrationAgent() {
 	}
 	delay, never := s.retentionPolicy()
 	if delay != 0 || never {
-		s.retainTerminal(s.g.Spec(), s.specIID, true, s.intAddr, s.intTermName(), s.intDir, s.branch, "")
+		agentArgv := append([]string(nil), s.intAgentArgv...)
+		if len(agentArgv) == 0 {
+			agentArgv = append([]string(nil), s.agentArgv...)
+		}
+		s.retainTerminal(s.g.Spec(), s.specIID, true, s.intAddr, s.intTermName(), s.intDir, s.branch, "", agentArgv)
 		return
 	}
 	if err := s.sessions.Stop(context.Background(), s.intAddr, s.specIID, s.intTermName()); err != nil {
@@ -705,6 +819,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		s.log.Error("task refused", "key", key, "reason", res.attention)
 		return
 	}
+	startSettings := s.currentRuntimeSettings(ctx)
 
 	// 先看有没有崩溃/关闭后留下的 active worker。只要 metadata 表明
 	// 另一个 supervisor 仍可能活着，或者接管边界不安全，就绝不启动新 agent。
@@ -992,7 +1107,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		// 从这里开始，任何失败都可能留下一个存活的终端。
 		finish = finishKeep
 		var reused bool
-		addr, reused, err = s.claimRetainedTerminal(taskCtx, key, iid, false, termName, s.workDir)
+		addr, reused, err = s.claimRetainedTerminal(taskCtx, key, iid, false, termName, s.workDir, startSettings.AgentArgv)
 		if err != nil {
 			fail(err)
 			return
@@ -1007,7 +1122,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 				// 参考的主 checkout 与其他目录；worktree 只作产出目录，
 				// 通过提示词告知。
 				Cwd:  s.workDir,
-				Argv: s.agentArgv,
+				Argv: startSettings.AgentArgv,
 			})
 			if err != nil {
 				// 启动结果不明确：可能已有终端，保留两把锁让人工确认。
@@ -1046,7 +1161,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	if record, err := s.sessions.Snapshot(taskCtx, addr); err == nil {
 		argv := record.Argv
 		if len(argv) == 0 {
-			argv = append([]string(nil), s.agentArgv...)
+			argv = append([]string(nil), startSettings.AgentArgv...)
 		}
 		cwd := record.Cwd
 		if cwd == "" {
@@ -1064,7 +1179,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			m.TerminalAddr = addr
 			m.TerminalName = termName
 			m.TerminalCwd = s.workDir
-			m.TerminalArgv = append([]string(nil), s.agentArgv...)
+			m.TerminalArgv = append([]string(nil), startSettings.AgentArgv...)
 		})
 	}
 	monitor := s.watchClaim(taskCtx, key, token, cancel)
@@ -1085,7 +1200,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 		}
 		stopped = true
 		finish = finishNone
-		s.retainTerminal(key, iid, false, addr, termName, s.workDir, branch, commit)
+		s.retainTerminal(key, iid, false, addr, termName, s.workDir, branch, commit, startSettings.AgentArgv)
 		return nil
 	}
 
@@ -1110,7 +1225,8 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			return
 		}
 		contextSection, contextPath, contextTruncated := s.issuePromptContext(key)
-		text, err := prompt.Render(s.template, prompt.Vars{
+		promptSettings := s.currentRuntimeSettings(taskCtx)
+		text, err := prompt.Render(promptSettings.Template, prompt.Vars{
 			IssueNo:               iid,
 			Token:                 reportToken,
 			SpecNo:                s.specIID,
@@ -1121,8 +1237,8 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			Branch:                branch,
 			Forge:                 s.forgeName,
 			ForgeCLI:              forgeCLI(s.forgeName),
-			RequireReview:         s.cfg.RequireReview,
-			Reviewer:              s.cfg.ReviewerName(),
+			RequireReview:         promptSettings.RequireReview,
+			Reviewer:              promptSettings.Reviewer,
 			IssueContext:          contextSection,
 			IssueContextPath:      contextPath,
 			IssueContextTruncated: contextTruncated,
@@ -1220,7 +1336,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 				return
 			}
 			// 合并冲突：让 agent 在任务 worktree 解决后重试。
-			if attempts >= s.cfg.Retries {
+			if attempts >= s.currentRuntimeSettings(taskCtx).Retries {
 				fail(fmt.Errorf("merge conflicts unresolved after %d retries: %s", attempts, conflict.Error()))
 				return
 			}
@@ -1250,7 +1366,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			continue
 		}
 		// 没有完成标记：续写提示词重试，超过 retries 转人工。
-		if attempts >= s.cfg.Retries {
+		if attempts >= s.currentRuntimeSettings(taskCtx).Retries {
 			fail(fmt.Errorf("no %s after %d retries: %v", worker.ReadyMarker, attempts, repErr))
 			return
 		}
@@ -1263,7 +1379,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			s.taskFailed(taskCtx, key, "record continue prompt transition", err, termName, &finish, &res, fail)
 			return
 		}
-		baseline, err = s.sessions.Prompt(taskCtx, addr, worker.ContinuePrompt(reportToken, s.cfg.RequireReview))
+		baseline, err = s.sessions.Prompt(taskCtx, addr, worker.ContinuePrompt(reportToken, s.currentRuntimeSettings(taskCtx).RequireReview))
 		if err != nil {
 			s.taskFailed(taskCtx, key, "send continue prompt", err, termName, &finish, &res, fail)
 			return

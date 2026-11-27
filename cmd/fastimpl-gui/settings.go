@@ -324,7 +324,7 @@ func (m *model) settingsDialog() core.Node {
 			}
 		},
 		Title:       "设置",
-		Description: "修改后关闭对话框会自动保存；也可以点击保存立即写入当前工作目录。",
+		Description: "修改后关闭对话框会自动保存；也可以点击保存立即写入当前工作目录。后续新 worker 与续写重试会读取可热更新项。",
 		TestID:      "settings",
 		Style:       core.Style{Width: core.Pt(760)},
 		Children: []core.Node{
