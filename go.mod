@@ -3,7 +3,7 @@ module github.com/yangjuncode/fastimpl
 go 1.27.3
 
 require (
-	github.com/nsgo-dev/nsgo v0.3.0
+	github.com/nsgo-dev/nsgo v0.3.4
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/yangjuncode/hcgo v0.1.0
 	golang.org/x/sys v0.50.0
