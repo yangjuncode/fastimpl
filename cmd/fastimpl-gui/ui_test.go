@@ -103,6 +103,19 @@ func loadGraph(app *nsgotest.App, m *model, snap snapshot) {
 	app.Settle()
 }
 
+// pressGraphNode 在依赖图画布上单击一个节点。坐标先由 flow 的图内
+// 布局转换成相机视口坐标，确保测试走的是真实指针路径，而不是直接改模型。
+func pressGraphNode(t *testing.T, gui *nsgotest.App, m *model, id string) {
+	t.Helper()
+	bounds, ok := m.flowState.Bounds(id)
+	if !ok {
+		t.Fatalf("graph node %s is not laid out", id)
+	}
+	at := m.cam.ToView(core.Point{X: bounds.Origin.X + bounds.Size.Width/2, Y: bounds.Origin.Y + bounds.Size.Height/2})
+	gui.PressAt("id:graph", at)
+	gui.Settle()
+}
+
 // 没传 issue 时主界面是启动表单：issue 编号与三个目录都在，居中显示。
 // 目录自动解析成功后会预填，并在底部只读信息栏显示。
 func TestEmptyStateRenders(t *testing.T) {
@@ -234,6 +247,38 @@ func TestGraphNodeStatusUpdatesInPlace(t *testing.T) {
 	})
 	gui.Settle()
 	gui.Find("id:graph >> text:运行中")
+}
+
+// 单击选中就必须立刻更新底部节点操作条；只有“需要处理”或“失败”的
+// 节点显示它，普通节点（包括截图里常见的已关闭节点）选中时不占这一栏。
+func TestGraphSingleClickUpdatesNodeActionsAndNormalNodesHideThem(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	snap.Nodes[0].State = graph.NeedsAttention
+	snap.Nodes[1].State = graph.Failed
+	loadGraph(gui, m, snap)
+
+	pressGraphNode(t, gui, m, "1!9")
+	if got := m.tab.GetUntracked(); got != pageGraph {
+		t.Fatalf("single click opened tab %q, want to stay on the graph", got)
+	}
+	gui.Find("id:node-actions")
+	gui.Find("text:节点 1!9：")
+
+	pressGraphNode(t, gui, m, "1!10")
+	if got := m.tab.GetUntracked(); got != pageGraph {
+		t.Fatalf("single click opened tab %q, want to stay on the graph", got)
+	}
+	gui.Find("id:node-actions")
+	gui.Find("text:节点 1!10：")
+
+	pressGraphNode(t, gui, m, "2!3")
+	if got := m.selected.GetUntracked(); got != "2!3" {
+		t.Fatalf("selected node = %q, want 2!3", got)
+	}
+	if gui.Exists("id:node-actions") {
+		t.Fatalf("normal closed node still shows node actions\n%s", gui.Dump())
+	}
 }
 
 // 日志-only 的全局 revision 不能重建图卡片：卡片 memo 发现自己关心的

@@ -958,7 +958,7 @@ func (m *model) graphPage() core.Node {
 							TestID:  "graph",
 							Overlay: m.zoomTools(),
 						},
-						m.nodeActions(),
+						core.Dynamic(func(cx *core.Scope) core.Node { return m.nodeActions() }),
 						m.legend(),
 					}}
 			}, Else: func(*core.Scope) core.Node {
@@ -983,6 +983,14 @@ func (m *model) nodeActions() core.Node {
 	if !ok {
 		return core.View{}
 	}
+	node, ok := m.graphNode(key)
+	if !ok {
+		return core.View{}
+	}
+	state := nodeState(node)
+	if state != viewNeedsAttention && state != viewFailed {
+		return core.View{}
+	}
 	button := func(text string, icon func() *core.SVG, action scheduler.NodeAction, testID string) core.Node {
 		return ui.Button{Text: text, Variant: ui.ButtonOutline, Icon: icon, TestID: testID,
 			OnPress: func() { m.session.ControlNode(key, action) }}
@@ -998,6 +1006,16 @@ func (m *model) nodeActions() core.Node {
 		button("取消", lucide.CircleX, scheduler.NodeActionCancel, "node-cancel"),
 		button("重新调度", lucide.RotateCcw, scheduler.NodeActionRestart, "node-restart"),
 	}}
+}
+
+// graphNode 读取一个图节点的当前状态；读 rev 让操作条在节点后来转入
+// 需要处理/失败或恢复正常时也能及时显示、隐藏。
+func (m *model) graphNode(key graph.Key) (graph.Node, bool) {
+	m.rev.Get()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n, ok := m.nodes[key]
+	return n, ok
 }
 
 // parseGraphKey 解析 flow 节点 ID（project!iid）。非法 ID 不触发任何控制。
