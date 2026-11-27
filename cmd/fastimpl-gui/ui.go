@@ -958,6 +958,7 @@ func (m *model) graphPage() core.Node {
 							TestID:  "graph",
 							Overlay: m.zoomTools(),
 						},
+						m.nodeActions(),
 						m.legend(),
 					}}
 			}, Else: func(*core.Scope) core.Node {
@@ -967,6 +968,47 @@ func (m *model) graphPage() core.Node {
 				return m.emptyState()
 			}},
 		}}
+}
+
+// nodeActions 是选中节点后的人工操作条。它是右键菜单的等价入口：依赖图
+// 组件当前只暴露选择/打开事件，应用层把高危动作集中在这里，并让 scheduler
+// 串行执行，避免界面直接碰终端、锁或 claim。
+func (m *model) nodeActions() core.Node {
+	colors := ui.ColorsOf(m.cx)
+	id := strings.TrimSpace(m.selected.Get())
+	if id == "" || id == pageGraph {
+		return core.View{}
+	}
+	key, ok := parseGraphKey(id)
+	if !ok {
+		return core.View{}
+	}
+	button := func(text string, icon func() *core.SVG, action scheduler.NodeAction, testID string) core.Node {
+		return ui.Button{Text: text, Variant: ui.ButtonOutline, Icon: icon, TestID: testID,
+			OnPress: func() { m.session.ControlNode(key, action) }}
+	}
+	return core.View{TestID: "node-actions", StyleFunc: func() core.Style {
+		return core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: 8, Padding: core.Symmetric(5, 10),
+			Borders: core.Edges{Top: 1}, BorderColor: colors.Border(), Background: colors.Surface()}
+	}, Children: []core.Node{
+		ui.Text("节点 "+id+"：", 11, ui.Medium, colors.Muted),
+		button("刷新", lucide.RefreshCw, scheduler.NodeActionRefresh, "node-refresh"),
+		button("确认完成", lucide.CircleCheck, scheduler.NodeActionConfirmComplete, "node-confirm-complete"),
+		button("停止", lucide.Square, scheduler.NodeActionStop, "node-stop"),
+		button("取消", lucide.CircleX, scheduler.NodeActionCancel, "node-cancel"),
+		button("重新调度", lucide.RotateCcw, scheduler.NodeActionRestart, "node-restart"),
+	}}
+}
+
+// parseGraphKey 解析 flow 节点 ID（project!iid）。非法 ID 不触发任何控制。
+func parseGraphKey(id string) (graph.Key, bool) {
+	parts := strings.Split(id, "!")
+	if len(parts) != 2 {
+		return graph.Key{}, false
+	}
+	project, err1 := strconv.Atoi(parts[0])
+	iid, err2 := strconv.Atoi(parts[1])
+	return graph.Key{ProjectID: project, IID: iid}, err1 == nil && err2 == nil
 }
 
 // zoomTools 浮在画布右上角的缩放控件。

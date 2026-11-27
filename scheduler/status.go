@@ -85,9 +85,22 @@ func (s *runtimeStore) times(k graph.Key) (time.Time, time.Time) {
 	return r.StartedAt, r.FinishedAt
 }
 
+// lookup 返回一个任务的运行数据副本。
+func (s *runtimeStore) lookup(k graph.Key) (TaskRuntime, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.tasks[k]
+	return r, ok
+}
+
 // setAttention 记录进入 needs attention 的原因；空串表示清除。
 func (s *runtimeStore) setAttention(k graph.Key, reason string) {
 	s.update(k, func(r *TaskRuntime) { r.Attention = reason })
+}
+
+// setReportReady 标记后台监督是否已在终端里看到本轮完成报告。
+func (s *runtimeStore) setReportReady(k graph.Key, ready bool) {
+	s.update(k, func(r *TaskRuntime) { r.ReportReady = ready })
 }
 
 // setAccepted 记录最近一次被接受的提交。

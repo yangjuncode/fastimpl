@@ -707,6 +707,7 @@ func (s *session) run(ctx context.Context, opts app.Options) {
 		},
 		BeforeSchedule: s.waitForStart,
 		SchedulerReady: func(sched *scheduler.Scheduler, attach app.AttachTerminal) {
+			sched.SetInteractiveAttention(true)
 			s.mu.Lock()
 			s.sched = sched
 			s.attach = attach
@@ -955,6 +956,27 @@ func progressMessage(p graph.BuildProgress) string {
 		return fmt.Sprintf("依赖图建好了：%d 个节点，%d 开放 / %d 已关闭", p.Discovered, p.Open, p.Closed)
 	}
 	return "正在建依赖图"
+}
+
+// ControlNode 把图上的人工操作转交给 scheduler。操作在后台执行，结果写进
+// 运行日志；scheduler 的下一次快照刷新会同步图状态。
+func (s *session) ControlNode(key graph.Key, action scheduler.NodeAction) {
+	s.mu.Lock()
+	sched, writer := s.sched, s.writer
+	s.mu.Unlock()
+	if sched == nil || writer == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		msg, err := sched.ControlNode(ctx, key, action)
+		if err != nil {
+			fmt.Fprintf(writer, "time=%s level=WARN msg=%q err=%q\n", time.Now().Format(time.RFC3339), "node control failed", err.Error())
+			return
+		}
+		fmt.Fprintf(writer, "time=%s level=INFO msg=%q key=%q action=%q\n", time.Now().Format(time.RFC3339), msg, key.String(), action)
+	}()
 }
 
 // lineWriter 收集运行日志：按行切分，只留最近 logLines 行；配置

@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yangjuncode/fastimpl/config"
@@ -86,6 +87,9 @@ type TaskRuntime struct {
 	Integration bool
 	// Attention 是进入 needs attention 的原因，供状态视图显示。
 	Attention string
+	// ReportReady 表示后台监督已在该终端看到本轮 FASTIMPL-READY 报告；
+	// 仍需人工确认后才继续集成。
+	ReportReady bool
 	// Accepted 是最近一次被接受的提交 SHA。
 	Accepted string
 	// StartedAt 是本轮 fastimpl 开始使用这个终端的时间；未启动为零值。
@@ -139,6 +143,16 @@ type Scheduler struct {
 	runtimeSettingsErr    string
 	// activeHeartbeat 是测试可缩短的 active metadata heartbeat 间隔。
 	activeHeartbeat time.Duration
+	// interactiveAttention 为真时，普通失败后的任务不退出 goroutine，
+	// 而是 park 在 needs attention 中接受人工刷新/确认/重新调度。CLI 默认
+	// 保持旧行为：Run 在无就绪任务时返回 stalled error。
+	interactiveAttention atomic.Bool
+	// attentionPoll 是 parked worker 的监督间隔；测试可缩短。
+	attentionPoll time.Duration
+	// attentionControls 保存 parked 任务的控制入口。只有任务 goroutine
+	// 自己消费，ControlNode 按 key 序列化转发。
+	attentionMu       sync.Mutex
+	attentionControls map[graph.Key]*attentionControl
 }
 
 // New 组装调度器；所有依赖由 app 层注入，便于测试替换。
@@ -170,6 +184,8 @@ func New(cfg config.Config, repo *worktree.Repo, f forge.Forge, forgeName string
 		retentionChanged:     make(chan struct{}),
 		runtimeSettingsValue: runtimeSettingsFromConfig(cfg, template, agentArgv),
 		activeHeartbeat:      ActiveHeartbeatInterval,
+		attentionPoll:        5 * time.Second,
+		attentionControls:    make(map[graph.Key]*attentionControl),
 	}
 }
 
@@ -279,6 +295,7 @@ type taskResult struct {
 	key        graph.Key
 	integrated bool
 	closed     bool // 开跑前发现 issue 已被外部关闭：不当失败，只标记
+	restart    bool // 人工清理后重新排队：清理照旧做，图状态回到 Pending
 	commit     string
 	attention  string
 }
@@ -372,12 +389,20 @@ func (s *Scheduler) record(res taskResult) {
 		s.g.SetClosed(res.key, true)
 		s.runtime.setAccepted(res.key, res.commit)
 		s.runtime.setAttention(res.key, "")
+		s.runtime.setReportReady(res.key, false)
 		s.log.Info("task integrated", "key", res.key, "commit", res.commit)
 	case res.closed:
 		s.g.SetClosed(res.key, true)
 		s.runtime.clearAddr(res.key)
 		s.runtime.setAttention(res.key, "")
+		s.runtime.setReportReady(res.key, false)
 		s.log.Info("issue already closed; skipped", "key", res.key)
+	case res.restart:
+		s.g.SetState(res.key, graph.Pending)
+		s.runtime.clearAddr(res.key)
+		s.runtime.setAttention(res.key, "")
+		s.runtime.setReportReady(res.key, false)
+		s.log.Info("task returned to pending for rescheduling", "key", res.key)
 	default:
 		s.g.SetState(res.key, graph.NeedsAttention)
 		s.runtime.setAttention(res.key, res.attention)
@@ -860,6 +885,9 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	}
 	stopped := false
 
+	var dir, branch string
+	var stopAndRelease func(branch, commit string) error
+
 	now := time.Now()
 	meta := ActiveTaskMeta{
 		Version:           activeMetaVersion,
@@ -927,6 +955,12 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	}
 	defer func() {
 		stopHeartbeat()
+		if finish == finishKeep && res.attention != "" && s.interactiveAttention.Load() && addr != "" {
+			// 结果要等人工处理完才发布；先把图节点标成 needs attention，
+			// 让 GUI/监督循环在 park 期间就能看到并操作该现场。
+			s.g.SetState(key, graph.NeedsAttention)
+			res = s.parkForAttention(ctx, key, addr, termName, reportToken, dir, branch, updateActive, stopAndRelease, res.attention, &finish, &stopped)
+		}
 		if finish == finishStop && addr != "" && !stopped {
 			if err := s.stopWorker(addr, termName); err != nil {
 				finish = finishKeep
@@ -968,8 +1002,6 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	s.log.Info("local task lock acquired", "key", key, "lock", lock.Path(), "recovered", recovered)
 	taskCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	var dir, branch string
-
 	if recovered {
 		// 只读核验已经在偷锁前做过；这里重读最关键的现场，防止偷锁与
 		// 接管之间 issue/claim 又变化。InFlight 是旧 supervisor 自己设置的，
@@ -1186,7 +1218,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 	defer monitor.stop()
 	// stopAndRelease 在任务成功整合后解除认领；terminal_retention 决定
 	// 终端是立即停止，还是保留一段时间后由后台/下次启动清理。
-	stopAndRelease := func(branch, commit string) error {
+	stopAndRelease = func(branch, commit string) error {
 		monitor.stop()
 		delay, never := s.retentionPolicy()
 		if delay == 0 && !never {
