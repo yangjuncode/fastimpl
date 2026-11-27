@@ -22,7 +22,7 @@ const DefaultFile = "fastimpl.prompt.md"
 // DefaultTemplate 是模板文件都不存在时播种到 exe 目录的默认内容。
 // 报告协议行（FASTIMPL-READY <token>）是 fastimpl 与 worker 的契约，
 // 定制时不要破坏这一行的格式；提交以 worktree HEAD 为准。
-const DefaultTemplate = `使用 implement 技能完成 {{.Forge}} 子任务 #{{.IssueNo}}（issue 的读写一律用 {{.ForgeCLI}} 命令行工具）。
+const DefaultTemplate = `/implement 使用 implement 技能完成 {{.Forge}} 子任务 #{{.IssueNo}}（issue 的读写一律用 {{.ForgeCLI}} 命令行工具）。
 {{if eq .WorkDir .RepoDir}}
 你的工作目录（cwd）{{.WorkDir}} 就是主仓库 checkout——可自由查阅代码，但不要在此修改或提交。
 {{else}}
