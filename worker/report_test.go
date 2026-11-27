@@ -66,3 +66,15 @@ func TestNewTokenUnique(t *testing.T) {
 		t.Fatalf("tokens %q %q", a, b)
 	}
 }
+
+func TestContinuePromptReviewConditional(t *testing.T) {
+	// requireReview 为 true 时通过条件含两轮审核，false 时只有实现、验证。
+	on := ContinuePrompt("tok1", true)
+	if !strings.Contains(on, "实现、验证与两轮审核都通过后") || !strings.Contains(on, ReadyMarker+" tok1") {
+		t.Fatalf("continue prompt on = %q", on)
+	}
+	off := ContinuePrompt("tok1", false)
+	if strings.Contains(off, "两轮审核") || !strings.Contains(off, "实现、验证都通过后") {
+		t.Fatalf("continue prompt off = %q", off)
+	}
+}

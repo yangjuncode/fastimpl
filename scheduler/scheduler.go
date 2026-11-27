@@ -609,7 +609,7 @@ func (s *Scheduler) resolveBaseConflict(ctx context.Context, files []string, pro
 		}
 		attempts++
 		var err error
-		baseline, err = s.sessions.Prompt(ctx, s.intAddr, worker.ContinuePrompt(token))
+		baseline, err = s.sessions.Prompt(ctx, s.intAddr, worker.ContinuePrompt(token, false))
 		if err != nil {
 			return fmt.Errorf("send continue prompt: %w", err)
 		}
@@ -1254,7 +1254,7 @@ func (s *Scheduler) runTask(ctx context.Context, key graph.Key, results chan<- t
 			s.taskFailed(taskCtx, key, "record continue prompt transition", err, termName, &finish, &res, fail)
 			return
 		}
-		baseline, err = s.sessions.Prompt(taskCtx, addr, worker.ContinuePrompt(reportToken))
+		baseline, err = s.sessions.Prompt(taskCtx, addr, worker.ContinuePrompt(reportToken, s.cfg.RequireReview))
 		if err != nil {
 			s.taskFailed(taskCtx, key, "send continue prompt", err, termName, &finish, &res, fail)
 			return

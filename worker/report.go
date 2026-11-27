@@ -68,9 +68,14 @@ func ParseReport(screen, token string) (Report, error) {
 }
 
 // ContinuePrompt 是重试时续发给同一终端的提示词：要求 agent
-// 继续完成工作并在末尾输出报告标记。
-func ContinuePrompt(token string) string {
-	return "继续完成这项工作：实现、验证与两轮审核都通过后，在回复末尾单独一行输出 " + ReadyMarker + " " + token + "，随后最多六行说明结论。未达到条件则继续处理，不要输出该标记。"
+// 继续完成工作并在末尾输出报告标记。requireReview 与初始提示词的
+// require_review 含义一致：为 false 时通过条件不含两轮审核。
+func ContinuePrompt(token string, requireReview bool) string {
+	conditions := "实现、验证"
+	if requireReview {
+		conditions += "与两轮审核"
+	}
+	return "继续完成这项工作：" + conditions + "都通过后，在回复末尾单独一行输出 " + ReadyMarker + " " + token + "，随后最多六行说明结论。未达到条件则继续处理，不要输出该标记。"
 }
 
 // NewToken 生成一次运行/任务的报告令牌，用于隔离过期屏幕证据。
