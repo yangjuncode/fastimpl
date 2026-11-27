@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -761,6 +762,38 @@ func TestLogCopyButtonCopiesAllLines(t *testing.T) {
 	}
 }
 
+// 日志页的保存按钮把全部日志行经系统保存对话框写进 .log 文件，成功后
+// 按钮短暂显示"已保存"。
+func TestLogSaveButtonSavesLogFile(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	snap.Log = []string{"line-one", "line-two"}
+	loadGraph(gui, m, snap)
+	path := filepath.Join(t.TempDir(), "saved.log")
+	gui.SaveFile = func(r nsgotest.FileSave) string {
+		if !strings.HasPrefix(r.Name, "fastimpl-log-") || !strings.HasSuffix(r.Name, ".log") {
+			t.Fatalf("save name = %q, want a fastimpl-log .log name", r.Name)
+		}
+		if string(r.Data) != "line-one\nline-two" {
+			t.Fatalf("save data = %q, want the joined log lines", r.Data)
+		}
+		return path
+	}
+	gui.Press("id:tab-log")
+	gui.Press("id:save-log")
+	if len(gui.Saves) != 1 {
+		t.Fatalf("save requests = %d, want 1", len(gui.Saves))
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "line-one\nline-two" {
+		t.Fatalf("saved log = %q, %v", b, err)
+	}
+	gui.Find("text:已保存")
+	gui.Advance(2 * time.Second)
+	if gui.Exists("text:已保存") {
+		t.Fatal("saved feedback did not revert after the clock advanced")
+	}
+}
+
 // 终端页的复制按钮把屏幕与回滚文本写进系统剪贴板：agent TUI 捕获鼠标
 // 时拖拽选择不可用，这个按钮是不依赖快捷键的复制通道。终端输出到达
 // 是异步的，按压放进 WaitUntil 里等解析完成。
@@ -777,4 +810,40 @@ func TestTerminalCopyButtonCopiesScreenText(t *testing.T) {
 		gui.Press("id:copy-terminal")
 		return strings.Contains(gui.Clipboard, "copy-me-marker")
 	})
+}
+
+// 终端页的保存按钮把屏幕与回滚文本按纯文本写进 .md 文件：按用户要求
+// 只改扩展名，不额外包 Markdown 代码块。终端输出到达是异步的，按压放进
+// WaitUntil 里等解析完成。
+func TestTerminalSaveButtonSavesMarkdownFile(t *testing.T) {
+	gui, m, sess := headless(t, app.Options{})
+	stream := newFakeStream()
+	sess.attach = (&fakeAttach{stream: stream}).attach
+	loadGraph(gui, m, specSnapshot())
+	path := filepath.Join(t.TempDir(), "terminal.md")
+	gui.SaveFile = func(r nsgotest.FileSave) string {
+		if !strings.HasPrefix(r.Name, "fastimpl-terminal-") || !strings.HasSuffix(r.Name, ".md") {
+			t.Fatalf("save name = %q, want a fastimpl-terminal .md name", r.Name)
+		}
+		return path
+	}
+	gui.Post(func() { m.tab.Set("1!9") })
+	gui.Settle()
+	gui.Find("id:save-terminal")
+	stream.readCh <- []byte("save-me-marker")
+	gui.WaitUntil(3*time.Second, func() bool {
+		gui.Press("id:save-terminal")
+		return len(gui.Saves) > 0 && strings.Contains(string(gui.Saves[len(gui.Saves)-1].Data), "save-me-marker")
+	})
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "save-me-marker") {
+		t.Fatalf("saved terminal = %q, want the marker", b)
+	}
+	if strings.Contains(string(b), "```") {
+		t.Fatalf("saved terminal = %q, want raw text without a Markdown fence", b)
+	}
+	gui.Find("text:已保存")
 }

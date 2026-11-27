@@ -91,9 +91,11 @@ type model struct {
 	logLastY     core.Points
 	// selected 是图上选中的节点 ID。
 	selected *core.Signal[string]
-	// logCopied/termCopied 在复制按钮按下后短暂为真，把按钮文字变成
-	// "已复制"；用模型级信号是因为页面随状态刷新重建，局部信号会丢。
+	// logCopied/termCopied 与 logSaved/termSaved 在复制/保存成功后短暂为真，
+	// 把按钮文字变成"已复制"/"已保存"；用模型级信号是因为页面随状态刷新重建，
+	// 局部信号会丢。
 	logCopied, termCopied *core.Signal[bool]
+	logSaved, termSaved   *core.Signal[bool]
 
 	cam       *camera.State
 	flowState *uiflow.State
@@ -138,6 +140,8 @@ func newModel(cx *core.Scope, s *session, opts app.Options) *model {
 		logFollowing:  core.NewSignal(cx, true),
 		logCopied:     core.NewSignal(cx, false),
 		termCopied:    core.NewSignal(cx, false),
+		logSaved:      core.NewSignal(cx, false),
+		termSaved:     core.NewSignal(cx, false),
 	}
 	m.post = cx.Post
 	// 轻量界面时钟只更新一个信号；tooltip 通过它重算工作时长。root scope
@@ -798,9 +802,9 @@ func (m *model) logGrown(core.Bounds) {
 	}
 }
 
-// flashCopied 把复制反馈信号置真，1.5 秒后恢复按钮文字；AfterFunc 随
+// flashFeedback 把操作反馈信号置真，1.5 秒后恢复按钮文字；AfterFunc 随
 // scope 销毁停止，测试里的 manual clock 也能控制它。
-func (m *model) flashCopied(sig *core.Signal[bool]) {
+func (m *model) flashFeedback(sig *core.Signal[bool]) {
 	sig.Set(true)
 	m.cx.AfterFunc(1500*time.Millisecond, func() { sig.Set(false) })
 }
@@ -826,7 +830,48 @@ func (m *model) copyButton(sig *core.Signal[bool], label string, text func() str
 				return
 			}
 			m.cx.SetClipboard(t)
-			m.flashCopied(sig)
+			m.flashFeedback(sig)
+		},
+	}
+}
+
+// exportName 是导出文件的默认名：时间戳避免连续保存时默认覆盖同一份文件。
+func (m *model) exportName(prefix, ext string) string {
+	return fmt.Sprintf("%s-%s.%s", prefix, m.cx.WallTime().Format("20060102-150405"), ext)
+}
+
+// saveButton 是日志页与终端页共用的保存按钮：按下时经系统保存对话框
+// 把 text() 写到用户选择的位置。保存是显式导出，空内容时不打开对话框；
+// 成功后按钮文字短暂变成"已保存"，写入失败用系统提示说明原因。
+func (m *model) saveButton(sig *core.Signal[bool], name func() string, text func() string, disabled func() bool, testID string) ui.Button {
+	return ui.Button{
+		TextFunc: func() string {
+			if sig.Get() {
+				return "已保存"
+			}
+			return "保存"
+		},
+		Variant:  ui.ButtonOutline,
+		Icon:     lucide.Save,
+		Disabled: disabled,
+		TestID:   testID,
+		OnPress: func() {
+			t := text()
+			if t == "" {
+				return
+			}
+			m.cx.SaveFile(core.SaveOptions{Name: name(), Start: m.settingsWorkDir(), Data: []byte(t)}, func(saved bool, _ string, err error) {
+				if err != nil {
+					m.cx.Post(func() {
+						m.cx.ShowAlert(core.AlertConfig{Title: "保存失败", Message: err.Error(), Cancelable: true,
+							Actions: []core.AlertAction{{Label: "确定"}}}, nil)
+					})
+					return
+				}
+				if saved {
+					m.cx.Post(func() { m.flashFeedback(sig) })
+				}
+			})
 		},
 	}
 }
@@ -853,6 +898,9 @@ func (m *model) logPage() core.Node {
 				m.copyButton(m.logCopied, "复制", func() string {
 					return strings.Join(m.snapshot().Log, "\n")
 				}, func() bool { return len(m.snapshot().Log) == 0 }, "copy-log"),
+				m.saveButton(m.logSaved, func() string { return m.exportName("fastimpl-log", "log") }, func() string {
+					return strings.Join(m.snapshot().Log, "\n")
+				}, func() bool { return len(m.snapshot().Log) == 0 }, "save-log"),
 			}},
 			core.Scroll{Ref: m.logScroll, OnScroll: m.logScrolled, Bar: logBar, TestID: "log-scroll",
 				Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0)},
@@ -1161,6 +1209,12 @@ func (m *model) terminalPage() core.Node {
 					}
 					return strings.TrimRight(tab.term.Text(), " \t\n")
 				}, func() bool { return tab.term == nil }, "copy-terminal"),
+				m.saveButton(m.termSaved, func() string { return m.exportName("fastimpl-terminal", "md") }, func() string {
+					if tab.term == nil {
+						return ""
+					}
+					return strings.TrimRight(tab.term.Text(), " \t\n")
+				}, func() bool { return tab.term == nil }, "save-terminal"),
 			}},
 			core.View{Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0), Overflow: core.Hidden},
 				Children: []core.Node{terminal.View{Terminal: term, AutoFocus: true, Style: core.Style{FlexGrow: 1},
