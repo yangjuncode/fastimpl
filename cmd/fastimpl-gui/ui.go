@@ -91,6 +91,11 @@ type model struct {
 	logLastY     core.Points
 	// selected 是图上选中的节点 ID。
 	selected *core.Signal[string]
+	// graphMenuOpen/graphMenuKey 控制依赖图节点的右键菜单：菜单是受控的，
+	// 只有右键落在“需要处理”或“失败”节点上时才打开，并记住那一次
+	// 针对的节点，避免菜单打开后指针移走导致动作打错节点。
+	graphMenuOpen *core.Signal[bool]
+	graphMenuKey  *core.Signal[string]
 	// logCopied/termCopied 与 logSaved/termSaved 在复制/保存成功后短暂为真，
 	// 把按钮文字变成"已复制"/"已保存"；用模型级信号是因为页面随状态刷新重建，
 	// 局部信号会丢。
@@ -133,6 +138,8 @@ func newModel(cx *core.Scope, s *session, opts app.Options) *model {
 		settingsOpen:  core.NewSignal(cx, false),
 		tab:           core.NewSignal(cx, pageGraph),
 		selected:      core.NewSignal(cx, ""),
+		graphMenuOpen: core.NewSignal(cx, false),
+		graphMenuKey:  core.NewSignal(cx, ""),
 		cam:           &camera.State{},
 		flowState:     &uiflow.State{},
 		now:           core.NewSignal(cx, cx.WallTime()),
@@ -936,7 +943,7 @@ func (m *model) graphPage() core.Node {
 				look := m.look()
 				return core.View{Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0), Overflow: core.Hidden},
 					Children: []core.Node{
-						uiflow.View{Camera: m.cam, State: m.flowState,
+						m.graphContextMenu(uiflow.View{Camera: m.cam, State: m.flowState,
 							Data: func() uiflow.Data {
 								// 只有结构变了才换数据；节点状态的刷新走卡片
 								// 自己订阅的信号，不动布局与相机。
@@ -957,8 +964,7 @@ func (m *model) graphPage() core.Node {
 							},
 							TestID:  "graph",
 							Overlay: m.zoomTools(),
-						},
-						core.Dynamic(func(cx *core.Scope) core.Node { return m.nodeActions() }),
+						}),
 						m.legend(),
 					}}
 			}, Else: func(*core.Scope) core.Node {
@@ -970,48 +976,73 @@ func (m *model) graphPage() core.Node {
 		}}
 }
 
-// nodeActions 是选中节点后的人工操作条。它是右键菜单的等价入口：依赖图
-// 组件当前只暴露选择/打开事件，应用层把高危动作集中在这里，并让 scheduler
-// 串行执行，避免界面直接碰终端、锁或 claim。
-func (m *model) nodeActions() core.Node {
-	colors := ui.ColorsOf(m.cx)
-	id := strings.TrimSpace(m.selected.Get())
-	if id == "" || id == pageGraph {
-		return core.View{}
+// graphContextMenu 是依赖图节点的右键菜单。flow 只报告指针悬停的节点，
+// 菜单本身做成受控弹出：右键落在普通节点或空白处时忽略打开请求；落在
+// “需要处理”或“失败”节点上时记录该节点并打开。动作仍交给 scheduler
+// 串行执行，界面不直接碰终端、锁或 claim。
+func (m *model) graphContextMenu(trigger core.Node) core.Node {
+	item := func(text string, icon func() *core.SVG, action scheduler.NodeAction, testID string) core.Node {
+		return ui.MenuItem{Text: text, Icon: icon, TestID: testID, OnSelect: func() {
+			key, ok := parseGraphKey(m.graphMenuKey.GetUntracked())
+			if ok {
+				m.session.ControlNode(key, action)
+			}
+		}}
 	}
-	key, ok := parseGraphKey(id)
-	if !ok {
-		return core.View{}
-	}
-	node, ok := m.graphNode(key)
-	if !ok {
-		return core.View{}
-	}
-	state := nodeState(node)
-	if state != viewNeedsAttention && state != viewFailed {
-		return core.View{}
-	}
-	button := func(text string, icon func() *core.SVG, action scheduler.NodeAction, testID string) core.Node {
-		return ui.Button{Text: text, Variant: ui.ButtonOutline, Icon: icon, TestID: testID,
-			OnPress: func() { m.session.ControlNode(key, action) }}
-	}
-	return core.View{TestID: "node-actions", StyleFunc: func() core.Style {
-		return core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: 8, Padding: core.Symmetric(5, 10),
-			Borders: core.Edges{Top: 1}, BorderColor: colors.Border(), Background: colors.Surface()}
-	}, Children: []core.Node{
-		ui.Text("节点 "+id+"：", 11, ui.Medium, colors.Muted),
-		button("刷新", lucide.RefreshCw, scheduler.NodeActionRefresh, "node-refresh"),
-		button("确认完成", lucide.CircleCheck, scheduler.NodeActionConfirmComplete, "node-confirm-complete"),
-		button("停止", lucide.Square, scheduler.NodeActionStop, "node-stop"),
-		button("取消", lucide.CircleX, scheduler.NodeActionCancel, "node-cancel"),
-		button("重新调度", lucide.RotateCcw, scheduler.NodeActionRestart, "node-restart"),
-	}}
+	return ui.ContextMenu{TestID: "graph-node-menu", Style: ui.FillRest,
+		Open: m.graphMenuOpen.Get,
+		OnOpenChange: func(open bool, _ base.Reason) {
+			if !open {
+				m.graphMenuOpen.Set(false)
+				return
+			}
+			id, ok := m.actionableHoveredNode()
+			if !ok {
+				return
+			}
+			m.graphMenuKey.Set(id)
+			m.graphMenuOpen.Set(true)
+		},
+		Trigger: trigger,
+		Children: []core.Node{
+			item("刷新", lucide.RefreshCw, scheduler.NodeActionRefresh, "node-refresh"),
+			item("确认完成", lucide.CircleCheck, scheduler.NodeActionConfirmComplete, "node-confirm-complete"),
+			item("停止", lucide.Square, scheduler.NodeActionStop, "node-stop"),
+			item("取消", lucide.CircleX, scheduler.NodeActionCancel, "node-cancel"),
+			item("重新调度", lucide.RotateCcw, scheduler.NodeActionRestart, "node-restart"),
+		}}
 }
 
-// graphNode 读取一个图节点的当前状态；读 rev 让操作条在节点后来转入
-// 需要处理/失败或恢复正常时也能及时显示、隐藏。
-func (m *model) graphNode(key graph.Key) (graph.Node, bool) {
-	m.rev.Get()
+// actionableHoveredNode 返回指针下允许人工处理的节点 ID。这里必须 untracked：
+// 它在右键事件回调里运行，不能把事件处理器意外订阅到 flow 的 hover 信号上，
+// 否则指针每次移动都会重建画布。
+func (m *model) actionableHoveredNode() (string, bool) {
+	type hit struct {
+		id string
+		ok bool
+	}
+	h := core.Untracked(m.cx, func() hit {
+		id := strings.TrimSpace(m.flowState.Hovered())
+		key, ok := parseGraphKey(id)
+		if !ok {
+			return hit{}
+		}
+		node, ok := m.peekGraphNode(key)
+		if !ok {
+			return hit{}
+		}
+		state := nodeState(node)
+		if state != viewNeedsAttention && state != viewFailed {
+			return hit{}
+		}
+		return hit{id: id, ok: true}
+	})
+	return h.id, h.ok
+}
+
+// peekGraphNode 读取一个图节点而不订阅 rev；右键事件回调用，避免把
+// 事件处理挂到界面刷新信号上。
+func (m *model) peekGraphNode(key graph.Key) (graph.Node, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n, ok := m.nodes[key]
