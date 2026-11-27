@@ -126,6 +126,25 @@ func TestOrdinaryErrorsAreNotRepositoryErrors(t *testing.T) {
 	}
 }
 
+// 运行管线最终返回的错误也必须进入传入的 stderr 日志流。GUI 的日志页
+// 与 log_file 都只消费这个流；若只在状态栏保存 err，失败后日志会停在
+// 最后一个正常阶段，看不到真正的失败原因。
+func TestRunLogsReturnedErrorToRunLog(t *testing.T) {
+	work := t.TempDir()
+	var stderr strings.Builder
+	err := RunObserved(context.Background(), Options{WorkDir: work, SpecIID: 8}, io.Discard, &stderr, Observer{})
+	if err == nil {
+		t.Fatal("RunObserved succeeded outside a repository; test setup is wrong")
+	}
+	logText := stderr.String()
+	if !strings.Contains(logText, "level=ERROR") || !strings.Contains(logText, "run failed") {
+		t.Fatalf("run log = %q, want an ERROR run failed record", logText)
+	}
+	if !strings.Contains(logText, err.Error()) {
+		t.Fatalf("run log = %q, want the returned error %q", logText, err.Error())
+	}
+}
+
 func TestObserverObserving(t *testing.T) {
 	if (Observer{}).observing() {
 		t.Error("the zero Observer reports observing; the CLI run must keep its old behavior")
@@ -200,7 +219,7 @@ func TestRunObservedReloadsConfigAfterScheduleGate(t *testing.T) {
 
 	oldBuildGraph := buildGraphFn
 	defer func() { buildGraphFn = oldBuildGraph }()
-	buildGraphFn = func(ctx context.Context, kind, dir, host, projectPath string, specIID int, log *slog.Logger, progress func(graph.BuildProgress), prefetch bool) (forge.Forge, *graph.Graph, *issuecontext.Store, error) {
+	buildGraphFn = func(ctx context.Context, kind, dir, host, projectPath string, specIID int, stderr io.Writer, log *slog.Logger, progress func(graph.BuildProgress), prefetch bool) (forge.Forge, *graph.Graph, *issuecontext.Store, error) {
 		g := graph.New(graph.Key{ProjectID: 1, IID: specIID})
 		return unexpectedForge{}, g, nil, nil
 	}

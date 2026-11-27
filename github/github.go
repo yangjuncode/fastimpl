@@ -24,14 +24,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
-	"github.com/yangjuncode/fastimpl/config"
-	"github.com/yangjuncode/fastimpl/forge"
-	"github.com/yangjuncode/fastimpl/retry"
 	"net/url"
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/yangjuncode/fastimpl/config"
+	"github.com/yangjuncode/fastimpl/forge"
+	"github.com/yangjuncode/fastimpl/retry"
 )
 
 // Runner 执行 gh 命令；测试用假实现替换它。
@@ -41,12 +43,16 @@ type Runner interface {
 }
 
 // ExecRunner 是调用真实 gh 的 Runner。
-type ExecRunner struct{}
+type ExecRunner struct {
+	// Progress 接收重试进度；为空时写进程 stderr。GUI 传入自己的
+	// 日志流，否则弱网重试在日志页/log_file 里不可见。
+	Progress io.Writer
+}
 
 // Run 在仓库目录中执行 gh，不经过 shell 拼接，标准错误并入错误信息。
-// 瞬时网络故障退避重试（见 retry.Do）。
-func (ExecRunner) Run(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error) {
-	return retry.Do(ctx, "gh "+strings.Join(argv, " "), func() ([]byte, error) {
+// 瞬时网络故障退避重试（见 retry.DoWriter）。
+func (r ExecRunner) Run(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error) {
+	return retry.DoWriter(ctx, "gh "+strings.Join(argv, " "), r.Progress, func() ([]byte, error) {
 		return execGh(ctx, dir, argv, stdin)
 	})
 }

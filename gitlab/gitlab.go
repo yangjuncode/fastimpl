@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os/exec"
 	"strconv"
@@ -29,13 +30,17 @@ type Runner interface {
 
 // ExecRunner 是调用真实 glab 的 Runner。
 // glab 依赖当前目录里的 Git remote 推断项目，因此必须在仓库内执行。
-type ExecRunner struct{}
+type ExecRunner struct {
+	// Progress 接收重试进度；为空时写进程 stderr。GUI 传入自己的
+	// 日志流，否则弱网重试在日志页/log_file 里不可见。
+	Progress io.Writer
+}
 
 // Run 在仓库目录中执行 glab，不经过 shell 拼接，标准错误并入错误信息。
 // 瞬时网络故障（dial/TLS 超时、连接拒绝、上游 5xx）退避重试——glab
 // 内部 HTTP 超时不对外配置，弱网实例只能靠重试扛抖动。
-func (ExecRunner) Run(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error) {
-	return retry.Do(ctx, "glab "+strings.Join(argv, " "), func() ([]byte, error) {
+func (r ExecRunner) Run(ctx context.Context, dir string, argv []string, stdin []byte) ([]byte, error) {
+	return retry.DoWriter(ctx, "glab "+strings.Join(argv, " "), r.Progress, func() ([]byte, error) {
 		return execGlab(ctx, dir, argv, stdin)
 	})
 }

@@ -78,7 +78,25 @@ func RunObserved(ctx context.Context, opts Options, stdout, stderr io.Writer, ob
 var buildGraphFn = buildGraph
 
 // run 是 Run 与 RunObserved 共用的运行管线。
-func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer Observer) error {
+func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer Observer) (retErr error) {
+	log := slog.New(slog.NewTextHandler(stderr, nil))
+	// GUI 的状态栏错误不会自动进入日志页/log_file：它只消费这个 stderr
+	// 日志流。无论失败发生在建图、EnsureMR、hc 连接还是调度收尾，最终
+	// 返回错误都必须在这里落一行，否则日志会停在最后一个正常阶段。
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		var activeConflict *ActiveRunConflictError
+		switch {
+		case errors.As(retErr, &activeConflict):
+			log.Warn("run not started", "reason", retErr)
+		case errors.Is(retErr, context.Canceled):
+			log.Warn("run canceled", "err", retErr)
+		default:
+			log.Error("run failed", "err", retErr)
+		}
+	}()
 	workDir, err := resolveWorkDir(opts.WorkDir)
 	if err != nil {
 		return err
@@ -86,7 +104,6 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	if opts.Init {
 		return initFiles(workDir, stdout)
 	}
-	log := slog.New(slog.NewTextHandler(stderr, nil))
 	// 真正调度前先确保本机稳定实例 ID（跨机器认领用）：尽早生成，
 	// 保证随后 config.Load 能读到它。只读的 -print 不生成。
 	if !opts.Print {
@@ -135,10 +152,10 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 	if err != nil {
 		return repoError(repoDir, err)
 	}
-	forge := resolveForge(ctx, cfg.Forge, host, repoDir)
+	forge := resolveForge(ctx, cfg.Forge, host, repoDir, stderr)
 	log.Info("building dependency graph", "forge", forge, "origin", host+"/"+projectPath, "spec", opts.SpecIID)
 	buildStart := time.Now()
-	fc, g, contexts, err := buildGraphFn(ctx, forge, repoDir, host, projectPath, opts.SpecIID, log, observer.Progress, !opts.Print)
+	fc, g, contexts, err := buildGraphFn(ctx, forge, repoDir, host, projectPath, opts.SpecIID, stderr, log, observer.Progress, !opts.Print)
 	if err != nil {
 		return err
 	}
@@ -225,9 +242,11 @@ func run(ctx context.Context, opts Options, stdout, stderr io.Writer, observer O
 		fmt.Fprintf(stderr, "warning: sync %s into %s failed: %v\n", baseName, branch, err)
 	}
 	// 集成分支就位后立即推送并确保 MR 存在；此后每次集成再推送。
+	log.Info("pushing integration branch", "branch", branch, "base", baseName)
 	if err := repo.Push(ctx, intDir, branch); err != nil {
 		return fmt.Errorf("push integration branch %s: %w", branch, err)
 	}
+	log.Info("ensuring merge request", "source", branch, "target", baseName)
 	mrURL, err := fc.EnsureMR(ctx, g.Spec().ProjectID, branch, baseName,
 		fmt.Sprintf("spec #%d integration", opts.SpecIID),
 		fmt.Sprintf("Close #%d", opts.SpecIID))
@@ -417,18 +436,18 @@ func resolveRepoDir(ctx context.Context, flagDir, cfgDir, workDir string) (strin
 }
 
 // resolveForge 解析 forge 类型：配置 > 主机名启发式 > glab/gh 探测 >
-// 默认 gitlab。
-func resolveForge(ctx context.Context, configured, host, dir string) string {
+// 默认 gitlab。stderr 同时作为 CLI 重试进度流，GUI 传入日志页 writer。
+func resolveForge(ctx context.Context, configured, host, dir string, stderr io.Writer) string {
 	if configured != "" {
 		return configured
 	}
 	if forge := worktree.ForgeForHost(host); forge != "" {
 		return forge
 	}
-	if gitlab.Probe(ctx, gitlab.ExecRunner{}, dir, host) {
+	if gitlab.Probe(ctx, gitlab.ExecRunner{Progress: stderr}, dir, host) {
 		return config.ForgeGitLab
 	}
-	if github.Probe(ctx, github.ExecRunner{}, dir, host) {
+	if github.Probe(ctx, github.ExecRunner{Progress: stderr}, dir, host) {
 		return config.ForgeGitHub
 	}
 	return config.ForgeGitLab
@@ -455,7 +474,7 @@ func resolveTreeDir(ctx context.Context, flagDir, cfgDir, repoDir string) (strin
 // buildGraph 按 forge 建 client 并构建完整依赖图；返回的 client
 // 同时是调度器的 Forge 端口（Claim/Close/Note）。progress 非 nil 时
 // 在建图过程中按阶段上报。
-func buildGraph(ctx context.Context, kind, dir, host, projectPath string, specIID int, log *slog.Logger, progress func(graph.BuildProgress), prefetch bool) (forge.Forge, *graph.Graph, *issuecontext.Store, error) {
+func buildGraph(ctx context.Context, kind, dir, host, projectPath string, specIID int, stderr io.Writer, log *slog.Logger, progress func(graph.BuildProgress), prefetch bool) (forge.Forge, *graph.Graph, *issuecontext.Store, error) {
 	wrap := func(client forge.Forge, base graph.Source) (graph.Source, *issuecontext.Store) {
 		if !prefetch {
 			return base, nil
@@ -465,7 +484,7 @@ func buildGraph(ctx context.Context, kind, dir, host, projectPath string, specII
 	}
 	switch kind {
 	case config.ForgeGitLab:
-		client, err := gitlab.NewClient(ctx, gitlab.ExecRunner{}, dir, host, projectPath)
+		client, err := gitlab.NewClient(ctx, gitlab.ExecRunner{Progress: stderr}, dir, host, projectPath)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -473,7 +492,7 @@ func buildGraph(ctx context.Context, kind, dir, host, projectPath string, specII
 		g, err := graph.BuildWithProgress(ctx, src, specIID, progress)
 		return client, g, store, err
 	case config.ForgeGitHub:
-		client, err := github.NewClient(ctx, github.ExecRunner{}, dir, host, projectPath)
+		client, err := github.NewClient(ctx, github.ExecRunner{Progress: stderr}, dir, host, projectPath)
 		if err != nil {
 			return nil, nil, nil, err
 		}

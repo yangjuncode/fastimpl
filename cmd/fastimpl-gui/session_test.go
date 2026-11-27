@@ -847,3 +847,32 @@ func TestObservedSpecPicksUpTasksAddedAfterObservationStarted(t *testing.T) {
 		t.Fatalf("Status = %+v, want a read-only terminal entry for the later issue-10 worker", snap.Status)
 	}
 }
+
+// GUI 日志页/log_file 必须包含运行管线最终返回的错误。这里不替换
+// runFn，走真实 app.RunObserved：失败只进状态栏时快照 Log 为空；
+// 正确实现会在 run 返回前把完整错误写入同一个 lineWriter。
+func TestSessionRunFailureAppearsInLog(t *testing.T) {
+	s := newSession()
+	changes := make(chan struct{}, 16)
+	s.SetOnChange(func() {
+		select {
+		case changes <- struct{}{}:
+		default:
+		}
+	})
+	if err := s.Start(app.Options{WorkDir: t.TempDir(), SpecIID: 8}); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, s, changes)
+	snap := s.Snapshot()
+	if snap.Phase != phaseFailed || snap.Err == nil {
+		t.Fatalf("phase = %v err = %v, want a failed run", snap.Phase, snap.Err)
+	}
+	joined := strings.Join(snap.Log, "\n")
+	if !strings.Contains(joined, "level=ERROR") || !strings.Contains(joined, "run failed") {
+		t.Fatalf("GUI log = %q, want the final run failure", joined)
+	}
+	if !strings.Contains(joined, snap.Err.Error()) {
+		t.Fatalf("GUI log = %q, want the returned error %q", joined, snap.Err.Error())
+	}
+}
