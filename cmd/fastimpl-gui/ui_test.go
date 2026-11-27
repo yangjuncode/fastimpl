@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -739,4 +740,41 @@ func TestExplicitConflictObserverTakesOverAfterSupervisorExits(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("explicit-conflict observer did not take over; snapshot = %+v", sess.Snapshot())
+}
+
+// 日志页的复制按钮把全部日志行写进系统剪贴板，按钮短暂显示"已复制"，
+// 时钟走过后恢复；日志为空时按钮禁用，不会把空内容刷上剪贴板。
+func TestLogCopyButtonCopiesAllLines(t *testing.T) {
+	gui, m, _ := headless(t, app.Options{})
+	snap := specSnapshot()
+	snap.Log = []string{"line-one", "line-two"}
+	loadGraph(gui, m, snap)
+	gui.Press("id:tab-log")
+	gui.Press("id:copy-log")
+	if gui.Clipboard != "line-one\nline-two" {
+		t.Fatalf("clipboard = %q, want the joined log lines", gui.Clipboard)
+	}
+	gui.Find("text:已复制")
+	gui.Advance(2 * time.Second)
+	if gui.Exists("text:已复制") {
+		t.Fatal("copied feedback did not revert after the clock advanced")
+	}
+}
+
+// 终端页的复制按钮把屏幕与回滚文本写进系统剪贴板：agent TUI 捕获鼠标
+// 时拖拽选择不可用，这个按钮是不依赖快捷键的复制通道。终端输出到达
+// 是异步的，按压放进 WaitUntil 里等解析完成。
+func TestTerminalCopyButtonCopiesScreenText(t *testing.T) {
+	gui, m, sess := headless(t, app.Options{})
+	stream := newFakeStream()
+	sess.attach = (&fakeAttach{stream: stream}).attach
+	loadGraph(gui, m, specSnapshot())
+	gui.Post(func() { m.tab.Set("1!9") })
+	gui.Settle()
+	gui.Find("id:copy-terminal")
+	stream.readCh <- []byte("copy-me-marker")
+	gui.WaitUntil(3*time.Second, func() bool {
+		gui.Press("id:copy-terminal")
+		return strings.Contains(gui.Clipboard, "copy-me-marker")
+	})
 }

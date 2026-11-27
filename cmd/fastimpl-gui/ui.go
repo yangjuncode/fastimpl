@@ -68,6 +68,9 @@ type model struct {
 	logLastY     core.Points
 	// selected 是图上选中的节点 ID。
 	selected *core.Signal[string]
+	// logCopied/termCopied 在复制按钮按下后短暂为真，把按钮文字变成
+	// "已复制"；用模型级信号是因为页面随状态刷新重建，局部信号会丢。
+	logCopied, termCopied *core.Signal[bool]
 
 	cam       *camera.State
 	flowState *uiflow.State
@@ -108,6 +111,8 @@ func newModel(cx *core.Scope, s *session, opts app.Options) *model {
 		now:          core.NewSignal(cx, cx.WallTime()),
 		logScroll:    &core.Ref{},
 		logFollowing: core.NewSignal(cx, true),
+		logCopied:    core.NewSignal(cx, false),
+		termCopied:   core.NewSignal(cx, false),
 	}
 	m.post = cx.Post
 	// 轻量界面时钟只更新一个信号；tooltip 通过它重算工作时长。root scope
@@ -763,6 +768,39 @@ func (m *model) logGrown(core.Bounds) {
 	}
 }
 
+// flashCopied 把复制反馈信号置真，1.5 秒后恢复按钮文字；AfterFunc 随
+// scope 销毁停止，测试里的 manual clock 也能控制它。
+func (m *model) flashCopied(sig *core.Signal[bool]) {
+	sig.Set(true)
+	m.cx.AfterFunc(1500*time.Millisecond, func() { sig.Set(false) })
+}
+
+// copyButton 是日志页与终端页共用的复制按钮：按下时把 text() 写进系统
+// 剪贴板，按钮文字短暂变成"已复制"。text 返回空时不动作——复制全部
+// 文本是显式按钮而非快捷键，不能把空内容悄悄刷上剪贴板。
+func (m *model) copyButton(sig *core.Signal[bool], label string, text func() string, disabled func() bool, testID string) ui.Button {
+	return ui.Button{
+		TextFunc: func() string {
+			if sig.Get() {
+				return "已复制"
+			}
+			return label
+		},
+		Variant:  ui.ButtonOutline,
+		Icon:     lucide.Copy,
+		Disabled: disabled,
+		TestID:   testID,
+		OnPress: func() {
+			t := text()
+			if t == "" {
+				return
+			}
+			m.cx.SetClipboard(t)
+			m.flashCopied(sig)
+		},
+	}
+}
+
 // logPage 是运行日志页。日志正文用等宽字体整块展示；快照最多保留最近
 // logLines 行，持久文件是否启用由设置里的 log_file 决定。
 func (m *model) logPage() core.Node {
@@ -782,6 +820,9 @@ func (m *model) logPage() core.Node {
 				ui.Spacer{},
 				core.Text{Content: "在底部时自动跟随新日志；向上翻阅会暂停跟随", MaxLines: 1,
 					Style: ui.TypeCaption, StyleFunc: ui.Colored(colors.Muted)},
+				m.copyButton(m.logCopied, "复制", func() string {
+					return strings.Join(m.snapshot().Log, "\n")
+				}, func() bool { return len(m.snapshot().Log) == 0 }, "copy-log"),
 			}},
 			core.Scroll{Ref: m.logScroll, OnScroll: m.logScrolled, Bar: logBar, TestID: "log-scroll",
 				Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0)},
@@ -1071,6 +1112,12 @@ func (m *model) terminalPage() core.Node {
 							}, TestID: "reconnect"},
 						}}
 				}},
+				m.copyButton(m.termCopied, "复制全部", func() string {
+					if tab.term == nil {
+						return ""
+					}
+					return strings.TrimRight(tab.term.Text(), " \t\n")
+				}, func() bool { return tab.term == nil }, "copy-terminal"),
 			}},
 			core.View{Style: core.Style{FlexGrow: 1, MinHeight: core.Pt(0), Overflow: core.Hidden},
 				Children: []core.Node{terminal.View{Terminal: term, AutoFocus: true, Style: core.Style{FlexGrow: 1},
