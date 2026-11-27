@@ -365,6 +365,15 @@ func (s *Scheduler) baseConflictPrompt(base string, files []string, token string
 		s.intDir, base, strings.Join(files, ", "), worker.ReadyMarker, token)
 }
 
+// baseConflictContinuePrompt 是 base 冲突 agent 未出报告时的续写提示词。
+// 不套用实现 worker 的 worker.ContinuePrompt：实现/验证/审核的措辞与
+// 纯合并任务无关，这里只重申完成合并提交后输出报告标记的契约；不再列
+// 冲突文件——续写时清单可能已变化，agent 以 git status 为准。
+func baseConflictContinuePrompt(base, token string) string {
+	return fmt.Sprintf("继续完成合并：完成 git merge origin/%s 的冲突解决并提交合并（冲突文件以 git status 为准；禁止 reset、rebase 或 checkout 丢弃集成分支上已有的任何提交）。完成合并提交后，在回复末尾单独一行输出 %s %s；未完成前不要输出该标记。",
+		base, worker.ReadyMarker, token)
+}
+
 // conflictPrompt 是让 agent 自己解决集成冲突的续写提示词：
 // 在任务 worktree（dir，不是 agent 的 cwd）中把集成分支合入本分支、
 // 解决冲突并提交，然后输出报告标记；fastimpl 之后再做干净合并。
@@ -609,7 +618,7 @@ func (s *Scheduler) resolveBaseConflict(ctx context.Context, files []string, pro
 		}
 		attempts++
 		var err error
-		baseline, err = s.sessions.Prompt(ctx, s.intAddr, worker.ContinuePrompt(token, false))
+		baseline, err = s.sessions.Prompt(ctx, s.intAddr, baseConflictContinuePrompt(s.baseName, token))
 		if err != nil {
 			return fmt.Errorf("send continue prompt: %w", err)
 		}
