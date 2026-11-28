@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nsgo-dev/nsgo/core"
+	"github.com/nsgo-dev/nsgo/icons/lucide"
 	"github.com/yangjuncode/fastimpl/graph"
 	"github.com/yangjuncode/fastimpl/scheduler"
 )
@@ -177,6 +179,39 @@ func TestFlowLabelsIncludeIssueNumber(t *testing.T) {
 		if got := labels[id]; got != want {
 			t.Errorf("flow label %s = %q, want %q", id, got, want)
 		}
+	}
+}
+
+func TestIntegratedCommitFooterShowsIntegratedIcon(t *testing.T) {
+	up := core.Color(0x112233)
+	muted := core.Color(0x445566)
+	footer := integratedCommitFooter(func() core.Color { return up }, func() core.Color { return muted }, "abcdef123456")
+	row, ok := footer.(core.View)
+	if !ok {
+		t.Fatalf("integratedCommitFooter = %T, want core.View row", footer)
+	}
+	if row.Style.Direction != core.Row || row.Style.AlignItems != core.AlignCenter {
+		t.Errorf("commit footer style = %+v, want a centered row", row.Style)
+	}
+	if len(row.Children) != 2 {
+		t.Fatalf("commit footer children = %d, want icon and text", len(row.Children))
+	}
+	icon, ok := row.Children[0].(core.Icon)
+	if !ok {
+		t.Fatalf("first child = %T, want core.Icon", row.Children[0])
+	}
+	if icon.SVG != lucide.CircleCheck() {
+		t.Error("commit footer icon is not the integrated CircleCheck icon")
+	}
+	if got := icon.StyleFunc().Color; got != up {
+		t.Errorf("commit footer icon color = %v, want integrated color %v", got, up)
+	}
+	text, ok := row.Children[1].(core.Text)
+	if !ok {
+		t.Fatalf("second child = %T, want core.Text", row.Children[1])
+	}
+	if text.Content != "commit abcdef12" {
+		t.Errorf("commit footer text = %q, want %q", text.Content, "commit abcdef12")
 	}
 }
 

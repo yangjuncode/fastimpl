@@ -134,6 +134,16 @@ func pendingColor(colors ui.Colors) func() core.Color {
 	return func() core.Color { return ui.Alpha(colors.Warn(), 0.8) }
 }
 
+// integratedCommitFooter 是本次运行已集成节点的 commit 行。已关闭表示
+// forge 上的完结状态，绿色已集成图标才表示 commit 是本机这次合入的。
+func integratedCommitFooter(iconTint, textTint func() core.Color, sha string) core.Node {
+	return core.View{Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: 4}, Children: []core.Node{
+		ui.Icon(lucide.CircleCheck, 12, iconTint),
+		core.Text{Content: "commit " + shortSHA(sha), MaxLines: 1,
+			Style: core.Style{FontSize: 11, LineHeight: 15}, StyleFunc: ui.Colored(textTint)},
+	}}
+}
+
 // stateBadge 返回状态的颜色、图标与文字。
 func stateBadge(colors ui.Colors, v viewState) (func() core.Color, func() *core.SVG, string) {
 	switch v {
@@ -420,8 +430,7 @@ func (c nodeCard) render(cx *core.Scope, current nodeLive, live *core.Memo[nodeL
 		footer = core.Text{Content: attentionSummary(rt.Attention), MaxLines: 1,
 			Style: core.Style{FontSize: 11, LineHeight: 15}, StyleFunc: ui.Colored(colors.Warn)}
 	case rt.Accepted != "":
-		footer = core.Text{Content: "commit " + shortSHA(rt.Accepted), MaxLines: 1,
-			Style: core.Style{FontSize: 11, LineHeight: 15}, StyleFunc: ui.Colored(colors.Muted)}
+		footer = integratedCommitFooter(colors.Up, colors.Muted, rt.Accepted)
 	case len(node.Deps) > 0:
 		deps := make([]string, len(node.Deps))
 		for i, dep := range node.Deps {
